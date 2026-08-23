@@ -8,7 +8,8 @@ now add the owned composer, inline dock, one final truth-safe card per settled
 tool, one joined turn receipt, bounded assistant-only presentation, and a
 generator-provenanced semantic preview for real `apply_patch` approvals. A
 bounded current-turn Inspect and one-summary Review now use the same primary-
-screen ledger. Tables, commands/suggestions, themes, Session picker, installed
+screen ledger. Six closed semantic palettes now use the same transactional
+screen ownership. Tables, commands/suggestions, Session picker, installed
 screenshots, and the real-emulator matrix remain incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
@@ -171,8 +172,30 @@ Built-in palettes are Adaptive, Midnight, Paper, Color-blind, High Contrast,
 and Mono.
 Adaptive uses the terminal's ordinary ANSI palette so it remains usable on
 unknown light/dark backgrounds. Themes are semantic token maps, never embedded
-escape strings in business events. Reduced Motion disables spinner animation
-and uses text changes only.
+escape strings in business events. Reduced Motion is a later product slice;
+when implemented it will disable spinner animation and use text changes only.
+
+The first theme checkpoint keeps that surface deliberately closed. Exact local
+commands `/theme adaptive`, `/theme midnight`, `/theme paper`,
+`/theme color-blind`, `/theme high-contrast`, and `/theme mono` select one of
+six compile-time palettes; `/theme` reports the current choice and the finite
+list when the width-aware Dock has room, while narrow layouts may visibly
+truncate that notice. The parser's six-name set remains exact at every width.
+Unknown names are local input errors and never become model prompts or next-turn
+queue entries. Selection is process-local presentation state, not a Session
+fact, and a resumed process starts from Adaptive again.
+
+Every palette maps the same closed `TextStyle` roles to fixed SGR sequences.
+No palette sets a background, emits OSC, queries the terminal, or accepts a raw
+escape string. Mono uses only attributes; High Contrast and Color-blind retain
+the same textual icons and labels, so color is never the only status signal.
+A switch redraws only the owned bottom surface. It does not replay or recolor
+native scrollback, and future transcript chunks use the new palette only after
+the redraw transaction commits. Resize, partial output, suspend, approval
+takeover, and terminal failure keep the existing poison/recovery and
+default-Reject rules. Linear mode recognizes the same exact commands locally
+but reports that it is always plain, stores no inactive palette choice, and
+emits zero ESC bytes.
 
 ## Responsive layouts
 
@@ -685,7 +708,8 @@ canonical input, numbered or lettered decisions, and append-only status lines;
 there is no cursor animation or dock rewrite. Every enhanced interaction has a
 plain semantic path, though mouse and cursor-rich editing are accelerators, not
 requirements. Mono and High Contrast never use color as the only distinction.
-Reduced Motion removes spinner frames. An optional product-owned bell or title
+The later Reduced Motion slice will remove spinner frames. An optional
+product-owned bell or title
 notice may fire only when approval is ready or a long turn completes; model
 text never controls it and the default is off.
 
@@ -740,6 +764,7 @@ text never controls it and the default is off.
 | detail-panel source lines | 4,096 |
 | detail-panel physical rows | 4,096 after wrapping |
 | detail-panel source text | 1 MiB UTF-8 |
+| built-in semantic palettes | 6 compile-time variants; longest name 13 ASCII bytes |
 | markup line-prefix candidate | 64 sanitized UTF-8 bytes |
 | complete inline-code candidate, including delimiters | 4 KiB sanitized UTF-8 |
 | fence language label | 32 ASCII bytes |
@@ -802,7 +827,7 @@ remain in force.
 1. Pure reducer tests cover every `Interaction`, desired/committed view, tool, approval, queue,
    command, resize, cancellation, and terminal-failure transition.
 2. Semantic golden tests render 112×34, 80×24, and 44×20 scenes in Adaptive,
-   Paper, High Contrast, Mono, and plain modes, including Chinese, emoji,
+   Midnight, Paper, Color-blind, High Contrast, Mono, and plain modes, including Chinese, emoji,
    combining characters, long paths, hostile controls, Markdown, diff, errors,
    compaction, and queue overflow.
 3. Real PTY tests cover Unicode editing, multiline, history, bracketed paste,
@@ -852,9 +877,10 @@ remain in force.
    reasoning moved out of enhanced Focus, exact context estimates, truthful
    compaction chronology, one joined summary Review, and transactional primary-
    screen Inspect/Review panels with local commands and approval takeover.
-8. **Remaining product checkpoint**: tables, commands/suggestions, themes, and
-   Session picker. Each sub-slice remains independently green and pushed; this
-   line is not a claim that they are already implemented.
+8. **Remaining product checkpoint (partial)**: the six closed, transactional
+   semantic themes are green. Tables, commands/suggestions, and Session picker
+   remain. Each sub-slice stays independently green and pushed; this line does
+   not claim that the remaining items are implemented.
 9. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
    review, non-force push, dual-platform CI, and a separate completion-status

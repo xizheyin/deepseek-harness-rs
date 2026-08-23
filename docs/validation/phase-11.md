@@ -12,8 +12,9 @@ terminal profiles; the strict Phase 9 linear path remains the fallback. Phase
 11 now also has bounded assistant-only Markdown/code/fenced-diff presentation
 and a generator-provenanced semantic preview for real built-in `apply_patch`
 approvals. Bounded current-turn Inspect and one-summary Review are also
-production reachable in the primary-screen ledger. It is still partial because
-tables, commands/suggestions, theme polish, the Session picker, installed Phase
+production reachable in the primary-screen ledger. Six closed semantic themes
+are process-local and transactionally share that ledger. It is still partial because
+tables, commands/suggestions, reduced motion, the Session picker, installed Phase
 11 acceptance, real screenshots, real-emulator evidence, and same-candidate
 dual-platform CI are not complete.
 
@@ -36,7 +37,7 @@ The implementation work is divided into these checkpoints:
 3. truth-safe semantic tool cards and the joined turn receipt;
 4. bounded assistant markup and semantic canonical-patch approval preview;
 5. bounded Focus/Inspect/Review, context estimates, and compaction facts;
-6. tables, themes, commands, suggestions, and Session picker;
+6. themes (green), then tables, commands, suggestions, and Session picker;
 7. installed-binary PTY journey, real screenshots, clean-target repository
    gates, independent review, and macOS/Ubuntu CI.
 
@@ -394,15 +395,61 @@ This is a green product checkpoint, not Phase 11 completion. Standard ANSI
 cannot undo terminal-emulator reflow that happens before `SIGWINCH`; the tested
 claim is that dsh does not actively append or replay panel snapshots. Real
 iTerm2, Terminal.app, and VS Code resize/reflow/copy evidence remains pending,
-as do tables, themes, commands/suggestions, Session picker, installed Phase 11
+as do tables, commands/suggestions, Session picker, installed Phase 11
 acceptance, current screenshots, and same-candidate macOS/Ubuntu CI.
+
+## Transactional semantic-theme slice — 2026-08-23
+
+Implementation commit
+`78a81200b4bdc976709c03cf67914dc970126291` makes six compile-time palettes
+production reachable through exact local `/theme` commands: Adaptive,
+Midnight, Paper, Color-blind, High Contrast, and Mono. The command without an
+argument reports the current palette and the finite set; unknown or extra
+arguments remain local errors and are never sent to the model or queued as a
+later turn. The linear path recognizes the same command surface but remains
+plain and emits zero ESC bytes.
+
+The palette maps only the closed `TextStyle` roles to fixed SGR strings. It
+never accepts a user-defined escape sequence, emits OSC, sets a background, or
+queries the terminal. Text labels and selection markers remain authoritative,
+so High Contrast, Color-blind, and Mono do not use color as the only signal.
+Approval still starts on Reject, including the 12×5 compact rescue surface.
+
+Theme state has separate requested and screen-committed revisions. A palette
+becomes current only after the complete `InlineScreen` transaction commits;
+partial output enters the existing poisoned-screen recovery and the requested
+palette is redrawn before it commits. Input arriving during that transition is
+discarded behind a fresh decoder epoch. Changing a theme redraws only the owned
+Dock and never replays or recolors native scrollback. The choice is not a
+Session fact: a real two-process PTY journey proves that a Paper session resumes
+with Adaptive and that theme commands are absent from its JSONL journal.
+
+Local validation used Rust 1.85.0 on macOS arm64 with fake models, loopback
+HTTP, temporary workspaces, and obvious fake credentials. No real API key,
+public network request, or model billing was used. The final same-tree
+`./scripts/verify.sh` passed: formatting, all-target checks, 689 library tests
+plus 338 other tests (1,027 total), zero failed/ignored, Clippy with warnings
+denied, and whitespace checks. Focused evidence includes the closed-palette and
+request/commit unit tests, Dock and `InlineScreen` geometry/scrollback tests,
+and 73 tests in the real-binary PTY target (71 journeys plus 2 harness
+regressions). The PTY journeys cover all six choices, width changes, active-turn
+query/invalid isolation, same-read fences, no transcript replay, suspend/resume,
+approval takeover and compact default safety, linear zero-ESC output, and the
+cross-process Adaptive reset.
+
+Three independent read-only reviews found no P0/P1 safety, truth, terminal, or
+test-coverage problem after the identified documentation and recovery/resume
+evidence gaps were closed. This is a green product checkpoint, not Phase 11
+completion. Reduced motion, tables, commands/file suggestions, Session picker,
+installed Phase 11 acceptance, screenshots, real-emulator capture, and the
+same-candidate macOS/Ubuntu CI remain pending.
 
 ## Evidence pending
 
 - remaining product files and default-enabled Phase 11 acceptance tests;
 - exact-limit and one-over tests for remaining card/receipt/Dock fields and
   the Review activity/text and reasoning omission-step caps, plus later
-  table/theme/picker resources;
+  table/picker resources;
 - installed candidate SHA and release acceptance output;
 - screenshot sizes and digests generated from real installed PTY bytes;
 - macOS and Ubuntu job URLs for the same candidate;

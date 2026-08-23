@@ -1282,8 +1282,11 @@ only trusted action summaries. It does not replay the Session, expose raw tool
 payloads or literal call/approval/compaction correlation IDs, reconstruct pre-
 resume history, or infer full diffs/commands from prose. These terminal-specific
 behaviors keep `docs/compatibility.md` `partial`. Tables, commands/suggestions,
-themes, the Session picker, installed Phase 11 evidence, screenshots, and the
-real-emulator/platform matrix must exist before any broader
+and the Session picker remain unfinished. The six closed semantic themes are a
+Rust terminal-only presentation choice: they change no Session or upstream
+Agent fact, accept no user-defined escape strings, and reset to Adaptive in a
+new process. Installed Phase 11 evidence, screenshots, and the real-emulator/
+platform matrix must exist before any broader
 `intentional-difference` completion claim.
 
 The complete state, layout, safety, resource, and test design was frozen in
