@@ -498,11 +498,36 @@ assistant text:
 - case-insensitive `diff` or `patch` fences with visual file-header, hunk,
   addition, deletion, and context styles.
 
-The parser does not decode HTML entities or interpret raw ANSI. Tables,
-emphasis, links, images, and HTML rendering remain unimplemented. Assistant
+The parser does not decode HTML entities or interpret raw ANSI. Emphasis,
+links, images, and HTML rendering remain unimplemented. Assistant
 fenced `diff`/`patch` remains presentation-only and never proves a file effect.
 Real `apply_patch` approval uses a separate provenance path described below;
 it never promotes assistant text or a generic diff-looking prompt.
+
+The table checkpoint recognizes one deliberately source-preserving subset. A
+candidate header, delimiter, and every body row must start and end with `|`.
+The delimiter has the same 2–8 columns as the header; each trimmed delimiter
+cell is three or more ASCII hyphens with optional leading/trailing `:`. Body
+rows must keep that column count. Escaped pipes, multiline cells, nesting, and
+column spans are outside this subset and remain ordinary assistant text.
+
+Recognition buffers only the candidate/table line needed to avoid styling a
+false header. Once the delimiter commits the table, the renderer preserves
+every source byte and line feed: pipe separators and the delimiter use
+`Border`, header cell text uses `Heading`, and body cell text uses `Assistant`.
+It does not pad or rewrite cells, so native terminal wrapping remains truthful
+at 44, 80, and 112 columns and copied text stays the model's exact Markdown.
+Linear mode keeps the same literal source with zero ESC bytes. An incomplete
+candidate, stream correction, retry, cancellation, or non-authoritative abort
+flushes held bytes as ordinary assistant text; only an authoritative final may
+accept a valid final body row without a trailing line feed.
+
+One table keeps at most 8 columns, 64 body rows, 16 KiB per physical source
+row, and 64 KiB aggregate source. Exact limits remain semantic. A one-over row,
+column mismatch, invalid delimiter, or aggregate overflow closes recognition
+and renders that line and later text normally; it never omits Session facts or
+cancels the Agent turn. Visible-control sanitization happens before recognition,
+and only the closed semantic styles reach `InlineScreen`.
 
 Untrusted content is converted to visible text before parsing, and the closed
 presentation builder rejects terminal controls again. Only a matching
@@ -765,6 +790,9 @@ text never controls it and the default is off.
 | detail-panel physical rows | 4,096 after wrapping |
 | detail-panel source text | 1 MiB UTF-8 |
 | built-in semantic palettes | 6 compile-time variants; longest name 13 ASCII bytes |
+| table columns / body rows | 8 / 64 |
+| table physical source row | 16 KiB sanitized UTF-8 |
+| table aggregate source | 64 KiB sanitized UTF-8 |
 | markup line-prefix candidate | 64 sanitized UTF-8 bytes |
 | complete inline-code candidate, including delimiters | 4 KiB sanitized UTF-8 |
 | fence language label | 32 ASCII bytes |
