@@ -728,6 +728,87 @@ reduced motion, help, status, sessions, exit, and quit are local commands.
 Commands that would change Agent or Session semantics must follow the ordinary
 audited boundary rather than being hidden UI actions.
 
+The first command-palette checkpoint is narrower than that future combined
+surface. It contains exactly the seven local commands that already exist in
+production: `/help`, `/inspect`, `/review`, `/focus`, `/theme`, `/exit`, and
+`/quit`. Theme names remain arguments to `/theme`; future commands such as
+status, sessions, Reduced Motion, or file suggestions must not appear before
+their own production path exists. The closed entry table owns a short ASCII
+description for each command, and neither model, Session, workspace, nor
+configuration text can add an entry. This listed order is also the stable menu
+order, and the first match is the default selection.
+
+The enhanced driver owns one `CommandPaletteState` beside `InputMemory`; it
+stores only an optional closed command identity and an optional dismissed
+Composer revision. Composer continues to own text/cursor/revision, and Dock is
+a pure layout consumer of an immutable palette snapshot. Resize, approval
+takeover, and a temporary detail view do not copy or mutate palette state. A
+Composer content edit clears a dismissal; cursor movement and resize do not.
+
+Enhanced Focus derives palette visibility only when the **entire** draft is a
+single line whose first byte is `/` and whose cursor is at the draft's byte end.
+Leading whitespace, a slash after other text, any LF, or a cursor inside the
+draft hides it. Filtering is case-sensitive ASCII prefix matching against the
+seven closed spellings. Selection stays by command identity while the prefix,
+width, or height changes only while that identity remains in the current match
+set. If an edit removes it, selection moves to the first match in closed-table
+order; no matches means no selectable identity. Up/Down move within matches,
+Tab/BackTab move forward/backward; all four clamp at the first/last match rather
+than wrapping. Every palette-navigation key ends the current decoder read
+batch, even when clamping means the identity did not change, so a following
+Enter byte cannot complete or submit in that batch. A timed standalone Esc
+dismisses the palette without changing the draft. Any later edit clears that
+dismissal and recomputes the finite matches. An unknown prefix may show a fixed
+`No matching local command` row; that row cannot be activated, and the draft
+still remains an ordinary prompt if the user later submits it. While this
+empty-state row is visible, Up/Down/Tab/BackTab are no-op menu keys that still
+end the read batch; they never fall through to history or queue recall.
+Rejected key input or a rejected paste dismisses a visible palette at the
+current Composer revision, reports the existing local error, and leaves draft
+and selection identity unchanged; a later content edit may reopen it.
+
+Enter on a non-exact selected prefix replaces that token with the selected
+command and ends the current decoder read batch. It does **not** submit, queue,
+open a view, change theme, or exit; only a fresh later Enter may pass the
+existing local-command classifier. Enter when the Composer already equals one
+complete command keeps today's ordinary submit behavior. Paste never selects a
+menu item: it only edits the draft, after which the palette may be derived for
+display, and the paste-completed input fence still ends that read before any
+completion or submit. Completion atomically replaces the entire draft as one
+undoable Composer edit, places the cursor at the command end, detaches any
+InputMemory history/reverse-search navigation, and leaves queue/history
+contents unchanged.
+Approval focus suppresses the palette, and Inspect/Review keep their existing
+input rules. During a running turn, completing `/inspect`, `/review`, `/focus`,
+or `/theme` still cannot queue it; the fresh submitted command follows the
+existing exact local-command path. All seven exact commands are classified
+before `PromptQueue` in both idle and running states and never enter the FIFO or
+Session. `/help` stays local; view/theme commands keep their current local
+actions; `/exit` and `/quit` use the existing owned shutdown path, including
+turn cancellation, required cleanup, Session settlement, terminal restoration,
+and no automatic admission of queued prompts. They therefore cannot be
+triggered by an arrow and Enter arriving in one terminal read.
+
+In a non-compact Dock, visible menu rows are
+`min(matches-or-empty-row, width_cap, rows - 8)`, where `width_cap` is three
+below 60 columns and seven otherwise; the subtraction preserves the ordinary
+status/divider/four Composer/hint rows plus at least one transcript row. Thus
+80/112-column layouts with at least 15 rows may show all seven, while the 44×12
+threshold shows at most three selected-centered rows. In every compact layout
+the selected command (or fixed empty row) replaces the ordinary status row, so
+the Composer and compact `Enter · Esc` hint remain visible with one transcript
+row still available; a real selection also keeps its explicit `>` marker.
+Wider layouts use `Enter complete · Esc close`. Truncation changes only product-owned
+descriptions, never command spelling. Linear mode retains its current zero-ESC
+whole-line behavior and prints no dynamic palette.
+
+For `n` visible match rows and selected index `s`, the deterministic window
+starts at `min(s.saturating_sub((n - 1) / 2), matches.len() - n)`; even windows
+therefore keep one more row below the selection until clamped at an edge. A
+wide no-match row uses `No matching local command`. Compact no-match uses the
+separate product-owned `! No match` spelling and no `>` selection marker, so it
+fits the 11-cell rescue width without pretending the empty row is actionable.
+
 ## Plain and accessible rendering
 
 Plain output contains zero ESC bytes and complete textual labels. It uses
@@ -807,6 +888,7 @@ text never controls it and the default is off.
 | screen transaction | 2 MiB |
 | retained split grapheme | 1 KiB |
 | visible suggestion rows | 12 |
+| command palette entries | 7 compile-time entries; at most 3 visible at 44×12 and 1 at 12×5 |
 | file suggestion candidates | 256 |
 | dynamic dock | 24 rows |
 | composer visible height | 8 rows |
@@ -838,7 +920,10 @@ remain in force.
 | Situation | Required UI behavior |
 | --- | --- |
 | invalid UTF-8 key bytes | visible local input error; draft and Session unchanged |
-| incomplete/unknown CSI | cancel menu/approval or insert visible text as specified; never Allow |
+| incomplete/unknown CSI | dismiss command palette at the current Composer revision with draft unchanged; cancel approval or insert visible text elsewhere as specified; never Allow |
+| command prefix has no match | fixed local empty-state row; draft remains submittable as an ordinary prompt |
+| resize/partial write while command palette is open | preserve draft and selected command identity through the existing screen transaction; no command action |
+| approval arrives while command palette is open | suppress palette, commit approval takeover, and retain default Reject; draft remains unchanged |
 | oversized prompt/paste/queue | reject locally without losing the previous draft |
 | resize during stream | reflow dock; no repeated transcript or cursor loss |
 | resize during approval | preserve Reject/selection; no decision |
@@ -884,6 +969,25 @@ remain in force.
 9. `./scripts/verify.sh`, Phase 9/10 acceptance, the new Phase 11 acceptance,
    `git diff --check`, independent safety/UX review, and macOS/Ubuntu CI all
    pass with zero ignored tests.
+10. Command-palette reducer tests cover all seven closed entries/order/default,
+    exact whole-draft/cursor visibility, case-sensitive prefix filtering,
+    stale-selection fallback, no-match, Esc dismissal, and all four
+    Up/Down/Tab/BackTab clamp plus read-fence transitions. Completion tests
+    assert one undoable atomic edit, cursor-at-end, detached history/reverse-
+    search navigation, and unchanged queue/history contents. Dock/InlineScreen
+    tests cover the exact width/height row formula, selected-centered windows,
+    untruncated command spelling, compact `>`/hint plus one transcript row,
+    112→44→12×5→80 identity retention, and zero/partial-write recovery without
+    committing an action. Real PTY journeys prove that Down/Tab plus Enter in
+    one read only navigates, a later fresh Enter completes a prefix, and another
+    fresh Enter executes it; an already exact command after same-read navigation
+    also waits for a fresh Enter. Paste plus same-read CR cannot execute. All
+    seven exact commands remain queue/Session-isolated during a running turn,
+    and an unknown slash draft remains the only ordinary queued prompt. A real
+    `apply_patch` approval arriving over an open palette suppresses it, discards
+    stale palette input, keeps Reject selected and the file unchanged, then
+    restores the exact draft after rejection. A linear partial prefix emits no
+    dynamic palette and remains zero-ESC.
 
 ## Implementation checkpoints
 
