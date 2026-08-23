@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_and_diff_remain_unique_at_44_80_and_112_columns() {
+    fn markdown_diff_and_tables_remain_unique_at_44_80_and_112_columns() {
         let source = concat!(
             "# MARKUP-HEADING\n",
             "- list with `INLINE-CODE`\n",
@@ -1026,6 +1026,9 @@ mod tests {
             "-REMOVE-SENTINEL\n",
             "+ADD-SENTINEL\n",
             "```\n",
+            "| TABLE-HEADER | Value |\n",
+            "| --- | --- |\n",
+            "| TABLE-BODY | native terminal wrapping keeps source exact |\n",
         );
         for (rows, columns) in [(20_u16, 44_u16), (24, 80), (34, 112)] {
             for policy in [
@@ -1062,6 +1065,8 @@ mod tests {
                     "CODE_SENTINEL",
                     "REMOVE-SENTINEL",
                     "ADD-SENTINEL",
+                    "TABLE-HEADER",
+                    "TABLE-BODY",
                 ] {
                     assert_eq!(
                         joined.matches(sentinel).count(),

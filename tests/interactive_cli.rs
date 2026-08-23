@@ -358,7 +358,8 @@ fn enhanced_streaming_markdown_and_diff_are_styled_without_replaying_source() {
         "-old-sentinel\n",
         "+新-sentinel\n``",
         "`\nDone with `in",
-        "line`.\n```rust\nfn EOF_CODE() {}\n``",
+        "line`.\n| Col",
+        "umn | 值 |\n| --- | :---: |\n| alpha | one |\n| beta | two |\n```rust\nfn EOF_CODE() {}\n``",
         "`",
     ]);
     let server = SequenceSseServer::start(vec![body]);
@@ -371,6 +372,9 @@ fn enhanced_streaming_markdown_and_diff_are_styled_without_replaying_source() {
     dsh.expect(b"\x1b[31m-old-sentinel");
     dsh.expect("\x1b[32m+新-sentinel".as_bytes());
     dsh.expect(b"\x1b[1m`inline`");
+    dsh.expect(b"\x1b[2;36m|\x1b[0m\x1b[1;36m Column");
+    dsh.expect(b"\x1b[2;36m| --- | :---: |");
+    dsh.expect(b"\x1b[2;36m|\x1b[0m\x1b[36m alpha");
     dsh.expect(b"\x1b[1mfn EOF_CODE() {}");
     dsh.expect(b"Turn complete");
     let (status, transcript) = dsh.exit_cleanly();
@@ -380,6 +384,8 @@ fn enhanced_streaming_markdown_and_diff_are_styled_without_replaying_source() {
         "-old-sentinel",
         "+新-sentinel",
         "`inline`",
+        " Column ",
+        " alpha ",
         "fn EOF_CODE() {}",
     ] {
         assert_eq!(
@@ -396,7 +402,7 @@ fn enhanced_streaming_markdown_and_diff_are_styled_without_replaying_source() {
 
 #[test]
 fn linear_tui_keeps_markdown_literal_and_emits_no_escape_bytes() {
-    let answer = "# Heading\n```diff\n-old-linear\n+new-linear\n```\n`inline`\n";
+    let answer = "# Heading\n```diff\n-old-linear\n+new-linear\n```\n`inline`\n| Column | Value |\n| --- | --- |\n| alpha | one |\n";
     let server = SequenceSseServer::start(vec![text_sse(answer)]);
     let workspace = TestWorkspace::new();
     let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
@@ -408,6 +414,9 @@ fn linear_tui_keeps_markdown_literal_and_emits_no_escape_bytes() {
     dsh.expect(b"-old-linear");
     dsh.expect(b"+new-linear");
     dsh.expect(b"`inline`");
+    dsh.expect(b"| Column | Value |");
+    dsh.expect(b"| --- | --- |");
+    dsh.expect(b"| alpha | one |");
     dsh.expect(b"[done]");
     dsh.expect_occurrences(b"dsh > ", 2);
     let (status, transcript) = dsh.exit_cleanly();
@@ -1486,10 +1495,16 @@ fn a_reserved_auto_turn_is_settled_before_suspend_and_returns_as_history() {
 
 #[test]
 fn enhanced_resize_during_a_partial_stream_reanchors_without_cancelling_the_turn() {
-    let partial =
-        concat!("data: {\"choices\":[{\"delta\":{\"content\":\"busy-partial\"}}]}\n\n").to_owned();
-    let mut server =
-        GatedFirstSseServer::start(partial, text_sse(" continuation-after-resize"), Vec::new());
+    let partial_text = "busy-partial\n| RESIZE_TABLE | Value |\n";
+    let partial = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+        serde_json::to_string(partial_text).unwrap()
+    );
+    let mut server = GatedFirstSseServer::start(
+        partial,
+        text_sse("| --- | --- |\n| body | continuation-after-resize |\n"),
+        Vec::new(),
+    );
     let workspace = TestWorkspace::new();
     let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
 
@@ -1499,13 +1514,27 @@ fn enhanced_resize_during_a_partial_stream_reanchors_without_cancelling_the_turn
     let resize = dsh.checkpoint();
     dsh.resize(30, 80);
     dsh.expect_after(resize, b"Working | type the next prompt while dsh runs");
+    assert!(
+        !dsh.snapshot()
+            .windows(b"RESIZE_TABLE".len())
+            .any(|window| window == b"RESIZE_TABLE"),
+        "a held table header must not leak before its delimiter arrives"
+    );
     server.release();
+    dsh.expect(b"\x1b[2;36m|\x1b[0m\x1b[1;36m RESIZE_TABLE");
     dsh.expect(b"continuation-after-resize");
     dsh.expect(b"Turn complete");
-    let (status, _) = dsh.exit_cleanly();
+    let (status, transcript) = dsh.exit_cleanly();
     let requests = server.finish();
 
     assert!(status.success());
+    assert_eq!(
+        transcript
+            .windows(b"RESIZE_TABLE".len())
+            .filter(|window| *window == b"RESIZE_TABLE")
+            .count(),
+        1
+    );
     assert_eq!(requests.len(), 1);
     assert_eq!(last_user_content(&requests[0]), "resize the active stream");
 }

@@ -508,7 +508,8 @@ The table checkpoint recognizes one deliberately source-preserving subset. A
 candidate header, delimiter, and every body row must start and end with `|`.
 The delimiter has the same 2–8 columns as the header; each trimmed delimiter
 cell is three or more ASCII hyphens with optional leading/trailing `:`. Body
-rows must keep that column count. Escaped pipes, multiline cells, nesting, and
+rows must keep that column count, and every trimmed header cell is non-empty.
+Escaped pipes, multiline cells, nesting, and
 column spans are outside this subset and remain ordinary assistant text.
 
 Recognition buffers only the candidate/table line needed to avoid styling a
@@ -817,7 +818,10 @@ text never controls it and the default is off.
 
 Input, queue, card, receipt, and Dock limits apply to source UTF-8 bytes unless
 their row says otherwise. Markup limits explicitly apply after visible-control
-sanitization. Inline/fence/style overflow degrades to ordinary copyable text;
+sanitization. The presentation-frame text budget counts text-run UTF-8 bytes;
+structural `LineFeed` items are governed by the item budget instead. The table
+source cap separately includes its physical line feeds. Inline/fence/style
+overflow degrades to ordinary copyable text;
 frame item/text overflow emits one fixed
 `[assistant display omitted: presentation limit exceeded]` marker and suppresses
 the remainder of that assistant block's display. These are presentation-only
