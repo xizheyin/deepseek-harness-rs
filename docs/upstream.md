@@ -1266,7 +1266,8 @@ next-turn FIFO, full-screen-scroll ownership, and directional approval. It now
 also folds each committed tool lifecycle into one truth-safe final card and
 joins committed `turn/end` with the exact `TurnOutcome` for a compact receipt.
 Committed assistant text now also has bounded, assistant-only presentation for
-headings, lists, quotes, inline code, fenced code, and fenced `diff`/`patch`.
+headings, lists, quotes, inline code, fenced code, fenced `diff`/`patch`, and a
+source-preserving 2–8-column pipe-table subset.
 Parsing happens only after visible-control sanitization and changes no Session
 or Agent fact. The real `apply_patch` preparation path now attaches process-local
 closed row provenance to the same canonical preview used by the result. The
@@ -1281,12 +1282,12 @@ metadata, while one exactly joined Review reuses the Focus receipt and retains
 only trusted action summaries. It does not replay the Session, expose raw tool
 payloads or literal call/approval/compaction correlation IDs, reconstruct pre-
 resume history, or infer full diffs/commands from prose. These terminal-specific
-behaviors keep `docs/compatibility.md` `partial`. Tables, commands/suggestions,
-and the Session picker remain unfinished. The six closed semantic themes are a
-Rust terminal-only presentation choice: they change no Session or upstream
-Agent fact, accept no user-defined escape strings, and reset to Adaptive in a
-new process. Installed Phase 11 evidence, screenshots, and the real-emulator/
-platform matrix must exist before any broader
+behaviors keep `docs/compatibility.md` `partial`. Commands/suggestions and the
+Session picker remain unfinished. The table subset and six closed semantic
+themes are Rust terminal-only presentation choices: they change no Session or
+upstream Agent fact, accept no user-defined escape strings, and reset to
+Adaptive in a new process. Installed Phase 11 evidence, screenshots, and the
+real-emulator/platform matrix must exist before any broader
 `intentional-difference` completion claim.
 
 The complete state, layout, safety, resource, and test design was frozen in

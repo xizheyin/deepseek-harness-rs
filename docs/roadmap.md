@@ -110,15 +110,16 @@ sandbox. Completion requires real installed-binary PTY journeys and screenshots,
 hostile-control and signal restoration tests, bounded resize/stream/paste/queue
 tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
-The current green checkpoints implement bounded assistant-message markup, six
-closed process-local semantic themes with transactional redraw, a
+The current green checkpoints implement bounded assistant-message markup,
+source-preserving 2–8-column pipe tables, six closed process-local semantic
+themes with transactional redraw, a
 generator-provenanced semantic card for the real single-file `apply_patch`
 approval preview, and bounded primary-screen Inspect/Review panels. Inspect
 shows only current-turn committed metadata and retained reasoning; Review keeps
 one exactly joined summary and does not invent full historical diffs or command
 records. The exact canonical approval source is still shown before the existing
-default-Reject selector, while lookalike generic text remains opaque. Tables,
-commands/suggestions, the Session picker, screenshots, real-emulator
+default-Reject selector, while lookalike generic text remains opaque. Commands/
+suggestions, the Session picker, screenshots, real-emulator
 evidence, and final same-candidate platform validation still prevent Phase 11
 completion.
 

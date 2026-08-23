@@ -13,10 +13,10 @@ terminal profiles; the strict Phase 9 linear path remains the fallback. Phase
 and a generator-provenanced semantic preview for real built-in `apply_patch`
 approvals. Bounded current-turn Inspect and one-summary Review are also
 production reachable in the primary-screen ledger. Six closed semantic themes
-are process-local and transactionally share that ledger. It is still partial because
-tables, commands/suggestions, reduced motion, the Session picker, installed Phase
-11 acceptance, real screenshots, real-emulator evidence, and same-candidate
-dual-platform CI are not complete.
+and bounded source-preserving tables transactionally share that ledger. It is
+still partial because commands/suggestions, reduced motion, the Session picker,
+installed Phase 11 acceptance, real screenshots, real-emulator evidence, and
+same-candidate dual-platform CI are not complete.
 
 ## Frozen boundary
 
@@ -37,7 +37,8 @@ The implementation work is divided into these checkpoints:
 3. truth-safe semantic tool cards and the joined turn receipt;
 4. bounded assistant markup and semantic canonical-patch approval preview;
 5. bounded Focus/Inspect/Review, context estimates, and compaction facts;
-6. themes (green), then tables, commands, suggestions, and Session picker;
+6. themes (green), tables (green), then commands, suggestions, and Session
+   picker;
 7. installed-binary PTY journey, real screenshots, clean-target repository
    gates, independent review, and macOS/Ubuntu CI.
 
@@ -444,12 +445,60 @@ completion. Reduced motion, tables, commands/file suggestions, Session picker,
 installed Phase 11 acceptance, screenshots, real-emulator capture, and the
 same-candidate macOS/Ubuntu CI remain pending.
 
+## Bounded source-preserving table slice — 2026-08-23
+
+Implementation commit
+`2f89cdeae005b222db11827bd59d2dd7fd79c1b6` makes a deliberately small
+assistant pipe-table subset production reachable. A header, delimiter, and
+body row must start and end with `|`; the header has 2–8 non-empty cells, the
+delimiter has the same column count and at least three ASCII hyphens per cell,
+and each body row keeps that count. Escaped pipes, multiline cells, nesting,
+column spans, and malformed delimiters remain ordinary assistant text.
+
+Once the delimiter proves a table, `Border` styles only pipes and delimiter
+cells, `Heading` styles header cells, and `Assistant` styles body cells. The
+renderer preserves every source byte and structural line feed, adds no padding,
+and leaves 44/80/112-column wrapping to the terminal. Linear mode emits the
+same literal source with zero ESC bytes. A held or malformed candidate, abort,
+retry/correction, row/aggregate overflow, and non-authoritative final all
+degrade to copyable plain text without changing Session facts or cancelling the
+Agent turn; only an authoritative final may accept a valid last row without LF.
+
+The closed resource contract is 8 columns, 64 body rows, 16 KiB per physical
+source row, and 64 KiB aggregate table source. Fragmented overflow remains
+plain until the real physical LF, so a Provider boundary cannot forge a new
+heading or fence inside an over-limit row. Retained table/fence bytes and
+presentation items are combined with the current fragment before the 768 KiB
+text and 96×1,024-item soft gates. Exact and one-over tests cover same-frame,
+cross-frame, mid-line, fallback, authoritative-finish, and abort paths; overflow
+emits the fixed display-omission marker rather than reaching the 1 MiB/128 Ki
+hard builder limits.
+
+Local validation used Rust 1.85.0 on Darwin 27.0.0 arm64 with fake models,
+loopback HTTP, temporary workspaces, and obvious fake credentials. No real API
+key, public network request, or model billing was used. The final same-tree
+`./scripts/verify.sh` passed: formatting, all-target checks, 694 library tests
+plus 338 other tests (1,032 total), zero failed/ignored, Clippy with warnings
+denied, and whitespace checks. Focused evidence includes 21 markup tests, the
+renamed 44/80/112 `InlineScreen` uniqueness test, and 73 tests in the real-
+binary PTY target (71 journeys plus 2 harness regressions). Existing enhanced
+and linear journeys now prove fragmented semantic tables and literal zero-ESC
+fallback; the active resize journey proves a held header is not displayed
+before its delimiter and enters native scrollback exactly once afterward.
+
+Three independent read-only reviews found no remaining P0/P1/P2 safety,
+fragmentation, resource-accounting, terminal, or test-evidence problem after
+the identified physical-line and retained-budget issues were fixed. This is a
+green product checkpoint, not Phase 11 completion. Commands/file suggestions,
+Reduced Motion, Session picker, installed Phase 11 acceptance, screenshots,
+real-emulator capture, and same-candidate macOS/Ubuntu CI remain pending.
+
 ## Evidence pending
 
 - remaining product files and default-enabled Phase 11 acceptance tests;
 - exact-limit and one-over tests for remaining card/receipt/Dock fields and
-  the Review activity/text and reasoning omission-step caps, plus later
-  table/picker resources;
+  the Review activity/text and reasoning omission-step caps, plus later picker
+  resources;
 - installed candidate SHA and release acceptance output;
 - screenshot sizes and digests generated from real installed PTY bytes;
 - macOS and Ubuntu job URLs for the same candidate;
