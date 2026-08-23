@@ -24,6 +24,31 @@ pub(crate) enum TextStyle {
     Warning,
     Error,
     Success,
+    Border,
+    Selection,
+}
+
+impl TextStyle {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 17] = [
+        Self::Plain,
+        Self::Muted,
+        Self::Accent,
+        Self::User,
+        Self::Assistant,
+        Self::Heading,
+        Self::Code,
+        Self::Quote,
+        Self::DiffHeader,
+        Self::DiffHunk,
+        Self::DiffAdd,
+        Self::DiffRemove,
+        Self::Warning,
+        Self::Error,
+        Self::Success,
+        Self::Border,
+        Self::Selection,
+    ];
 }
 
 pub(crate) enum PresentedItem {

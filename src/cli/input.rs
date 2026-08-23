@@ -1,3 +1,5 @@
+use crate::tui::theme::ThemeCommand;
+
 pub(super) const MAX_INTERACTIVE_PROMPT_BYTES: usize = 1_000;
 pub(super) const MAX_APPROVAL_RECORD_BYTES: usize = 64;
 
@@ -91,12 +93,16 @@ pub(super) enum IdleInput {
     Help,
     Inspect,
     Review,
+    Theme(ThemeCommand),
     Exit,
     Submit(String),
 }
 
 pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> IdleInput {
     let command = record.trim_matches(|character: char| character.is_ascii_whitespace());
+    if let Some(theme) = ThemeCommand::parse(command) {
+        return IdleInput::Theme(theme);
+    }
     match command {
         "" => IdleInput::Redraw,
         "/help" => IdleInput::Help,
@@ -110,6 +116,7 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
 #[cfg(test)]
 mod tests {
     use super::{CanonicalRecordParser, IdleInput, InputRecordEvent, classify_idle_record};
+    use crate::tui::theme::{ThemeCommand, ThemePalette};
 
     fn feed(
         parser: &mut CanonicalRecordParser,
@@ -240,6 +247,14 @@ mod tests {
         assert_eq!(classify_idle_record("  /help \t", true), IdleInput::Help);
         assert_eq!(classify_idle_record(" /inspect ", true), IdleInput::Inspect);
         assert_eq!(classify_idle_record(" /review ", true), IdleInput::Review);
+        assert_eq!(
+            classify_idle_record(" /theme paper ", true),
+            IdleInput::Theme(ThemeCommand::Select(ThemePalette::Paper))
+        );
+        assert_eq!(
+            classify_idle_record(" /theme secret-name ", true),
+            IdleInput::Theme(ThemeCommand::Invalid)
+        );
         assert_eq!(classify_idle_record(" /exit ", false), IdleInput::Exit);
         assert_eq!(classify_idle_record("\t/quit", true), IdleInput::Exit);
         assert_eq!(

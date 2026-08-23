@@ -11,6 +11,7 @@ pub(crate) mod presentation;
 pub(crate) mod projector;
 #[cfg(test)]
 pub(crate) mod terminal_model;
+pub(crate) mod theme;
 pub(crate) mod timeline;
 pub(crate) mod view;
 pub(crate) mod visible;

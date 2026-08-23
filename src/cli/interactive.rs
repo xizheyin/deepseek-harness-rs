@@ -23,6 +23,7 @@ use crate::{
         },
         input_memory::{InputMemory, InputMemoryError, LocalPromptId},
         key_decoder::{InputEvent, Key, KeyDecoder},
+        theme::{ThemeCommand, ThemePalette, ThemeRequest, ThemeState},
         view::{ContextEstimate, ViewMode, ViewRequest, ViewState},
     },
 };
@@ -132,6 +133,7 @@ struct PendingInlineOutput {
 #[derive(Clone, Copy, Debug)]
 struct SurfaceCommit {
     request: ViewRequest,
+    theme: ThemeRequest,
     offset: usize,
     total_rows: usize,
     page_rows: usize,
@@ -309,6 +311,7 @@ async fn run_enhanced(
     }
     let mut input = InputMemory::default();
     let mut view = ViewState::default();
+    let mut theme = ThemeState::default();
     let mut notice = None;
     let mut screen = InlineScreen::default();
     let initial_dock = render_enhanced_dock(
@@ -323,6 +326,7 @@ async fn run_enhanced(
         signals,
         &mut screen,
         &mut view,
+        &mut theme,
     )
     .await;
     let mut pending_signal = match initial_dock {
@@ -378,6 +382,12 @@ async fn run_enhanced(
                 }
                 EnhancedIdleEvent::Signal(UiSignal::Suspend) => {
                     input_escape_deadline = None;
+                    let mut dock = ActiveDock {
+                        screen: &mut screen,
+                        last_size: &mut last_size,
+                        view: &mut view,
+                        theme: &mut theme,
+                    };
                     pending_signal = suspend_enhanced(
                         &mut terminal,
                         signals,
@@ -388,9 +398,7 @@ async fn run_enhanced(
                             interaction: DockInteraction::Idle,
                             live: &live,
                         },
-                        &mut screen,
-                        &mut last_size,
-                        &mut view,
+                        &mut dock,
                     )
                     .await?;
                     continue;
@@ -406,6 +414,7 @@ async fn run_enhanced(
                         &mut decoder,
                         &mut input,
                         &mut view,
+                        &theme,
                         last_size,
                         &mut notice,
                     )?
@@ -418,6 +427,7 @@ async fn run_enhanced(
                         &scratch[..count],
                         &mut input,
                         &mut view,
+                        &theme,
                         last_size,
                         &mut notice,
                     )?;
@@ -452,7 +462,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Empty => notice = None,
                         EnhancedSubmission::Help => {
                             notice = Some(
-                                "/inspect | /review | /focus | /help | /exit | Ctrl+O inspect"
+                                "/inspect | /review | /focus | /theme | /help | /exit | Ctrl+O inspect"
                                     .to_owned(),
                             );
                         }
@@ -474,6 +484,9 @@ async fn run_enhanced(
                                 .map_err(|_| InteractiveError::Output)?;
                             notice = None;
                         }
+                        EnhancedSubmission::Theme(command) => {
+                            apply_theme_command(command, &mut theme, &mut notice)?;
+                        }
                         EnhancedSubmission::Exit => break Ok(InteractiveExit::Ordinary(0)),
                         EnhancedSubmission::Prompt => {
                             let prompt = copy_enhanced_prompt(&draft)?;
@@ -485,6 +498,7 @@ async fn run_enhanced(
                                 screen: &mut screen,
                                 last_size: &mut last_size,
                                 view: &mut view,
+                                theme: &mut theme,
                             };
                             let _ = active_dock
                                 .view
@@ -555,6 +569,12 @@ async fn run_enhanced(
                                     break Ok(InteractiveExit::Ordinary(code));
                                 }
                                 TurnDisposition::Signal(UiSignal::Suspend) => {
+                                    let mut dock = ActiveDock {
+                                        screen: &mut screen,
+                                        last_size: &mut last_size,
+                                        view: &mut view,
+                                        theme: &mut theme,
+                                    };
                                     pending_signal = suspend_enhanced(
                                         &mut terminal,
                                         signals,
@@ -565,9 +585,7 @@ async fn run_enhanced(
                                             interaction: DockInteraction::Idle,
                                             live: &live,
                                         },
-                                        &mut screen,
-                                        &mut last_size,
-                                        &mut view,
+                                        &mut dock,
                                     )
                                     .await?;
                                     continue;
@@ -593,6 +611,7 @@ async fn run_enhanced(
                 signals,
                 &mut screen,
                 &mut view,
+                &mut theme,
             )
             .await?;
             if action == EnhancedInputAction::PasteFence && pending_signal.is_none() {
@@ -619,6 +638,7 @@ async fn run_enhanced(
                             signals,
                             &mut screen,
                             &mut view,
+                            &mut theme,
                         )
                         .await?;
                     }
@@ -888,12 +908,17 @@ enum EnhancedSubmission {
     Inspect,
     Review,
     Focus,
+    Theme(ThemeCommand),
     Exit,
     Prompt,
 }
 
 fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
-    match prompt.trim_matches(|character: char| character.is_ascii_whitespace()) {
+    let command = prompt.trim_matches(|character: char| character.is_ascii_whitespace());
+    if let Some(theme) = ThemeCommand::parse(command) {
+        return EnhancedSubmission::Theme(theme);
+    }
+    match command {
         "" => EnhancedSubmission::Empty,
         "/help" => EnhancedSubmission::Help,
         "/inspect" => EnhancedSubmission::Inspect,
@@ -904,15 +929,46 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
     }
 }
 
+const THEME_LIST_NOTICE: &str =
+    "Themes · adaptive · midnight · paper · color-blind · high-contrast · mono";
+
+fn apply_theme_command(
+    command: ThemeCommand,
+    theme: &mut ThemeState,
+    notice: &mut Option<String>,
+) -> Result<(), InteractiveError> {
+    *notice = Some(match command {
+        ThemeCommand::Show => format!(
+            "Theme · {} | {THEME_LIST_NOTICE}",
+            theme.requested().palette().name()
+        ),
+        ThemeCommand::Select(palette) => {
+            let changed = theme
+                .request(palette)
+                .map_err(|_| InteractiveError::Output)?;
+            if changed {
+                format!("Theme changed · {}", palette.name())
+            } else {
+                format!("Theme already active · {}", palette.name())
+            }
+        }
+        ThemeCommand::Invalid => {
+            format!("Unknown theme | {THEME_LIST_NOTICE}")
+        }
+    });
+    Ok(())
+}
+
 fn apply_enhanced_input(
     decoder: &mut KeyDecoder,
     bytes: &[u8],
     input: &mut InputMemory,
     view: &mut ViewState,
+    theme: &ThemeState,
     size: super::terminal::TerminalSize,
     notice: &mut Option<String>,
 ) -> Result<EnhancedInputAction, InteractiveError> {
-    if view.requested() != view.committed() {
+    if view.requested() != view.committed() || theme.is_transitioning() {
         decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
         return Ok(EnhancedInputAction::Redraw);
     }
@@ -1070,10 +1126,11 @@ fn expire_enhanced_escape(
     decoder: &mut KeyDecoder,
     input: &mut InputMemory,
     view: &mut ViewState,
+    theme: &ThemeState,
     size: TerminalSize,
     notice: &mut Option<String>,
 ) -> Result<EnhancedInputAction, InteractiveError> {
-    if view.requested() != view.committed() {
+    if view.requested() != view.committed() || theme.is_transitioning() {
         decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
         return Ok(EnhancedInputAction::Redraw);
     }
@@ -1113,7 +1170,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/inspect · /review · /focus · /help · /exit · Enter send · Ctrl+J newline"
+                "/inspect · /review · /focus · /theme · /help · /exit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -1177,6 +1234,7 @@ async fn render_enhanced_dock(
     signals: &mut SignalStreams,
     screen: &mut InlineScreen,
     view: &mut ViewState,
+    theme: &mut ThemeState,
 ) -> Result<Option<UiSignal>, InteractiveError> {
     loop {
         if screen.is_poisoned() {
@@ -1194,13 +1252,20 @@ async fn render_enhanced_dock(
             model.interaction,
             size,
             view,
+            theme,
             model.live,
         )?;
-        let write = stage_surface(screen, size, resized, &surface.frame)?;
+        let write = stage_surface(
+            screen,
+            size,
+            resized,
+            &surface.frame,
+            surface.commit.theme.palette(),
+        )?;
         match write_screen_transaction(terminal.output_terminal(), signals, screen, write).await? {
             ScreenWriteOutcome::Complete => {
                 *last_size = size;
-                commit_surface(view, surface.commit);
+                commit_surface(view, theme, surface.commit);
                 return Ok(None);
             }
             ScreenWriteOutcome::Signal(signal) => return Ok(Some(signal)),
@@ -1233,12 +1298,26 @@ async fn render_active_dock(
         }
         let size = terminal.size().unwrap_or(*dock.last_size);
         let resized = size != *dock.last_size;
-        let surface = enhanced_surface_frame(input, notice, interaction, size, dock.view, live)?;
-        let write = stage_surface(dock.screen, size, resized, &surface.frame)?;
+        let surface = enhanced_surface_frame(
+            input,
+            notice,
+            interaction,
+            size,
+            dock.view,
+            dock.theme,
+            live,
+        )?;
+        let write = stage_surface(
+            dock.screen,
+            size,
+            resized,
+            &surface.frame,
+            surface.commit.theme.palette(),
+        )?;
         match write_screen_transaction(terminal, signals, dock.screen, write).await? {
             ScreenWriteOutcome::Complete => {
                 *dock.last_size = size;
-                commit_surface(dock.view, surface.commit);
+                commit_surface(dock.view, dock.theme, surface.commit);
                 return Ok(None);
             }
             ScreenWriteOutcome::Signal(signal) => return Ok(Some(signal)),
@@ -1288,6 +1367,7 @@ fn enhanced_surface_frame(
     interaction: DockInteraction,
     size: TerminalSize,
     view: &mut ViewState,
+    theme: &ThemeState,
     live: &LiveRenderer,
 ) -> Result<EnhancedSurface, InteractiveError> {
     if !matches!(
@@ -1301,7 +1381,15 @@ fn enhanced_surface_frame(
             .map_err(|_| InteractiveError::Output)?;
     }
     let request = view.requested();
-    enhanced_surface_frame_for_request(input, notice, interaction, size, request, live)
+    enhanced_surface_frame_for_request(
+        input,
+        notice,
+        interaction,
+        size,
+        request,
+        theme.requested(),
+        live,
+    )
 }
 
 fn enhanced_surface_frame_for_request(
@@ -1310,6 +1398,7 @@ fn enhanced_surface_frame_for_request(
     interaction: DockInteraction,
     size: TerminalSize,
     request: ViewRequest,
+    theme: ThemeRequest,
     live: &LiveRenderer,
 ) -> Result<EnhancedSurface, InteractiveError> {
     match request.mode() {
@@ -1317,6 +1406,7 @@ fn enhanced_surface_frame_for_request(
             frame: enhanced_dock_frame(input, notice, interaction, size)?,
             commit: SurfaceCommit {
                 request,
+                theme,
                 offset: 0,
                 total_rows: 0,
                 page_rows: 0,
@@ -1337,28 +1427,34 @@ fn enhanced_surface_frame_for_request(
                     .map_err(map_dock_error)?;
             Ok(EnhancedSurface {
                 frame,
-                commit: surface_commit(request, viewport),
+                commit: surface_commit(request, theme, viewport),
             })
         }
     }
 }
 
-fn surface_commit(request: ViewRequest, viewport: DetailViewport) -> SurfaceCommit {
+fn surface_commit(
+    request: ViewRequest,
+    theme: ThemeRequest,
+    viewport: DetailViewport,
+) -> SurfaceCommit {
     SurfaceCommit {
         request,
+        theme,
         offset: viewport.offset,
         total_rows: viewport.total_rows,
         page_rows: viewport.page_rows,
     }
 }
 
-fn commit_surface(view: &mut ViewState, commit: SurfaceCommit) {
+fn commit_surface(view: &mut ViewState, theme: &mut ThemeState, commit: SurfaceCommit) {
     let _ = view.commit(
         commit.request,
         commit.offset,
         commit.total_rows,
         commit.page_rows,
     );
+    let _ = theme.commit(commit.theme);
 }
 
 fn stage_surface(
@@ -1366,15 +1462,16 @@ fn stage_surface(
     size: TerminalSize,
     resized: bool,
     frame: &DockFrame,
+    theme: ThemePalette,
 ) -> Result<PendingScreenWrite, InteractiveError> {
     let write = if screen.is_detached() {
-        screen.stage_attach(screen_size(size), frame, true)
+        screen.stage_attach(screen_size(size), frame, theme)
     } else if resized {
-        screen.stage_resize(screen_size(size), frame, true)
+        screen.stage_resize(screen_size(size), frame, theme)
     } else if screen.dock_rows() != Some(frame.rows().map_err(map_dock_error)?) {
-        screen.stage_reanchor_bottom(frame, true)
+        screen.stage_reanchor_bottom(frame, theme)
     } else {
-        screen.stage_dock(frame, true)
+        screen.stage_dock(frame, theme)
     };
     write.map_err(map_inline_screen_error)
 }
@@ -1526,13 +1623,16 @@ async fn suspend_enhanced(
     signals: &mut SignalStreams,
     decoder: &mut KeyDecoder,
     model: DockRenderModel<'_>,
-    screen: &mut InlineScreen,
-    last_size: &mut TerminalSize,
-    view: &mut ViewState,
+    dock: &mut ActiveDock<'_>,
 ) -> Result<Option<UiSignal>, InteractiveError> {
-    if !screen.is_detached() && !screen.is_poisoned() {
-        let write = screen.stage_detach().map_err(map_inline_screen_error)?;
-        match write_screen_transaction(terminal.output_terminal(), signals, screen, write).await? {
+    if !dock.screen.is_detached() && !dock.screen.is_poisoned() {
+        let write = dock
+            .screen
+            .stage_detach()
+            .map_err(map_inline_screen_error)?;
+        match write_screen_transaction(terminal.output_terminal(), signals, dock.screen, write)
+            .await?
+        {
             ScreenWriteOutcome::Complete => {}
             ScreenWriteOutcome::Signal(signal) => return Ok(Some(signal)),
             ScreenWriteOutcome::Resize | ScreenWriteOutcome::PoisonedResize => {
@@ -1547,17 +1647,17 @@ async fn suspend_enhanced(
                 .await
                 {
                     Ok(Some(signal)) => return Ok(Some(signal)),
-                    Ok(None) => screen.recover_after_visual_reset(),
+                    Ok(None) => dock.screen.recover_after_visual_reset(),
                     Err(_) => terminal.best_effort_visual_reset(),
                 }
             }
         }
     }
-    if screen.is_poisoned() {
+    if dock.screen.is_poisoned() {
         match write_enhanced_bytes(terminal.output_terminal(), POISON_TEARDOWN_BYTES, signals).await
         {
             Ok(Some(signal)) => return Ok(Some(signal)),
-            Ok(None) => screen.recover_after_visual_reset(),
+            Ok(None) => dock.screen.recover_after_visual_reset(),
             Err(_) => terminal.best_effort_visual_reset(),
         }
     }
@@ -1574,14 +1674,24 @@ async fn suspend_enhanced(
         if terminal.is_foreground()? {
             terminal.reenter_after_resume()?;
             decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
-            if screen.is_poisoned() {
+            if dock.screen.is_poisoned() {
                 if let Some(signal) =
-                    recover_poisoned_screen(terminal.output_terminal(), signals, screen).await?
+                    recover_poisoned_screen(terminal.output_terminal(), signals, dock.screen)
+                        .await?
                 {
                     return Ok(Some(signal));
                 }
             }
-            return render_enhanced_dock(model, terminal, last_size, signals, screen, view).await;
+            return render_enhanced_dock(
+                model,
+                terminal,
+                dock.last_size,
+                signals,
+                dock.screen,
+                dock.view,
+                dock.theme,
+            )
+            .await;
         }
     }
 }
@@ -1736,6 +1846,22 @@ async fn run_linear(
                             }
                         }
                     }
+                    IdleInput::Theme(command) => {
+                        let message = if matches!(command, ThemeCommand::Invalid) {
+                            "[unknown theme; linear UI remains plain]\n"
+                        } else {
+                            "[linear UI is always plain; theme command kept local]\n"
+                        };
+                        if let Some(signal) =
+                            write_notice(message, &mut presenter, &terminal, signals).await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
                     IdleInput::Exit => return Ok(InteractiveExit::Ordinary(0)),
                     IdleInput::Submit(prompt) => {
                         parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
@@ -1840,6 +1966,7 @@ struct ActiveDock<'a> {
     screen: &'a mut InlineScreen,
     last_size: &'a mut TerminalSize,
     view: &'a mut ViewState,
+    theme: &'a mut ThemeState,
 }
 
 #[derive(Clone, Copy)]
@@ -2570,7 +2697,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                 active.terminal,
                                 active.enhanced_decoder.as_deref_mut(),
                                 active.queued_input.as_deref_mut(),
-                                active.active_dock.as_mut().map(|dock| &mut *dock.view),
+                                active.active_dock.as_mut(),
                                 active.queue_notice.as_deref_mut(),
                             )? {
                                 ActiveInputOutcome::Continue => {}
@@ -2721,7 +2848,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                     active.terminal,
                                     active.enhanced_decoder.as_deref_mut(),
                                     active.queued_input.as_deref_mut(),
-                                    active.active_dock.as_mut().map(|dock| &mut *dock.view),
+                                    active.active_dock.as_mut(),
                                     active.queue_notice.as_deref_mut(),
                                     &active.scratch[..count],
                                 )?;
@@ -3062,7 +3189,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                 active.terminal,
                                 active.enhanced_decoder.as_deref_mut(),
                                 active.queued_input.as_deref_mut(),
-                                active.active_dock.as_mut().map(|dock| &mut *dock.view),
+                                active.active_dock.as_mut(),
                                 active.queue_notice.as_deref_mut(),
                             )? {
                                 ActiveInputOutcome::Continue => {}
@@ -3178,7 +3305,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                     active.terminal,
                                     active.enhanced_decoder.as_deref_mut(),
                                     active.queued_input.as_deref_mut(),
-                                    active.active_dock.as_mut().map(|dock| &mut *dock.view),
+                                    active.active_dock.as_mut(),
                                     active.queue_notice.as_deref_mut(),
                                     &active.scratch[..count],
                                 )?;
@@ -3409,11 +3536,11 @@ fn handle_active_input(
     terminal: &AsyncTerminal,
     decoder: Option<&mut KeyDecoder>,
     input: Option<&mut InputMemory>,
-    view: Option<&mut ViewState>,
+    dock: Option<&mut ActiveDock<'_>>,
     notice: Option<&mut Option<String>>,
     bytes: &[u8],
 ) -> Result<ActiveInputOutcome, InteractiveError> {
-    let (Some(decoder), Some(input), Some(view), Some(notice)) = (decoder, input, view, notice)
+    let (Some(decoder), Some(input), Some(dock), Some(notice)) = (decoder, input, dock, notice)
     else {
         return Ok(ActiveInputOutcome::Continue);
     };
@@ -3421,7 +3548,7 @@ fn handle_active_input(
         rows: MIN_ENHANCED_ROWS,
         columns: MIN_ENHANCED_COLUMNS,
     });
-    match apply_enhanced_input(decoder, bytes, input, view, size, notice)? {
+    match apply_enhanced_input(decoder, bytes, input, dock.view, dock.theme, size, notice)? {
         EnhancedInputAction::None => Ok(ActiveInputOutcome::Continue),
         EnhancedInputAction::Redraw => Ok(ActiveInputOutcome::Redraw),
         EnhancedInputAction::PasteFence => Ok(ActiveInputOutcome::PasteFence),
@@ -3430,8 +3557,9 @@ fn handle_active_input(
             match classify_enhanced_submission(input.composer().text()) {
                 EnhancedSubmission::Exit => return Ok(ActiveInputOutcome::Eof),
                 EnhancedSubmission::Help => {
+                    let _ = input.take_draft_for_turn()?;
                     *notice = Some(
-                        "/inspect | /review | /focus | /help | /exit | Enter queue | Ctrl+J newline"
+                        "/inspect | /review | /focus | /theme | /help | /exit | Enter queue | Ctrl+J newline"
                             .to_owned(),
                     );
                     return Ok(ActiveInputOutcome::Redraw);
@@ -3446,10 +3574,16 @@ fn handle_active_input(
                         _ => return Err(InteractiveError::Agent),
                     };
                     let _ = input.take_draft_for_turn()?;
-                    let _ = view
+                    let _ = dock
+                        .view
                         .request_mode(mode)
                         .map_err(|_| InteractiveError::Output)?;
                     *notice = None;
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::Theme(command) => {
+                    let _ = input.take_draft_for_turn()?;
+                    apply_theme_command(command, dock.theme, notice)?;
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Empty => {
@@ -3478,10 +3612,10 @@ fn handle_active_escape_expiry(
     terminal: &AsyncTerminal,
     decoder: Option<&mut KeyDecoder>,
     input: Option<&mut InputMemory>,
-    view: Option<&mut ViewState>,
+    dock: Option<&mut ActiveDock<'_>>,
     notice: Option<&mut Option<String>>,
 ) -> Result<ActiveInputOutcome, InteractiveError> {
-    let (Some(decoder), Some(input), Some(view), Some(notice)) = (decoder, input, view, notice)
+    let (Some(decoder), Some(input), Some(dock), Some(notice)) = (decoder, input, dock, notice)
     else {
         return Ok(ActiveInputOutcome::Continue);
     };
@@ -3489,7 +3623,7 @@ fn handle_active_escape_expiry(
         rows: MIN_ENHANCED_ROWS,
         columns: MIN_ENHANCED_COLUMNS,
     });
-    match expire_enhanced_escape(decoder, input, view, size, notice)? {
+    match expire_enhanced_escape(decoder, input, dock.view, dock.theme, size, notice)? {
         EnhancedInputAction::None => Ok(ActiveInputOutcome::Continue),
         EnhancedInputAction::Redraw => Ok(ActiveInputOutcome::Redraw),
         EnhancedInputAction::PasteFence => Ok(ActiveInputOutcome::PasteFence),
@@ -3814,11 +3948,16 @@ fn complete_ready_frame(
                 DockInteraction::Running,
                 size,
                 dock.view.committed(),
+                dock.theme.requested(),
                 live,
             )?;
             let write = dock
                 .screen
-                .stage_transcript(presentation.chunk(), &surface.frame, true)
+                .stage_transcript(
+                    presentation.chunk(),
+                    &surface.frame,
+                    surface.commit.theme.palette(),
+                )
                 .map_err(map_inline_screen_error)?;
             Ok(PendingOutput::Inline(PendingInlineOutput {
                 write,
@@ -3842,8 +3981,22 @@ fn complete_ready_frame(
         if size != *dock.last_size {
             return Err(InteractiveError::TerminalUnsupported);
         }
-        let surface = enhanced_surface_frame(input, notice, interaction, size, dock.view, live)?;
-        let write = stage_surface(dock.screen, size, false, &surface.frame)?;
+        let surface = enhanced_surface_frame(
+            input,
+            notice,
+            interaction,
+            size,
+            dock.view,
+            dock.theme,
+            live,
+        )?;
+        let write = stage_surface(
+            dock.screen,
+            size,
+            false,
+            &surface.frame,
+            surface.commit.theme.palette(),
+        )?;
         *pending = Some(PendingOutput::Inline(PendingInlineOutput {
             write,
             intent: InlineIntent::Dock(interaction),
@@ -3882,7 +4035,7 @@ fn complete_ready_frame(
             dock.screen
                 .commit(output.write)
                 .map_err(map_inline_screen_error)?;
-            commit_surface(dock.view, output.surface);
+            commit_surface(dock.view, dock.theme, output.surface);
             if let InlineIntent::Transcript(presentation) = output.intent {
                 transcript_presenter
                     .take()
@@ -4237,15 +4390,20 @@ async fn write_enhanced_terminal_frame(
             model.interaction,
             size,
             dock.view.committed(),
+            dock.theme.requested(),
             model.live,
         )?;
         let write = dock
             .screen
-            .stage_transcript(presentation.chunk(), &surface.frame, true)
+            .stage_transcript(
+                presentation.chunk(),
+                &surface.frame,
+                surface.commit.theme.palette(),
+            )
             .map_err(map_inline_screen_error)?;
         match write_screen_transaction(terminal, signals, dock.screen, write).await? {
             ScreenWriteOutcome::Complete => {
-                commit_surface(dock.view, surface.commit);
+                commit_surface(dock.view, dock.theme, surface.commit);
                 presenter.commit(presentation);
                 return Ok(None);
             }
@@ -4355,10 +4513,11 @@ mod tests {
     use super::{
         AfterFrame, ApprovalUiUpdate, InlineIntent, InteractiveError, InteractiveExit,
         InteractivePresentation, PendingInlineOutput, PendingOutput, StopIntent, SurfaceCommit,
-        apply_approval_update, apply_enhanced_input, discard_ready_updates_after_stop,
-        expire_enhanced_escape, latch_observer_fault, observe_enhanced_cleanup_signal,
-        observe_failure, observe_signal, prepare_pending_for_resize, presentation_uses_enhanced,
-        session_context_estimate, turn_exhausted_session_capacity,
+        apply_approval_update, apply_enhanced_input, apply_theme_command, commit_surface,
+        discard_ready_updates_after_stop, expire_enhanced_escape, latch_observer_fault,
+        observe_enhanced_cleanup_signal, observe_failure, observe_signal,
+        prepare_pending_for_resize, presentation_uses_enhanced, session_context_estimate,
+        turn_exhausted_session_capacity,
     };
     use crate::{
         agent::{ApprovalPrompt, ApprovalRequest},
@@ -4380,6 +4539,7 @@ mod tests {
             inline_screen::InlineScreen,
             input_memory::InputMemory,
             key_decoder::KeyDecoder,
+            theme::{ThemeCommand, ThemePalette, ThemeState},
             view::{ViewMode, ViewState},
         },
     };
@@ -4444,6 +4604,7 @@ mod tests {
         let mut input = InputMemory::default();
         input.insert_text("SAFE_DRAFT").unwrap();
         let mut view = ViewState::default();
+        let theme = ThemeState::default();
         let mut notice = None;
         let size = TerminalSize {
             rows: 24,
@@ -4455,6 +4616,7 @@ mod tests {
             b"\x0f\r",
             &mut input,
             &mut view,
+            &theme,
             size,
             &mut notice,
         )
@@ -4470,6 +4632,7 @@ mod tests {
             b"hidden\r",
             &mut input,
             &mut view,
+            &theme,
             size,
             &mut notice,
         )
@@ -4485,6 +4648,7 @@ mod tests {
             b"\x1b[6~\r",
             &mut input,
             &mut view,
+            &theme,
             size,
             &mut notice,
         )
@@ -4495,11 +4659,63 @@ mod tests {
     }
 
     #[test]
+    fn theme_transition_discards_input_until_the_palette_redraw_commits() {
+        let mut decoder = KeyDecoder::default();
+        let mut input = InputMemory::default();
+        let mut view = ViewState::default();
+        let mut theme = ThemeState::default();
+        let mut notice = None;
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+
+        apply_theme_command(
+            ThemeCommand::Select(ThemePalette::Paper),
+            &mut theme,
+            &mut notice,
+        )
+        .unwrap();
+        assert!(theme.is_transitioning());
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"HIDDEN\r",
+                &mut input,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::Redraw
+        );
+        assert!(input.composer().is_empty());
+
+        assert!(theme.commit(theme.requested()));
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"fresh",
+                &mut input,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::Redraw
+        );
+        assert_eq!(input.composer().text(), "fresh");
+    }
+
+    #[test]
     fn detail_escape_requires_a_fresh_input_after_returning_to_focus() {
         let mut decoder = KeyDecoder::default();
         let mut input = InputMemory::default();
         input.insert_text("SAFE_DRAFT").unwrap();
         let mut view = ViewState::default();
+        let theme = ThemeState::default();
         view.request_mode(ViewMode::Inspect).unwrap();
         assert!(view.commit(view.requested(), 0, 20, 10));
         let mut notice = None;
@@ -4514,6 +4730,7 @@ mod tests {
                 b"\x1b",
                 &mut input,
                 &mut view,
+                &theme,
                 size,
                 &mut notice,
             )
@@ -4522,7 +4739,15 @@ mod tests {
         );
         assert!(decoder.escape_pending());
         assert_eq!(
-            expire_enhanced_escape(&mut decoder, &mut input, &mut view, size, &mut notice).unwrap(),
+            expire_enhanced_escape(
+                &mut decoder,
+                &mut input,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
             super::EnhancedInputAction::Redraw
         );
         assert_eq!(view.requested().mode(), ViewMode::Focus);
@@ -4533,6 +4758,7 @@ mod tests {
                 b"\r",
                 &mut input,
                 &mut view,
+                &theme,
                 size,
                 &mut notice,
             )
@@ -4554,20 +4780,23 @@ mod tests {
         let frame = super::enhanced_dock_frame(&input, None, interaction, size).unwrap();
         let mut screen = InlineScreen::default();
         let mut attach = screen
-            .stage_attach(super::screen_size(size), &frame, true)
+            .stage_attach(super::screen_size(size), &frame, ThemePalette::Adaptive)
             .unwrap();
         let attach_bytes = attach.bytes().len();
         attach.advance(attach_bytes).unwrap();
         screen.commit(attach).unwrap();
 
-        let mut write = screen.stage_dock(&frame, true).unwrap();
+        let mut write = screen.stage_dock(&frame, ThemePalette::Paper).unwrap();
+        let mut theme = ThemeState::default();
+        theme.request(ThemePalette::Paper).unwrap();
         write.advance(1).unwrap();
-        let view = ViewState::default();
+        let mut view = ViewState::default();
         let mut pending = Some(PendingOutput::Inline(PendingInlineOutput {
             write,
             intent: InlineIntent::Dock(interaction),
             surface: SurfaceCommit {
                 request: view.requested(),
+                theme: theme.requested(),
                 offset: 0,
                 total_rows: 0,
                 page_rows: 0,
@@ -4575,6 +4804,9 @@ mod tests {
         }));
         assert!(prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
         assert!(screen.is_poisoned());
+        assert_eq!(theme.requested().palette(), ThemePalette::Paper);
+        assert_eq!(theme.committed().palette(), ThemePalette::Adaptive);
+        assert!(theme.is_transitioning());
         assert!(matches!(
             pending,
             Some(PendingOutput::Dock(DockInteraction::Approval(
@@ -4589,17 +4821,61 @@ mod tests {
         };
         let compact = super::enhanced_dock_frame(&input, None, interaction, compact_size).unwrap();
         let mut second_resize = screen
-            .stage_attach(super::screen_size(compact_size), &compact, true)
+            .stage_attach(
+                super::screen_size(compact_size),
+                &compact,
+                theme.requested().palette(),
+            )
             .unwrap();
         second_resize.advance(1).unwrap();
         screen.abort(second_resize);
         assert!(screen.is_poisoned());
         screen.recover_after_visual_reset();
+        let mut recovered = screen
+            .stage_attach(
+                super::screen_size(compact_size),
+                &compact,
+                theme.requested().palette(),
+            )
+            .unwrap();
         assert!(
-            screen
-                .stage_attach(super::screen_size(compact_size), &compact, true)
-                .is_ok()
+            recovered
+                .bytes()
+                .windows(b"> Allow".len())
+                .any(|row| row == b"> Allow")
         );
+        assert!(
+            !recovered
+                .bytes()
+                .windows(b"> Reject".len())
+                .any(|row| row == b"> Reject")
+        );
+        assert!(
+            recovered
+                .bytes()
+                .windows(
+                    ThemePalette::Paper
+                        .sgr(crate::tui::presentation::TextStyle::Selection)
+                        .len()
+                )
+                .any(|bytes| bytes
+                    == ThemePalette::Paper
+                        .sgr(crate::tui::presentation::TextStyle::Selection)
+                        .as_bytes())
+        );
+        let recovered_bytes = recovered.bytes().len();
+        recovered.advance(recovered_bytes).unwrap();
+        screen.commit(recovered).unwrap();
+        let recovered_surface = SurfaceCommit {
+            request: view.requested(),
+            theme: theme.requested(),
+            offset: 0,
+            total_rows: 0,
+            page_rows: 0,
+        };
+        commit_surface(&mut view, &mut theme, recovered_surface);
+        assert_eq!(theme.committed().palette(), ThemePalette::Paper);
+        assert!(!theme.is_transitioning());
     }
 
     #[test]

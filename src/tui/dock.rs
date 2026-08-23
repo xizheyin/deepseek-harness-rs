@@ -7,6 +7,8 @@ use unicode_width::UnicodeWidthStr;
 use super::{
     composer::Composer,
     input_memory::PromptQueue,
+    presentation::TextStyle,
+    theme::ThemePalette,
     view::{DetailDocument, DetailTone},
     visible::{VisibleTextError, render_visible_owned},
 };
@@ -60,6 +62,7 @@ enum DockRole {
     Hint,
     Notice,
     ApprovalChoice,
+    ApprovalSelected,
     ApprovalWarning,
     DetailTitle,
     DetailPlain,
@@ -196,7 +199,11 @@ impl DockFrame {
                 };
                 let marker = if choice == selected { ">" } else { " " };
                 lines.push(line(
-                    DockRole::ApprovalChoice,
+                    if choice == selected {
+                        DockRole::ApprovalSelected
+                    } else {
+                        DockRole::ApprovalChoice
+                    },
                     fit_ascii(&format!(" {marker} {label}"), width_usize),
                 ));
             }
@@ -441,14 +448,18 @@ impl DockFrame {
     /// Writes only the owned bottom rows. Coordinate ownership remains with
     /// `InlineScreen`; this pure layout object never establishes a scrolling
     /// region or decides how transcript output moves.
-    pub(crate) fn render_bottom(&self, output: &mut String, styled: bool) -> Result<(), DockError> {
+    pub(crate) fn render_bottom(
+        &self,
+        output: &mut String,
+        theme: ThemePalette,
+    ) -> Result<(), DockError> {
         let start_row = self.output_bottom.checked_add(1).ok_or(DockError::Limit)?;
         output.push_str("\x1b[?25l");
         push_absolute_frame_lines(
             output,
             &self.lines,
             start_row,
-            styled,
+            theme,
             self.software_cursor
                 .then_some((self.cursor_row, self.cursor_column)),
         )?;
@@ -471,7 +482,7 @@ fn push_absolute_frame_lines(
     output: &mut String,
     lines: &[DockLine],
     start_row: u16,
-    styled: bool,
+    theme: ThemePalette,
     software_cursor: Option<(u16, u16)>,
 ) -> Result<(), DockError> {
     for (index, line) in lines.iter().enumerate() {
@@ -483,7 +494,7 @@ fn push_absolute_frame_lines(
         let cursor_column = software_cursor
             .filter(|(cursor_row, _)| usize::from(*cursor_row) == index)
             .map(|(_, cursor_column)| cursor_column);
-        push_line(output, line, styled, cursor_column)?;
+        push_line(output, line, theme, cursor_column)?;
     }
     Ok(())
 }
@@ -694,41 +705,51 @@ const fn detail_role(tone: DetailTone) -> DockRole {
 fn push_line(
     output: &mut String,
     line: &DockLine,
-    styled: bool,
+    theme: ThemePalette,
     cursor_column: Option<u16>,
 ) -> Result<(), DockError> {
-    if styled {
-        output.push_str(match line.role {
-            DockRole::Queue | DockRole::Hint => "\x1b[2m",
-            DockRole::Divider => "\x1b[2;36m",
-            DockRole::Composer => "\x1b[0m",
-            DockRole::Notice => "\x1b[1;33m",
-            DockRole::ApprovalChoice => "\x1b[1m",
-            DockRole::ApprovalWarning => "\x1b[1;33m",
-            DockRole::DetailTitle | DockRole::DetailAccent => "\x1b[1;36m",
-            DockRole::DetailPlain => "\x1b[0m",
-            DockRole::DetailMuted => "\x1b[2m",
-            DockRole::DetailPositive => "\x1b[32m",
-            DockRole::DetailCaution => "\x1b[1;33m",
-            DockRole::DetailNegative => "\x1b[1;31m",
-            DockRole::DetailCode => "\x1b[1m",
-        });
-    }
+    let style = style_for_role(line.role);
+    push_absolute_style(output, theme, style);
     output
         .try_reserve(line.text.len() + 4)
         .map_err(|_| DockError::Capacity)?;
     if let Some(column) = cursor_column {
         let split = byte_at_cell(&line.text, usize::from(column)).ok_or(DockError::InvalidState)?;
         output.push_str(&line.text[..split]);
-        output.push_str("\x1b[7m \x1b[0m");
+        push_absolute_style(output, theme, TextStyle::Selection);
+        output.push(' ');
+        push_absolute_style(output, theme, style);
         output.push_str(&line.text[split..]);
     } else {
         output.push_str(&line.text);
     }
-    if styled {
-        output.push_str("\x1b[0m");
-    }
+    output.push_str("\x1b[0m");
     Ok(())
+}
+
+const fn style_for_role(role: DockRole) -> TextStyle {
+    match role {
+        DockRole::Queue | DockRole::Hint | DockRole::DetailMuted => TextStyle::Muted,
+        DockRole::Divider => TextStyle::Border,
+        DockRole::Composer | DockRole::DetailPlain => TextStyle::Plain,
+        DockRole::Notice | DockRole::ApprovalWarning | DockRole::DetailCaution => {
+            TextStyle::Warning
+        }
+        DockRole::ApprovalChoice => TextStyle::Code,
+        DockRole::ApprovalSelected => TextStyle::Selection,
+        DockRole::DetailTitle => TextStyle::Heading,
+        DockRole::DetailAccent => TextStyle::Accent,
+        DockRole::DetailPositive => TextStyle::Success,
+        DockRole::DetailNegative => TextStyle::Error,
+        DockRole::DetailCode => TextStyle::Code,
+    }
+}
+
+fn push_absolute_style(output: &mut String, theme: ThemePalette, style: TextStyle) {
+    output.push_str("\x1b[0m");
+    if style != TextStyle::Plain {
+        output.push_str(theme.sgr(style));
+    }
 }
 
 fn byte_at_cell(text: &str, target: usize) -> Option<usize> {
@@ -754,8 +775,31 @@ mod tests {
     use crate::tui::{
         composer::Composer,
         input_memory::PromptQueue,
+        presentation::TextStyle,
+        theme::ThemePalette,
         view::{DetailDocument, DetailTone, ViewMode},
     };
+
+    fn without_sgr(bytes: &str) -> Vec<u8> {
+        let bytes = bytes.as_bytes();
+        let mut output = Vec::new();
+        let mut index = 0_usize;
+        while index < bytes.len() {
+            if index + 1 < bytes.len() && bytes[index] == 0x1b && bytes[index + 1] == b'[' {
+                let mut end = index + 2;
+                while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                    end += 1;
+                }
+                if end < bytes.len() && bytes[end] == b'm' {
+                    index = end + 1;
+                    continue;
+                }
+            }
+            output.push(bytes[index]);
+            index += 1;
+        }
+        output
+    }
 
     #[test]
     fn responsive_frames_fit_44_80_and_112_columns() {
@@ -915,6 +959,17 @@ mod tests {
                     .iter()
                     .any(|line| line.text.contains("Stop turn"))
             );
+            let mut rendered = String::new();
+            frame
+                .render_bottom(&mut rendered, ThemePalette::Adaptive)
+                .unwrap();
+            assert_eq!(
+                rendered
+                    .matches(ThemePalette::Adaptive.sgr(TextStyle::Selection))
+                    .count(),
+                1,
+                "only the selected approval choice may use selection styling"
+            );
             assert!(
                 frame
                     .lines
@@ -925,6 +980,46 @@ mod tests {
                 unicode_width::UnicodeWidthStr::width(line.text.as_str())
                     <= usize::from(columns - 1)
             }));
+        }
+    }
+
+    #[test]
+    fn every_palette_preserves_the_same_compact_44_80_112_geometry_and_text() {
+        let composer = Composer::default();
+        let queue = PromptQueue::default();
+        for (rows, columns) in [(5, 12), (20, 44), (24, 80), (34, 112)] {
+            let frame = DockFrame::layout(
+                DockModel {
+                    interaction: DockInteraction::Approval(DockApprovalSelection::Reject),
+                    composer: &composer,
+                    queue: &queue,
+                    notice: None,
+                },
+                rows,
+                columns,
+            )
+            .unwrap();
+            let mut expected = None;
+            for palette in ThemePalette::ALL {
+                let mut bytes = String::new();
+                frame.render_bottom(&mut bytes, palette).unwrap();
+                let visible = without_sgr(&bytes);
+                assert!(
+                    visible
+                        .windows(b"> Reject".len())
+                        .any(|window| window == b"> Reject")
+                );
+                assert_eq!(
+                    bytes.matches(palette.sgr(TextStyle::Selection)).count(),
+                    1,
+                    "{palette:?} must style exactly the selected Reject choice at {columns}x{rows}"
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&visible, expected);
+                } else {
+                    expected = Some(visible);
+                }
+            }
         }
     }
 

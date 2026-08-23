@@ -250,7 +250,7 @@ impl LiveFrame {
 
     pub(super) fn help() -> Result<Self, LiveRenderError> {
         Self::trusted(
-            "[commands]\n/inspect  show committed turn facts\n/review  show the last joined turn summary\n/help  show this help\n/exit  exit dsh\n/quit  exit dsh\n",
+            "[commands]\n/inspect  show committed turn facts\n/review  show the last joined turn summary\n/theme  show/select the enhanced palette; linear stays plain\n/help  show this help\n/exit  exit dsh\n/quit  exit dsh\n",
         )
     }
 

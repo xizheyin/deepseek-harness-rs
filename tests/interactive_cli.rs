@@ -43,6 +43,36 @@ fn text_sse(text: &str) -> String {
     )
 }
 
+fn contains_foreground_color_sgr(bytes: &[u8]) -> bool {
+    let mut index = 0_usize;
+    while index + 2 < bytes.len() {
+        if bytes[index] != 0x1b || bytes[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let start = index + 2;
+        let mut end = start;
+        while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+            end += 1;
+        }
+        if end == bytes.len() {
+            break;
+        }
+        if bytes[end] == b'm' {
+            let params = std::str::from_utf8(&bytes[start..end]).unwrap_or("");
+            if params.split(';').any(|value| {
+                value.parse::<u16>().is_ok_and(|value| {
+                    value == 38 || (30..=37).contains(&value) || (90..=97).contains(&value)
+                })
+            }) {
+                return true;
+            }
+        }
+        index = end + 1;
+    }
+    false
+}
+
 fn fragmented_text_sse(fragments: &[&str]) -> String {
     let mut body = String::new();
     body.try_reserve(fragments.len().saturating_mul(96).saturating_add(128))
@@ -302,7 +332,8 @@ fn styled_terminal_uses_product_owned_color_and_semantic_labels() {
     dsh.expect(b"\x1b[1;36mdsh-rs\x1b[0m");
     dsh.expect("❯".as_bytes());
     dsh.write(b"show the styled interface\r");
-    dsh.expect(b"\x1b[1;36mDSH\x1b[0m\r\n\x1b[36mstyled answer");
+    dsh.expect(b"\x1b[1;36mDSH");
+    dsh.expect(b"\x1b[36mstyled answer");
     dsh.expect(b"\x1b[1;36mTurn complete");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     let (status, transcript) = dsh.exit_cleanly();
@@ -408,6 +439,13 @@ fn linear_inspect_and_review_are_local_zero_escape_reports() {
     dsh.expect(b"INSPECT");
     dsh.expect(b"COMMITTED FACTS");
     dsh.expect_occurrences(b"dsh > ", 4);
+
+    dsh.write(b"/theme paper\r");
+    dsh.expect(b"[linear UI is always plain; theme command kept local]");
+    dsh.expect_occurrences(b"dsh > ", 5);
+    dsh.write(b"/theme PRIVATE_UNKNOWN_NAME\r");
+    dsh.expect(b"[unknown theme; linear UI remains plain]");
+    dsh.expect_occurrences(b"dsh > ", 6);
     let (status, transcript) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -415,6 +453,179 @@ fn linear_inspect_and_review_are_local_zero_escape_reports() {
     assert!(!transcript.contains(&0x1b));
     assert_eq!(requests.len(), 1);
     assert_eq!(last_user_content(&requests[0]), "build a linear review");
+}
+
+#[test]
+fn enhanced_theme_commands_are_local_transactional_and_reach_all_six_palettes() {
+    let mut server = GatedFirstSseServer::start(
+        String::new(),
+        text_sse("theme selection kept one fresh request"),
+        Vec::new(),
+    );
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    for (name, sgr) in [
+        ("midnight", "\x1b[1;38;5;221m"),
+        ("paper", "\x1b[1;38;5;130m"),
+        ("color-blind", "\x1b[1;38;5;208m"),
+        ("high-contrast", "\x1b[1;7m"),
+        ("mono", "\x1b[1m"),
+        ("adaptive", "\x1b[1;33m"),
+    ] {
+        let checkpoint = dsh.checkpoint();
+        dsh.write(format!("/theme {name}\r").as_bytes());
+        dsh.expect_after(checkpoint, format!("Theme changed · {name}").as_bytes());
+        dsh.expect_after(checkpoint, sgr.as_bytes());
+        server.assert_no_first_request(Duration::from_millis(100));
+        if name == "paper" {
+            let narrow = dsh.checkpoint();
+            dsh.resize(20, 44);
+            dsh.expect_after(narrow, b"\x1b[1;38;5;25m");
+            let wide = dsh.checkpoint();
+            dsh.resize(24, 80);
+            dsh.expect_after(wide, b"\x1b[1;38;5;25m");
+        }
+    }
+
+    let wide_list = dsh.checkpoint();
+    dsh.resize(34, 112);
+    dsh.expect_after(wide_list, b"\x1b[2;36m");
+    let list = dsh.checkpoint();
+    dsh.write(b"/theme\r");
+    dsh.expect_after(list, "Theme · adaptive".as_bytes());
+    dsh.expect_after(list, b"color-blind");
+    dsh.expect_after(list, b"high-contrast");
+    server.assert_no_first_request(Duration::from_millis(100));
+
+    let complete_theme_tail = "high-contrast · mono".as_bytes();
+    for (rows, columns, visible_notice) in [
+        (20, 44, "Theme · adaptive | Themes · adaptive · midn"),
+        (
+            24,
+            80,
+            "Theme · adaptive | Themes · adaptive · midnight · paper · color-blind · high-co",
+        ),
+        (5, 12, "Theme · ada"),
+    ] {
+        let resized = dsh.checkpoint();
+        dsh.resize(rows, columns);
+        dsh.expect_after(resized, b"\x1b[2;36m");
+        let show = dsh.checkpoint();
+        dsh.write(b"/theme\r");
+        dsh.expect_after(show, visible_notice.as_bytes());
+        assert!(
+            !dsh.snapshot()[show..]
+                .windows(complete_theme_tail.len())
+                .any(|window| window == complete_theme_tail),
+            "a narrow one-line Dock notice must be visibly truncated"
+        );
+        server.assert_no_first_request(Duration::from_millis(100));
+    }
+
+    let restored = dsh.checkpoint();
+    dsh.resize(34, 112);
+    dsh.expect_after(restored, b"\x1b[2;36m");
+
+    let invalid = dsh.checkpoint();
+    dsh.write(b"/theme PRIVATE_THEME_NAME\r");
+    dsh.expect_after(invalid, b"Unknown theme");
+    server.assert_no_first_request(Duration::from_millis(100));
+    assert!(
+        !dsh.snapshot()[invalid..]
+            .windows(b"PRIVATE_THEME_NAME".len())
+            .any(|window| window == b"PRIVATE_THEME_NAME")
+    );
+
+    let fence = dsh.checkpoint();
+    dsh.write(b"/theme paper\rHIDDEN_THEME_PROMPT\r");
+    dsh.expect_after(fence, "Theme changed · paper".as_bytes());
+    server.assert_no_first_request(Duration::from_millis(250));
+
+    dsh.write(b"fresh request after theme fence\r");
+    server.release();
+    dsh.expect(b"theme selection kept one fresh request");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        last_user_content(&requests[0]),
+        "fresh request after theme fence"
+    );
+}
+
+#[test]
+fn active_theme_switch_never_enters_the_next_turn_fifo() {
+    let first =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"active theme prefix\"}}]}\n\n".to_owned();
+    let mut server = GatedThenStalledSseServer::start(first, text_sse(" active theme suffix"));
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"start a themed active turn\r");
+    dsh.expect(b"active theme prefix");
+    let themed = dsh.checkpoint();
+    dsh.write(b"/theme mono\r");
+    dsh.expect_after(themed, "Theme changed · mono".as_bytes());
+    server.assert_no_second_request(Duration::from_millis(250));
+
+    let shown = dsh.checkpoint();
+    dsh.write(b"/theme\r");
+    dsh.expect_after(shown, "Theme · mono".as_bytes());
+    server.assert_no_second_request(Duration::from_millis(100));
+
+    let invalid = dsh.checkpoint();
+    dsh.write(b"/theme PRIVATE_ACTIVE_THEME\rHIDDEN_ACTIVE_PROMPT\r");
+    dsh.expect_after(invalid, b"Unknown theme");
+    server.assert_no_second_request(Duration::from_millis(250));
+    assert!(
+        !dsh.snapshot()[invalid..]
+            .windows(b"PRIVATE_ACTIVE_THEME".len())
+            .any(|window| window == b"PRIVATE_ACTIVE_THEME")
+    );
+
+    server.release();
+    dsh.expect_after(themed, b"active theme suffix");
+    dsh.expect_after(themed, b"Turn complete");
+    server.assert_no_second_request(Duration::from_millis(250));
+    let themed_output = dsh.snapshot();
+    assert_eq!(
+        themed_output
+            .windows(b"active theme prefix".len())
+            .filter(|window| *window == b"active theme prefix")
+            .count(),
+        1,
+        "a palette-only redraw must not replay old transcript text"
+    );
+    assert!(
+        !contains_foreground_color_sgr(&themed_output[themed..]),
+        "Mono may use attributes and cursor controls, but no foreground color"
+    );
+
+    dsh.write(b"fresh prompt after active theme\r");
+    server.wait_until_second_request();
+    dsh.expect(b"Working");
+    dsh.write(&[0x03]);
+    dsh.expect(b"stopped; skipped");
+    let (status, _) = dsh.exit_cleanly();
+    let (requests, second_closed) = server.finish();
+
+    assert!(status.success());
+    assert!(second_closed);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        last_user_content(&requests[0]),
+        "start a themed active turn"
+    );
+    assert_eq!(
+        last_user_content(&requests[1]),
+        "fresh prompt after active theme"
+    );
 }
 
 #[test]
@@ -530,6 +741,8 @@ fn enhanced_dock_keeps_cbreak_across_idle_and_restores_it_for_suspend() {
     dsh.expect("❯".as_bytes());
     assert!(dsh.terminal_uses_application_mode());
     assert_ne!(dsh.terminal_state(), dsh.initial_terminal_state());
+    dsh.write(b"/theme paper\r");
+    dsh.expect("Theme changed · paper".as_bytes());
     dsh.write(b"continue after enhanced suspension");
     let inspect = dsh.checkpoint();
     dsh.write(&[0x0f]);
@@ -541,6 +754,7 @@ fn enhanced_dock_keeps_cbreak_across_idle_and_restores_it_for_suspend() {
     let resumed = dsh.checkpoint();
     dsh.signal(Signal::CONT);
     dsh.expect_after(resumed, b"INSPECT");
+    dsh.expect_after(resumed, b"\x1b[1;38;5;25m");
     assert!(dsh.terminal_uses_application_mode());
 
     let turn_checkpoint = dsh.checkpoint();
@@ -1323,25 +1537,27 @@ fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
     let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
 
     dsh.expect("❯".as_bytes());
+    dsh.write(b"/theme paper\r");
+    dsh.expect("Theme changed · paper".as_bytes());
     dsh.write(b"show the styled approval selector\r");
     dsh.expect(b"Proposed update");
     dsh.expect(b"note.txt");
     dsh.expect(b"+2 -2");
-    dsh.expect(b"\x1b[1;36m--- a/note.txt");
-    dsh.expect(b"\x1b[36m@@ -1,2 +1,2 @@");
-    dsh.expect(b"\x1b[31m--- a/decoy");
-    dsh.expect(b"\x1b[32m+++ B/DECOY");
+    dsh.expect(b"\x1b[1;38;5;25m--- a/note.txt");
+    dsh.expect(b"\x1b[38;5;24m@@ -1,2 +1,2 @@");
+    dsh.expect(b"\x1b[1;38;5;124m--- a/decoy");
+    dsh.expect(b"\x1b[38;5;28m+++ B/DECOY");
     dsh.approval_ready();
     dsh.expect(b"> Reject");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
+    let compact = dsh.checkpoint();
+    dsh.resize(5, 12);
+    dsh.expect_after(compact, b"Not applied");
+    dsh.expect_after(compact, b"> Reject");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
     let selection = dsh.checkpoint();
     dsh.write(b"\x1b[A");
-    dsh.expect_after(selection, b"> Allow once");
-    dsh.expect_after(selection, b"Arrow keys move | Enter confirms | Esc stops");
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
-    let compact = dsh.checkpoint();
-    dsh.resize(6, 15);
-    dsh.expect_after(compact, b"> Allow once");
+    dsh.expect_after(selection, b"> Allow...");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
     dsh.write(b"\r");
     dsh.expect(b"Updated  note.txt");
@@ -1386,6 +1602,8 @@ fn enhanced_approval_takes_over_inspect_before_rendering_the_preview() {
     let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
 
     dsh.expect("❯".as_bytes());
+    dsh.write(b"/theme paper\r");
+    dsh.expect("Theme changed · paper".as_bytes());
     dsh.write(b"open inspect before approval\r");
     dsh.expect(b"waiting before approval");
     let inspect = dsh.checkpoint();
@@ -1398,6 +1616,9 @@ fn enhanced_approval_takes_over_inspect_before_rendering_the_preview() {
     server.release();
     dsh.expect_after(takeover, b"Requested  Patch");
     dsh.expect_after(takeover, b"Proposed update");
+    dsh.expect_after(takeover, b"\x1b[1;38;5;25m--- a/note.txt");
+    dsh.expect_after(takeover, b"\x1b[1;38;5;124m-old");
+    dsh.expect_after(takeover, b"\x1b[38;5;28m+new");
     dsh.approval_ready();
     dsh.expect(b"> Reject");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
@@ -2004,6 +2225,59 @@ fn interactive_resume_reuses_the_stored_context_and_reaches_a_new_prompt() {
     assert!(requests[1].contains("\"content\":\"seed this durable session\""));
     assert!(requests[1].contains("\"content\":\"seeded answer\""));
     assert!(requests[1].contains("\"content\":\"continue interactively\""));
+}
+
+#[test]
+fn enhanced_theme_is_process_local_and_resume_starts_from_adaptive() {
+    let server = SequenceSseServer::start(vec![text_sse("theme persistence seed")]);
+    let workspace = TestWorkspace::new();
+    let caller_workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut first = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    first.expect("❯".as_bytes());
+    first.write(b"/theme paper\r");
+    first.expect("Theme changed · paper".as_bytes());
+    first.write(b"persist one ordinary turn\r");
+    first.expect(b"theme persistence seed");
+    first.expect(b"Turn complete");
+    let (status, _) = first.exit_cleanly();
+    assert!(status.success());
+
+    let entries = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let filename = entries[0].file_name().into_string().unwrap();
+    let session_id = filename.strip_suffix(".jsonl").unwrap().to_owned();
+    let journal = std::fs::read(entries[0].path()).unwrap();
+    assert!(!journal.windows(b"/theme".len()).any(|row| row == b"/theme"));
+    assert!(
+        !journal
+            .windows(b"Theme changed".len())
+            .any(|row| row == b"Theme changed")
+    );
+
+    let mut resumed = PtyHarness::spawn_resume_color_cargo(
+        &server.base_url,
+        &caller_workspace.0,
+        session_root,
+        &session_id,
+    );
+    resumed.expect("❯".as_bytes());
+    let shown = resumed.checkpoint();
+    resumed.write(b"/theme\r");
+    resumed.expect_after(shown, "Theme · adaptive".as_bytes());
+    resumed.expect_after(shown, b"\x1b[1;33m");
+    let (status, _) = resumed.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(server.finish().len(), 1);
 }
 
 #[test]

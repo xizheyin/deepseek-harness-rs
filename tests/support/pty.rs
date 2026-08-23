@@ -270,6 +270,22 @@ impl PtyHarness {
         )
     }
 
+    pub fn spawn_color_with_session_root_cargo(
+        base_url: &str,
+        workspace: &Path,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            PtyLaunch::cargo(true),
+        )
+    }
+
     pub fn spawn_color_with_tui_mode(base_url: &str, workspace: &Path, mode: &str) -> Self {
         let mut launch = PtyLaunch::cargo(true);
         launch.enhanced = matches!(mode, "auto" | "enhanced");
@@ -475,6 +491,23 @@ impl PtyHarness {
             Some(session_root),
             Some(session_id),
             PtyLaunch::cargo(false),
+        )
+    }
+
+    pub fn spawn_resume_color_cargo(
+        base_url: &str,
+        caller_workspace: &Path,
+        session_root: TestSessionRoot,
+        session_id: &str,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            caller_workspace,
+            false,
+            None,
+            Some(session_root),
+            Some(session_id),
+            PtyLaunch::cargo(true),
         )
     }
 

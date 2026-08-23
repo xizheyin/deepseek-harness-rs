@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{
     dock::{DockError, DockFrame},
     presentation::{PresentedChunk, PresentedItem, TextStyle},
+    theme::ThemePalette,
 };
 
 const MAX_SCREEN_WRITE_BYTES: usize = 2 * 1024 * 1024;
@@ -161,7 +162,7 @@ impl InlineScreen {
         &self,
         size: ScreenSize,
         dock: &DockFrame,
-        styled: bool,
+        theme: ThemePalette,
     ) -> Result<PendingScreenWrite, InlineScreenError> {
         if self.state != ScreenState::Detached || self.poisoned.load(Ordering::Acquire) {
             return Err(InlineScreenError::InvalidState);
@@ -179,7 +180,7 @@ impl InlineScreen {
         for _ in 0..=dock_rows {
             bytes.push_str("\r\n");
         }
-        dock.render_bottom(&mut bytes, styled)?;
+        dock.render_bottom(&mut bytes, theme)?;
         finish_screen_write(
             bytes,
             None,
@@ -200,13 +201,13 @@ impl InlineScreen {
     pub(crate) fn stage_dock(
         &self,
         dock: &DockFrame,
-        styled: bool,
+        theme: ThemePalette,
     ) -> Result<PendingScreenWrite, InlineScreenError> {
         let ledger = self.ready()?;
         validate_ready_frame(&ledger, dock)?;
         let mut bytes = screen_buffer()?;
         dock.clear_bottom(&mut bytes)?;
-        dock.render_bottom(&mut bytes, styled)?;
+        dock.render_bottom(&mut bytes, theme)?;
         let base_generation = ledger.generation;
         let next = next_generation(ledger)?;
         finish_screen_write(
@@ -225,13 +226,13 @@ impl InlineScreen {
     pub(crate) fn stage_reanchor_bottom(
         &self,
         dock: &DockFrame,
-        styled: bool,
+        theme: ThemePalette,
     ) -> Result<PendingScreenWrite, InlineScreenError> {
         let mut ledger = self.ready()?;
         validate_frame(ledger.size, dock)?;
         let dock_rows = dock.rows()?;
         if dock_rows == ledger.dock_rows {
-            return self.stage_dock(dock, styled);
+            return self.stage_dock(dock, theme);
         }
         let output_bottom = ledger
             .size
@@ -259,7 +260,7 @@ impl InlineScreen {
             ledger.transcript_row -= scrolls;
         }
         ledger.dock_rows = dock_rows;
-        dock.render_bottom(&mut bytes, styled)?;
+        dock.render_bottom(&mut bytes, theme)?;
         let base_generation = ledger.generation;
         ledger = next_generation(ledger)?;
         finish_screen_write(
@@ -274,7 +275,7 @@ impl InlineScreen {
         &self,
         chunk: &PresentedChunk,
         dock: &DockFrame,
-        styled: bool,
+        theme: ThemePalette,
     ) -> Result<PendingScreenWrite, InlineScreenError> {
         let mut ledger = self.ready()?;
         validate_ready_frame(&ledger, dock)?;
@@ -294,7 +295,7 @@ impl InlineScreen {
                 .as_ref()
                 .ok_or(InlineScreenError::InvalidState)?;
             push_cup(&mut bytes, ledger.transcript_row, seal.start_column);
-            push_style(&mut bytes, seal.style, styled);
+            push_style(&mut bytes, seal.style, theme);
             bytes
                 .try_reserve(seal.text.len())
                 .map_err(|_| InlineScreenError::Capacity)?;
@@ -307,7 +308,7 @@ impl InlineScreen {
         for item in chunk.items() {
             match item {
                 PresentedItem::LineFeed => {
-                    push_style(&mut bytes, TextStyle::Plain, styled);
+                    push_style(&mut bytes, TextStyle::Plain, theme);
                     active_style = TextStyle::Plain;
                     bytes.push('\n');
                     advance_line_feed(&mut ledger);
@@ -349,7 +350,7 @@ impl InlineScreen {
                             advance_soft_wrap(&mut ledger);
                         }
                         if active_style != *style {
-                            push_style(&mut bytes, *style, styled);
+                            push_style(&mut bytes, *style, theme);
                             active_style = *style;
                         }
                         bytes
@@ -406,10 +407,10 @@ impl InlineScreen {
             }
         }
         if active_style != TextStyle::Plain {
-            push_style(&mut bytes, TextStyle::Plain, styled);
+            push_style(&mut bytes, TextStyle::Plain, theme);
         }
         reserve_dock_space(&mut bytes, &mut ledger);
-        dock.render_bottom(&mut bytes, styled)?;
+        dock.render_bottom(&mut bytes, theme)?;
         ledger = next_generation(ledger)?;
         finish_screen_write(
             bytes,
@@ -423,7 +424,7 @@ impl InlineScreen {
         &self,
         size: ScreenSize,
         dock: &DockFrame,
-        styled: bool,
+        theme: ThemePalette,
     ) -> Result<PendingScreenWrite, InlineScreenError> {
         let mut ledger = self.ready()?;
         validate_frame(size, dock)?;
@@ -455,7 +456,7 @@ impl InlineScreen {
         for _ in 0..=dock_rows {
             bytes.push_str("\r\n");
         }
-        dock.render_bottom(&mut bytes, styled)?;
+        dock.render_bottom(&mut bytes, theme)?;
         ledger.size = size;
         ledger.dock_rows = dock_rows;
         ledger.transcript_row = transcript_row;
@@ -695,27 +696,11 @@ fn reserve_dock_space(output: &mut String, ledger: &mut Ledger) {
     ledger.transcript_row -= scrolls;
 }
 
-fn push_style(output: &mut String, style: TextStyle, styled: bool) {
-    if !styled {
-        return;
+fn push_style(output: &mut String, style: TextStyle, theme: ThemePalette) {
+    output.push_str("\x1b[0m");
+    if style != TextStyle::Plain {
+        output.push_str(theme.sgr(style));
     }
-    output.push_str(match style {
-        TextStyle::Plain => "\x1b[0m",
-        TextStyle::Muted => "\x1b[2m",
-        TextStyle::Accent => "\x1b[1;36m",
-        TextStyle::User => "\x1b[1;35m",
-        TextStyle::Assistant => "\x1b[36m",
-        TextStyle::Heading => "\x1b[1;36m",
-        TextStyle::Code => "\x1b[1m",
-        TextStyle::Quote => "\x1b[2;36m",
-        TextStyle::DiffHeader => "\x1b[1;36m",
-        TextStyle::DiffHunk => "\x1b[36m",
-        TextStyle::DiffAdd => "\x1b[32m",
-        TextStyle::DiffRemove => "\x1b[31m",
-        TextStyle::Warning => "\x1b[1;33m",
-        TextStyle::Error => "\x1b[1;31m",
-        TextStyle::Success => "\x1b[32m",
-    });
 }
 
 fn screen_buffer() -> Result<String, InlineScreenError> {
@@ -760,6 +745,7 @@ mod tests {
         markup::MarkupState,
         presentation::{PresentedChunk, TextStyle},
         terminal_model::{HistoryPolicy, MiniTerminal},
+        theme::ThemePalette,
         view::{DetailDocument, DetailTone, ViewMode},
     };
 
@@ -858,7 +844,7 @@ mod tests {
                     columns: 80,
                 },
                 &dock,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         let bytes = commit(&mut screen, attach);
@@ -895,17 +881,47 @@ mod tests {
                     columns: 80,
                 },
                 &first,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         let _ = commit(&mut screen, attach);
 
         composer.insert_text("draft").unwrap();
         let next = dock(&composer, &queue);
-        let redraw = screen.stage_dock(&next, true).unwrap();
+        let redraw = screen.stage_dock(&next, ThemePalette::Adaptive).unwrap();
         let bytes = commit(&mut screen, redraw);
         assert!(!bytes.contains('\n'));
         assert!(!bytes.contains("\x1b[r"));
+    }
+
+    #[test]
+    fn palette_redraw_restyles_only_the_owned_dock_without_scrolling() {
+        let composer = Composer::default();
+        let queue = PromptQueue::default();
+        let frame = dock(&composer, &queue);
+        let mut screen = InlineScreen::default();
+        let attach = screen
+            .stage_attach(
+                ScreenSize {
+                    rows: 24,
+                    columns: 80,
+                },
+                &frame,
+                ThemePalette::Adaptive,
+            )
+            .unwrap();
+        let _ = commit(&mut screen, attach);
+
+        let paper = screen.stage_dock(&frame, ThemePalette::Paper).unwrap();
+        let paper_bytes = commit(&mut screen, paper);
+        assert!(!paper_bytes.contains('\n'));
+        assert!(paper_bytes.contains(ThemePalette::Paper.sgr(TextStyle::Border)));
+        assert!(!paper_bytes.contains("\x1b]"));
+
+        let mono = screen.stage_dock(&frame, ThemePalette::Mono).unwrap();
+        let mono_bytes = commit(&mut screen, mono);
+        assert!(!mono_bytes.contains("38;5;"));
+        assert!(!mono_bytes.contains('\n'));
     }
 
     #[test]
@@ -921,7 +937,7 @@ mod tests {
                     columns: 80,
                 },
                 &frame,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         let _ = commit(&mut screen, attach);
@@ -931,13 +947,13 @@ mod tests {
             .push_text(TextStyle::Assistant, "busy-partial")
             .unwrap();
         let write = screen
-            .stage_transcript(&first.finish(), &frame, true)
+            .stage_transcript(&first.finish(), &frame, ThemePalette::Adaptive)
             .unwrap();
         let _ = commit(&mut screen, write);
         for _ in 0..100 {
             composer.insert_char('x').unwrap();
             frame = dock(&composer, &queue);
-            let redraw = screen.stage_dock(&frame, true).unwrap();
+            let redraw = screen.stage_dock(&frame, ThemePalette::Adaptive).unwrap();
             let bytes = commit(&mut screen, redraw);
             assert!(!bytes.contains("busy-partial"));
         }
@@ -948,7 +964,7 @@ mod tests {
             .unwrap();
         continuation.push_line_feed().unwrap();
         let write = screen
-            .stage_transcript(&continuation.finish(), &frame, true)
+            .stage_transcript(&continuation.finish(), &frame, ThemePalette::Adaptive)
             .unwrap();
         let bytes = commit(&mut screen, write);
         assert!(bytes.contains(" first-turn-finished"));
@@ -974,7 +990,7 @@ mod tests {
                         columns: 80,
                     },
                     &frame,
-                    true,
+                    ThemePalette::Adaptive,
                 )
                 .unwrap();
             apply(&mut screen, &mut terminal, attach);
@@ -1022,11 +1038,11 @@ mod tests {
                 let queue = PromptQueue::default();
                 let frame = dock_at(&composer, &queue, rows, columns);
                 let attach = screen
-                    .stage_attach(ScreenSize { rows, columns }, &frame, true)
+                    .stage_attach(ScreenSize { rows, columns }, &frame, ThemePalette::Adaptive)
                     .unwrap();
                 apply(&mut screen, &mut terminal, attach);
                 let write = screen
-                    .stage_transcript(&markup_chunk(source), &frame, true)
+                    .stage_transcript(&markup_chunk(source), &frame, ThemePalette::Adaptive)
                     .unwrap();
                 apply(&mut screen, &mut terminal, write);
 
@@ -1035,7 +1051,7 @@ mod tests {
                     drain.push_line_feed().unwrap();
                 }
                 let write = screen
-                    .stage_transcript(&drain.finish(), &frame, true)
+                    .stage_transcript(&drain.finish(), &frame, ThemePalette::Adaptive)
                     .unwrap();
                 apply(&mut screen, &mut terminal, write);
 
@@ -1081,14 +1097,14 @@ mod tests {
                         columns: 80,
                     },
                     &frame,
-                    true,
+                    ThemePalette::Adaptive,
                 )
                 .unwrap();
             apply(&mut screen, &mut terminal, attach);
 
             let long = "x".repeat(100);
             let write = screen
-                .stage_transcript(&chunk(&long, true), &frame, true)
+                .stage_transcript(&chunk(&long, true), &frame, ThemePalette::Adaptive)
                 .unwrap();
             let bytes = apply(&mut screen, &mut terminal, write);
             assert!(
@@ -1097,17 +1113,25 @@ mod tests {
             );
 
             let write = screen
-                .stage_transcript(&chunk("busy-partial", false), &frame, true)
+                .stage_transcript(
+                    &chunk("busy-partial", false),
+                    &frame,
+                    ThemePalette::Adaptive,
+                )
                 .unwrap();
             apply(&mut screen, &mut terminal, write);
             for _ in 0..100 {
                 composer.insert_char('x').unwrap();
                 frame = dock(&composer, &queue);
-                let redraw = screen.stage_dock(&frame, true).unwrap();
+                let redraw = screen.stage_dock(&frame, ThemePalette::Adaptive).unwrap();
                 apply(&mut screen, &mut terminal, redraw);
             }
             let write = screen
-                .stage_transcript(&chunk(" first-turn-finished", true), &frame, true)
+                .stage_transcript(
+                    &chunk(" first-turn-finished", true),
+                    &frame,
+                    ThemePalette::Adaptive,
+                )
                 .unwrap();
             apply(&mut screen, &mut terminal, write);
             let mut drain = PresentedChunk::builder();
@@ -1115,7 +1139,7 @@ mod tests {
                 drain.push_line_feed().unwrap();
             }
             let write = screen
-                .stage_transcript(&drain.finish(), &frame, true)
+                .stage_transcript(&drain.finish(), &frame, ThemePalette::Adaptive)
                 .unwrap();
             apply(&mut screen, &mut terminal, write);
 
@@ -1148,12 +1172,16 @@ mod tests {
                     columns: 80,
                 },
                 &frame,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         apply(&mut screen, &mut terminal, attach);
         let write = screen
-            .stage_transcript(&chunk("busy-partial", false), &frame, true)
+            .stage_transcript(
+                &chunk("busy-partial", false),
+                &frame,
+                ThemePalette::Adaptive,
+            )
             .unwrap();
         apply(&mut screen, &mut terminal, write);
 
@@ -1166,12 +1194,16 @@ mod tests {
                     columns: 80,
                 },
                 &grown,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         apply(&mut screen, &mut terminal, resize);
         let write = screen
-            .stage_transcript(&chunk("continuation-after-resize", true), &grown, true)
+            .stage_transcript(
+                &chunk("continuation-after-resize", true),
+                &grown,
+                ThemePalette::Adaptive,
+            )
             .unwrap();
         apply(&mut screen, &mut terminal, write);
 
@@ -1210,7 +1242,7 @@ mod tests {
                     columns: 80,
                 },
                 &initial,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         apply(&mut screen, &mut terminal, attach);
@@ -1218,7 +1250,7 @@ mod tests {
         let secret = "draft-secret-must-not-enter-history";
         composer.insert_text(secret).unwrap();
         let private = dock(&composer, &queue);
-        let mut redraw = screen.stage_dock(&private, true).unwrap();
+        let mut redraw = screen.stage_dock(&private, ThemePalette::Adaptive).unwrap();
         let prefix_end = redraw
             .bytes()
             .windows(secret.len())
@@ -1242,7 +1274,7 @@ mod tests {
                     columns: 80,
                 },
                 &clean,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         apply(&mut screen, &mut terminal, attach);
@@ -1272,16 +1304,16 @@ mod tests {
                         columns: 80,
                     },
                     &frame,
-                    true,
+                    ThemePalette::Adaptive,
                 )
                 .unwrap();
             let _ = commit(&mut split, attach);
             let write = split
-                .stage_transcript(&chunk(first, false), &frame, true)
+                .stage_transcript(&chunk(first, false), &frame, ThemePalette::Adaptive)
                 .unwrap();
             let _ = commit(&mut split, write);
             let write = split
-                .stage_transcript(&chunk(second, false), &frame, true)
+                .stage_transcript(&chunk(second, false), &frame, ThemePalette::Adaptive)
                 .unwrap();
             let _ = commit(&mut split, write);
 
@@ -1293,12 +1325,12 @@ mod tests {
                         columns: 80,
                     },
                     &frame,
-                    true,
+                    ThemePalette::Adaptive,
                 )
                 .unwrap();
             let _ = commit(&mut single, attach);
             let write = single
-                .stage_transcript(&chunk(whole, false), &frame, true)
+                .stage_transcript(&chunk(whole, false), &frame, ThemePalette::Adaptive)
                 .unwrap();
             let _ = commit(&mut single, write);
 
@@ -1319,13 +1351,13 @@ mod tests {
                     columns: 80,
                 },
                 &dock,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         attach.advance(1).unwrap();
         screen.abort(attach);
         assert!(screen.is_poisoned());
-        assert!(screen.stage_dock(&dock, true).is_err());
+        assert!(screen.stage_dock(&dock, ThemePalette::Adaptive).is_err());
     }
 
     #[test]
@@ -1348,20 +1380,22 @@ mod tests {
                         columns: 80,
                     },
                     &focus,
-                    true,
+                    ThemePalette::Adaptive,
                 )
                 .unwrap();
             apply(&mut screen, &mut terminal, attach);
             for marker in ["TRANSCRIPT_A", "TRANSCRIPT_B"] {
                 let write = screen
-                    .stage_transcript(&chunk(marker, true), &focus, true)
+                    .stage_transcript(&chunk(marker, true), &focus, ThemePalette::Adaptive)
                     .unwrap();
                 apply(&mut screen, &mut terminal, write);
             }
 
             let before_growth = terminal.history().len();
             let delta = usize::from(detail.rows().unwrap() - focus.rows().unwrap());
-            let grow = screen.stage_reanchor_bottom(&detail, true).unwrap();
+            let grow = screen
+                .stage_reanchor_bottom(&detail, ThemePalette::Adaptive)
+                .unwrap();
             let grow_bytes = apply(&mut screen, &mut terminal, grow);
             assert_eq!(grow_bytes.matches('\n').count(), delta);
             assert_eq!(terminal.history().len() - before_growth, delta);
@@ -1369,7 +1403,9 @@ mod tests {
             assert!(!grow_bytes.contains("TRANSCRIPT_B"));
 
             let before_shrink = terminal.history().len();
-            let shrink = screen.stage_reanchor_bottom(&focus, true).unwrap();
+            let shrink = screen
+                .stage_reanchor_bottom(&focus, ThemePalette::Adaptive)
+                .unwrap();
             let shrink_bytes = apply(&mut screen, &mut terminal, shrink);
             assert_eq!(shrink_bytes.matches('\n').count(), 0);
             assert_eq!(terminal.history().len(), before_shrink);
@@ -1379,7 +1415,7 @@ mod tests {
                 drain.push_line_feed().unwrap();
             }
             let write = screen
-                .stage_transcript(&drain.finish(), &focus, true)
+                .stage_transcript(&drain.finish(), &focus, ThemePalette::Adaptive)
                 .unwrap();
             apply(&mut screen, &mut terminal, write);
             let all = terminal.all_lines().join("\n");
@@ -1412,20 +1448,28 @@ mod tests {
                     columns: 80,
                 },
                 &focus,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         apply(&mut screen, &mut terminal, attach);
-        let grow = screen.stage_reanchor_bottom(&detail, true).unwrap();
+        let grow = screen
+            .stage_reanchor_bottom(&detail, ThemePalette::Adaptive)
+            .unwrap();
         apply(&mut screen, &mut terminal, grow);
         let write = screen
-            .stage_transcript(&chunk("busy-partial", false), &detail, true)
+            .stage_transcript(
+                &chunk("busy-partial", false),
+                &detail,
+                ThemePalette::Adaptive,
+            )
             .unwrap();
         apply(&mut screen, &mut terminal, write);
-        let shrink = screen.stage_reanchor_bottom(&focus, true).unwrap();
+        let shrink = screen
+            .stage_reanchor_bottom(&focus, ThemePalette::Adaptive)
+            .unwrap();
         apply(&mut screen, &mut terminal, shrink);
         let write = screen
-            .stage_transcript(&chunk(" continued", true), &focus, true)
+            .stage_transcript(&chunk(" continued", true), &focus, ThemePalette::Adaptive)
             .unwrap();
         apply(&mut screen, &mut terminal, write);
         let mut drain = PresentedChunk::builder();
@@ -1433,7 +1477,7 @@ mod tests {
             drain.push_line_feed().unwrap();
         }
         let write = screen
-            .stage_transcript(&drain.finish(), &focus, true)
+            .stage_transcript(&drain.finish(), &focus, ThemePalette::Adaptive)
             .unwrap();
         apply(&mut screen, &mut terminal, write);
         assert_eq!(
@@ -1467,14 +1511,18 @@ mod tests {
                     columns: 80,
                 },
                 &focus,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         let _ = commit(&mut zero, attach);
-        let first = zero.stage_reanchor_bottom(&detail, true).unwrap();
+        let first = zero
+            .stage_reanchor_bottom(&detail, ThemePalette::Adaptive)
+            .unwrap();
         zero.abort(first);
         assert!(!zero.is_poisoned());
-        let retry = zero.stage_reanchor_bottom(&detail, true).unwrap();
+        let retry = zero
+            .stage_reanchor_bottom(&detail, ThemePalette::Adaptive)
+            .unwrap();
         let _ = commit(&mut zero, retry);
 
         let mut partial = InlineScreen::default();
@@ -1485,14 +1533,16 @@ mod tests {
                     columns: 80,
                 },
                 &focus,
-                true,
+                ThemePalette::Adaptive,
             )
             .unwrap();
         let _ = commit(&mut partial, attach);
-        let mut write = partial.stage_reanchor_bottom(&detail, true).unwrap();
+        let mut write = partial
+            .stage_reanchor_bottom(&detail, ThemePalette::Adaptive)
+            .unwrap();
         write.advance(1).unwrap();
         partial.abort(write);
         assert!(partial.is_poisoned());
-        assert!(partial.stage_dock(&detail, true).is_err());
+        assert!(partial.stage_dock(&detail, ThemePalette::Adaptive).is_err());
     }
 }
