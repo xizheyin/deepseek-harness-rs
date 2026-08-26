@@ -152,6 +152,15 @@ impl Composer {
         self.insert_text("\n")
     }
 
+    pub(super) fn complete_command(&mut self, command: &str) -> Result<(), ComposerError> {
+        if !command.is_ascii() || !command.starts_with('/') || command.contains(char::is_whitespace)
+        {
+            return Err(ComposerError::InvalidState);
+        }
+        let length = self.text.len();
+        self.apply_edit(0..length, command, false)
+    }
+
     pub(crate) fn move_left(&mut self) -> bool {
         let Some(previous) = previous_grapheme_start(&self.text, self.cursor) else {
             return false;

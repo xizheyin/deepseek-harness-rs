@@ -2,7 +2,10 @@ use std::{collections::VecDeque, fmt};
 
 use thiserror::Error;
 
-use super::composer::{Composer, ComposerError, MAX_PROMPT_BYTES};
+use super::{
+    command_palette::CommandId,
+    composer::{Composer, ComposerError, MAX_PROMPT_BYTES},
+};
 
 const MAX_QUEUE_ITEMS: usize = 8;
 const MAX_QUEUE_BYTES: usize = 256 * 1024;
@@ -527,6 +530,15 @@ impl InputMemory {
         Ok(())
     }
 
+    pub(crate) fn complete_local_command(
+        &mut self,
+        command: CommandId,
+    ) -> Result<(), InputMemoryError> {
+        self.composer.complete_command(command.command())?;
+        self.history_navigation = None;
+        Ok(())
+    }
+
     pub(crate) fn move_left(&mut self) -> bool {
         self.composer.move_left()
     }
@@ -811,7 +823,31 @@ mod tests {
         InputMemory, InputMemoryError, MAX_HISTORY_BYTES, MAX_HISTORY_ITEMS, MAX_QUEUE_BYTES,
         MAX_QUEUE_ITEMS, PromptHistory,
     };
-    use crate::tui::composer::MAX_PROMPT_BYTES;
+    use crate::tui::{command_palette::CommandId, composer::MAX_PROMPT_BYTES};
+
+    #[test]
+    fn command_completion_is_one_undoable_edit_and_detaches_history_navigation() {
+        let mut input = InputMemory::default();
+        input.record_committed_human("/historic").unwrap();
+        assert!(input.history_previous().unwrap());
+        let history_items = input.history().len();
+        input.complete_local_command(CommandId::Help).unwrap();
+        assert_eq!(input.composer().text(), "/help");
+        assert_eq!(input.composer().cursor(), "/help".len());
+        assert!(!input.history_next().unwrap());
+        assert!(input.undo().unwrap());
+        assert_eq!(input.composer().text(), "/historic");
+        assert_eq!(input.history().len(), history_items);
+
+        input.insert_text(" queued").unwrap();
+        input.enqueue_draft().unwrap();
+        input.insert_text("/he").unwrap();
+        let queued = input.queue().len();
+        input.complete_local_command(CommandId::Help).unwrap();
+        assert_eq!(input.composer().text(), "/help");
+        assert_eq!(input.queue().len(), queued);
+        assert_eq!(input.history().len(), history_items);
+    }
 
     #[test]
     fn queue_limits_are_atomic_and_admission_is_fifo() {

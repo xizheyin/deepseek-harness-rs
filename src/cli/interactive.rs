@@ -13,6 +13,9 @@ use crate::{
         TurnId, UiUserSource,
     },
     tui::{
+        command_palette::{
+            CommandId, CommandPaletteSnapshot, CommandPaletteState, PaletteEnter, PaletteMove,
+        },
         dock::{
             DetailViewport, DockApprovalSelection, DockError, DockFrame, DockInteraction,
             DockModel, MIN_ENHANCED_COLUMNS, MIN_ENHANCED_ROWS,
@@ -310,6 +313,7 @@ async fn run_enhanced(
         return shutdown_after_enhanced_error(&mut agent, signals, InteractiveError::Agent).await;
     }
     let mut input = InputMemory::default();
+    let mut command_palette = CommandPaletteState::default();
     let mut view = ViewState::default();
     let mut theme = ThemeState::default();
     let mut notice = None;
@@ -319,6 +323,7 @@ async fn run_enhanced(
             input: &input,
             notice: notice.as_deref(),
             interaction: DockInteraction::Idle,
+            command_palette: command_palette.snapshot(input.composer()),
             live: &live,
         },
         &terminal,
@@ -369,6 +374,7 @@ async fn run_enhanced(
                     }
                 }
             };
+            let auto_submit = matches!(event, EnhancedIdleEvent::AutoSubmit);
             let action = match event {
                 EnhancedIdleEvent::Signal(UiSignal::Interrupt) => {
                     decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
@@ -387,6 +393,8 @@ async fn run_enhanced(
                         last_size: &mut last_size,
                         view: &mut view,
                         theme: &mut theme,
+                        command_palette: &mut command_palette,
+                        palette_suppressed: false,
                     };
                     pending_signal = suspend_enhanced(
                         &mut terminal,
@@ -396,6 +404,7 @@ async fn run_enhanced(
                             input: &input,
                             notice: notice.as_deref(),
                             interaction: DockInteraction::Idle,
+                            command_palette: dock.command_palette.snapshot(input.composer()),
                             live: &live,
                         },
                         &mut dock,
@@ -413,6 +422,7 @@ async fn run_enhanced(
                     expire_enhanced_escape(
                         &mut decoder,
                         &mut input,
+                        &mut command_palette,
                         &mut view,
                         &theme,
                         last_size,
@@ -426,6 +436,7 @@ async fn run_enhanced(
                         &mut decoder,
                         &scratch[..count],
                         &mut input,
+                        &mut command_palette,
                         &mut view,
                         &theme,
                         last_size,
@@ -438,11 +449,23 @@ async fn run_enhanced(
 
             match action {
                 EnhancedInputAction::None => continue,
-                EnhancedInputAction::Redraw | EnhancedInputAction::PasteFence => {}
+                EnhancedInputAction::Redraw
+                | EnhancedInputAction::RedrawFence
+                | EnhancedInputAction::PasteFence => {}
                 EnhancedInputAction::Exit => break Ok(InteractiveExit::Ordinary(0)),
                 EnhancedInputAction::Submit => {
                     let mut queued_id: Option<LocalPromptId> = None;
-                    let (draft, cursor) = if input.queue().len() != 0 {
+                    let composer_submission =
+                        classify_enhanced_submission(input.composer().text());
+                    let local_command = !auto_submit
+                        && matches!(
+                            composer_submission,
+                            EnhancedSubmission::Command(_) | EnhancedSubmission::Theme(_)
+                        );
+                    let (draft, cursor) = if local_command {
+                        let cursor = input.composer().cursor();
+                        (input.take_draft_for_turn()?, cursor)
+                    } else if input.queue().len() != 0 {
                         let reserved = input.reserve_front()?;
                         let id = reserved.id();
                         let text = copy_enhanced_prompt(reserved.text())?;
@@ -453,41 +476,48 @@ async fn run_enhanced(
                         let cursor = input.composer().cursor();
                         (input.take_draft_for_turn()?, cursor)
                     };
-                    let submission = if queued_id.is_some() {
+                    let submission = if local_command {
+                        composer_submission
+                    } else if queued_id.is_some() {
                         EnhancedSubmission::Prompt
                     } else {
                         classify_enhanced_submission(&draft)
                     };
                     match submission {
                         EnhancedSubmission::Empty => notice = None,
-                        EnhancedSubmission::Help => {
-                            notice = Some(
-                                "/inspect | /review | /focus | /theme | /help | /exit | Ctrl+O inspect"
-                                    .to_owned(),
-                            );
-                        }
-                        EnhancedSubmission::Inspect => {
-                            let _ = view
-                                .request_mode(ViewMode::Inspect)
-                                .map_err(|_| InteractiveError::Output)?;
-                            notice = None;
-                        }
-                        EnhancedSubmission::Review => {
-                            let _ = view
-                                .request_mode(ViewMode::Review)
-                                .map_err(|_| InteractiveError::Output)?;
-                            notice = None;
-                        }
-                        EnhancedSubmission::Focus => {
-                            let _ = view
-                                .request_mode(ViewMode::Focus)
-                                .map_err(|_| InteractiveError::Output)?;
-                            notice = None;
-                        }
+                        EnhancedSubmission::Command(command) => match command {
+                            CommandId::Help => {
+                                notice = Some(
+                                    "/inspect | /review | /focus | /theme | /help | /exit | /quit | Ctrl+O inspect"
+                                        .to_owned(),
+                                );
+                            }
+                            CommandId::Inspect | CommandId::Review | CommandId::Focus => {
+                                let mode = match command {
+                                    CommandId::Inspect => ViewMode::Inspect,
+                                    CommandId::Review => ViewMode::Review,
+                                    CommandId::Focus => ViewMode::Focus,
+                                    _ => return Err(InteractiveError::Agent),
+                                };
+                                let _ = view
+                                    .request_mode(mode)
+                                    .map_err(|_| InteractiveError::Output)?;
+                                notice = None;
+                            }
+                            CommandId::Theme => {
+                                apply_theme_command(
+                                    ThemeCommand::Show,
+                                    &mut theme,
+                                    &mut notice,
+                                )?;
+                            }
+                            CommandId::Exit | CommandId::Quit => {
+                                break Ok(InteractiveExit::Ordinary(0));
+                            }
+                        },
                         EnhancedSubmission::Theme(command) => {
                             apply_theme_command(command, &mut theme, &mut notice)?;
                         }
-                        EnhancedSubmission::Exit => break Ok(InteractiveExit::Ordinary(0)),
                         EnhancedSubmission::Prompt => {
                             let prompt = copy_enhanced_prompt(&draft)?;
                             presenter.observe_external_line_start();
@@ -499,6 +529,8 @@ async fn run_enhanced(
                                 last_size: &mut last_size,
                                 view: &mut view,
                                 theme: &mut theme,
+                                command_palette: &mut command_palette,
+                                palette_suppressed: false,
                             };
                             let _ = active_dock
                                 .view
@@ -574,6 +606,8 @@ async fn run_enhanced(
                                         last_size: &mut last_size,
                                         view: &mut view,
                                         theme: &mut theme,
+                                        command_palette: &mut command_palette,
+                                        palette_suppressed: false,
                                     };
                                     pending_signal = suspend_enhanced(
                                         &mut terminal,
@@ -583,6 +617,9 @@ async fn run_enhanced(
                                             input: &input,
                                             notice: notice.as_deref(),
                                             interaction: DockInteraction::Idle,
+                                            command_palette: dock
+                                                .command_palette
+                                                .snapshot(input.composer()),
                                             live: &live,
                                         },
                                         &mut dock,
@@ -604,6 +641,7 @@ async fn run_enhanced(
                     input: &input,
                     notice: notice.as_deref(),
                     interaction: DockInteraction::Idle,
+                    command_palette: command_palette.snapshot(input.composer()),
                     live: &live,
                 },
                 &terminal,
@@ -631,6 +669,7 @@ async fn run_enhanced(
                                 input: &input,
                                 notice: notice.as_deref(),
                                 interaction: DockInteraction::Idle,
+                                command_palette: command_palette.snapshot(input.composer()),
                                 live: &live,
                             },
                             &terminal,
@@ -889,6 +928,7 @@ enum ScreenWriteOutcome {
 enum EnhancedInputAction {
     None,
     Redraw,
+    RedrawFence,
     PasteFence,
     Submit,
     Exit,
@@ -904,28 +944,21 @@ enum PasteFenceOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EnhancedSubmission {
     Empty,
-    Help,
-    Inspect,
-    Review,
-    Focus,
+    Command(CommandId),
     Theme(ThemeCommand),
-    Exit,
     Prompt,
 }
 
 fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
     let command = prompt.trim_matches(|character: char| character.is_ascii_whitespace());
-    if let Some(theme) = ThemeCommand::parse(command) {
-        return EnhancedSubmission::Theme(theme);
-    }
-    match command {
-        "" => EnhancedSubmission::Empty,
-        "/help" => EnhancedSubmission::Help,
-        "/inspect" => EnhancedSubmission::Inspect,
-        "/review" => EnhancedSubmission::Review,
-        "/focus" => EnhancedSubmission::Focus,
-        "/exit" | "/quit" => EnhancedSubmission::Exit,
-        _ => EnhancedSubmission::Prompt,
+    if command.is_empty() {
+        EnhancedSubmission::Empty
+    } else if let Some(command) = CommandId::from_exact(command) {
+        EnhancedSubmission::Command(command)
+    } else if let Some(theme) = ThemeCommand::parse(command) {
+        EnhancedSubmission::Theme(theme)
+    } else {
+        EnhancedSubmission::Prompt
     }
 }
 
@@ -959,10 +992,12 @@ fn apply_theme_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_enhanced_input(
     decoder: &mut KeyDecoder,
     bytes: &[u8],
     input: &mut InputMemory,
+    command_palette: &mut CommandPaletteState,
     view: &mut ViewState,
     theme: &ThemeState,
     size: super::terminal::TerminalSize,
@@ -990,16 +1025,21 @@ fn apply_enhanced_input(
             InputEvent::PasteStarted => Ok(EnhancedInputAction::None),
             InputEvent::Paste(text) => {
                 *notice = Some(match input.insert_paste(&text) {
-                    Ok(()) => "Paste inserted · Enter sends after the input fence".to_owned(),
+                    Ok(()) => {
+                        let _ = command_palette.sync(input.composer());
+                        "Paste inserted · Enter sends after the input fence".to_owned()
+                    }
                     Err(error) => format!("{error} · draft kept behind the input fence"),
                 });
                 Ok(EnhancedInputAction::PasteFence)
             }
             InputEvent::PasteRejected(error) => {
+                let _ = command_palette.dismiss(input.composer());
                 *notice = Some(error.to_string());
                 Ok(EnhancedInputAction::PasteFence)
             }
             InputEvent::Rejected(error) => {
+                let _ = command_palette.dismiss(input.composer());
                 *notice = Some(error.to_string());
                 Ok(EnhancedInputAction::Redraw)
             }
@@ -1007,7 +1047,7 @@ fn apply_enhanced_input(
                 .toggle_inspect()
                 .map(|()| EnhancedInputAction::Redraw)
                 .map_err(|_| InputMemoryError::InvalidState),
-            InputEvent::Key(key) => apply_enhanced_key(key, input, width, notice),
+            InputEvent::Key(key) => apply_enhanced_key(key, input, command_palette, width, notice),
         };
         match update {
             Ok(EnhancedInputAction::None) => ControlFlow::Continue(()),
@@ -1018,7 +1058,9 @@ fn apply_enhanced_input(
                     || view.requested() != view.committed()
                     || matches!(
                         next,
-                        EnhancedInputAction::Submit | EnhancedInputAction::Exit
+                        EnhancedInputAction::RedrawFence
+                            | EnhancedInputAction::Submit
+                            | EnhancedInputAction::Exit
                     )
                 {
                     ControlFlow::Break(())
@@ -1125,6 +1167,7 @@ fn refresh_decoder_escape_deadline(decoder: &KeyDecoder, deadline: &mut Option<I
 fn expire_enhanced_escape(
     decoder: &mut KeyDecoder,
     input: &mut InputMemory,
+    command_palette: &mut CommandPaletteState,
     view: &mut ViewState,
     theme: &ThemeState,
     size: TerminalSize,
@@ -1141,6 +1184,7 @@ fn expire_enhanced_escape(
         InputEvent::Key(key) if view.committed().mode() == ViewMode::Focus => apply_enhanced_key(
             key,
             input,
+            command_palette,
             usize::from(size.columns.saturating_sub(3)).max(1),
             notice,
         )
@@ -1149,6 +1193,7 @@ fn expire_enhanced_escape(
             .map_err(|()| InteractiveError::Agent)
             .inspect(|_| *notice = None),
         InputEvent::Rejected(error) => {
+            let _ = command_palette.dismiss(input.composer());
             *notice = Some(error.to_string());
             Ok(EnhancedInputAction::Redraw)
         }
@@ -1161,16 +1206,43 @@ fn expire_enhanced_escape(
 fn apply_enhanced_key(
     key: Key,
     input: &mut InputMemory,
+    command_palette: &mut CommandPaletteState,
     width: usize,
     notice: &mut Option<String>,
 ) -> Result<EnhancedInputAction, InputMemoryError> {
+    if command_palette.sync(input.composer()).is_visible() {
+        match key {
+            Key::Up | Key::BackTab => {
+                let _ = command_palette.navigate(input.composer(), PaletteMove::Previous);
+                return Ok(EnhancedInputAction::RedrawFence);
+            }
+            Key::Down | Key::Tab => {
+                let _ = command_palette.navigate(input.composer(), PaletteMove::Next);
+                return Ok(EnhancedInputAction::RedrawFence);
+            }
+            Key::Enter => match command_palette.enter(input.composer()) {
+                PaletteEnter::Submit => return Ok(EnhancedInputAction::Submit),
+                PaletteEnter::Complete(command) => {
+                    input.complete_local_command(command)?;
+                    let _ = command_palette.sync(input.composer());
+                    return Ok(EnhancedInputAction::RedrawFence);
+                }
+            },
+            Key::Escape => {
+                let _ = command_palette.dismiss(input.composer());
+                *notice = None;
+                return Ok(EnhancedInputAction::Redraw);
+            }
+            _ => {}
+        }
+    }
     let mut changed = false;
     match key {
         Key::Enter => return Ok(EnhancedInputAction::Submit),
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/inspect · /review · /focus · /theme · /help · /exit · Enter send · Ctrl+J newline"
+                "/inspect · /review · /focus · /theme · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -1193,6 +1265,7 @@ fn apply_enhanced_key(
         Key::Undo => changed = input.undo()?,
         Key::ReverseSearch => {
             let found = input.reverse_search_previous()?;
+            let _ = command_palette.sync(input.composer());
             *notice = Some(if found {
                 "Reverse search · Ctrl+R finds the next older match".to_owned()
             } else {
@@ -1212,6 +1285,7 @@ fn apply_enhanced_key(
             changed = input.delete()?;
         }
     }
+    let _ = command_palette.sync(input.composer());
     *notice = None;
     Ok(
         if changed
@@ -1249,7 +1323,11 @@ async fn render_enhanced_dock(
         let surface = enhanced_surface_frame(
             model.input,
             model.notice,
-            model.interaction,
+            command_palette_interaction(
+                model.interaction,
+                model.command_palette,
+                view.requested().mode(),
+            ),
             size,
             view,
             theme,
@@ -1298,10 +1376,15 @@ async fn render_active_dock(
         }
         let size = terminal.size().unwrap_or(*dock.last_size);
         let resized = size != *dock.last_size;
+        let palette = if dock.palette_suppressed {
+            CommandPaletteSnapshot::Hidden
+        } else {
+            dock.command_palette.snapshot(input.composer())
+        };
         let surface = enhanced_surface_frame(
             input,
             notice,
-            interaction,
+            command_palette_interaction(interaction, palette, dock.view.requested().mode()),
             size,
             dock.view,
             dock.theme,
@@ -1342,6 +1425,17 @@ fn map_dock_error(error: DockError) -> InteractiveError {
     }
 }
 
+fn active_command_palette_snapshot(
+    input: &InputMemory,
+    dock: &ActiveDock<'_>,
+) -> CommandPaletteSnapshot {
+    if dock.palette_suppressed {
+        CommandPaletteSnapshot::Hidden
+    } else {
+        dock.command_palette.snapshot(input.composer())
+    }
+}
+
 fn enhanced_dock_frame(
     input: &InputMemory,
     notice: Option<&str>,
@@ -1359,6 +1453,29 @@ fn enhanced_dock_frame(
         size.columns,
     )
     .map_err(map_dock_error)
+}
+
+fn command_palette_interaction(
+    interaction: DockInteraction,
+    command_palette: CommandPaletteSnapshot,
+    view: ViewMode,
+) -> DockInteraction {
+    let interaction = match interaction {
+        DockInteraction::CommandPalette { running: true, .. } => DockInteraction::Running,
+        DockInteraction::CommandPalette { running: false, .. } => DockInteraction::Idle,
+        interaction => interaction,
+    };
+    if view == ViewMode::Focus
+        && !matches!(interaction, DockInteraction::Approval(_))
+        && command_palette.is_visible()
+    {
+        DockInteraction::CommandPalette {
+            running: matches!(interaction, DockInteraction::Running),
+            snapshot: command_palette,
+        }
+    } else {
+        interaction
+    }
 }
 
 fn enhanced_surface_frame(
@@ -1967,6 +2084,8 @@ struct ActiveDock<'a> {
     last_size: &'a mut TerminalSize,
     view: &'a mut ViewState,
     theme: &'a mut ThemeState,
+    command_palette: &'a mut CommandPaletteState,
+    palette_suppressed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1974,6 +2093,7 @@ struct DockRenderModel<'a> {
     input: &'a InputMemory,
     notice: Option<&'a str>,
     interaction: DockInteraction,
+    command_palette: CommandPaletteSnapshot,
     live: &'a LiveRenderer,
 }
 
@@ -2368,6 +2488,10 @@ async fn reconcile_active_geometry(
     Ok(signal)
 }
 
+fn approval_owns_active_input(joins: &ApprovalJoin, approval_ui: &ApprovalUiState<'_>) -> bool {
+    joins.question().is_some() || !approval_ui.is_inactive()
+}
+
 async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, InteractiveError> {
     let prepared = prepare_user_turn(active.agent.session(), &active.prompt)
         .map_err(|_| InteractiveError::Agent)?;
@@ -2393,6 +2517,10 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             .run_turn(prepared.proposal, cancellation.clone());
         tokio::pin!(future);
         loop {
+            if let Some(dock) = active.active_dock.as_mut() {
+                dock.palette_suppressed =
+                    active.joins.question().is_some() || !approval_ui.is_inactive();
+            }
             if latch_observer_fault(active.events, &mut stop, &cancellation) {
                 discard_pending(&mut pending, active.presenter);
             }
@@ -2693,23 +2821,29 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         }
                         UiWork::InputEscapeExpired => {
                             input_escape_deadline = None;
-                            match handle_active_escape_expiry(
-                                active.terminal,
-                                active.enhanced_decoder.as_deref_mut(),
-                                active.queued_input.as_deref_mut(),
-                                active.active_dock.as_mut(),
-                                active.queue_notice.as_deref_mut(),
-                            )? {
-                                ActiveInputOutcome::Continue => {}
-                                ActiveInputOutcome::Redraw => dock_redraw_requested = true,
-                                ActiveInputOutcome::PasteFence | ActiveInputOutcome::Eof => {
-                                    latch_active_failure(
-                                        &mut stop,
-                                        &cancellation,
-                                        &mut pending,
-                                        active.presenter,
-                                        InteractiveError::Agent,
-                                    );
+                            if approval_owns_active_input(active.joins, &approval_ui) {
+                                if let Some(decoder) = active.enhanced_decoder.as_deref_mut() {
+                                    decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+                                }
+                            } else {
+                                match handle_active_escape_expiry(
+                                    active.terminal,
+                                    active.enhanced_decoder.as_deref_mut(),
+                                    active.queued_input.as_deref_mut(),
+                                    active.active_dock.as_mut(),
+                                    active.queue_notice.as_deref_mut(),
+                                )? {
+                                    ActiveInputOutcome::Continue => {}
+                                    ActiveInputOutcome::Redraw => dock_redraw_requested = true,
+                                    ActiveInputOutcome::PasteFence | ActiveInputOutcome::Eof => {
+                                        latch_active_failure(
+                                            &mut stop,
+                                            &cancellation,
+                                            &mut pending,
+                                            active.presenter,
+                                            InteractiveError::Agent,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2843,7 +2977,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         error,
                                     ),
                                 }
-                            } else if approval_ui.is_inactive() {
+                            } else if !approval_owns_active_input(active.joins, &approval_ui) {
                                 let input_outcome = handle_active_input(
                                     active.terminal,
                                     active.enhanced_decoder.as_deref_mut(),
@@ -2995,6 +3129,10 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
     if stop.is_none() {
         let final_deadline = Instant::now() + FRAME_DEADLINE;
         loop {
+            if let Some(dock) = active.active_dock.as_mut() {
+                dock.palette_suppressed =
+                    active.joins.question().is_some() || !approval_ui.is_inactive();
+            }
             drain_active_signals(active.signals, &mut stop);
             if latch_observer_fault(active.events, &mut stop, &cancellation) {
                 discard_pending(&mut pending, active.presenter);
@@ -3185,18 +3323,24 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         }
                         UiWork::InputEscapeExpired => {
                             input_escape_deadline = None;
-                            match handle_active_escape_expiry(
-                                active.terminal,
-                                active.enhanced_decoder.as_deref_mut(),
-                                active.queued_input.as_deref_mut(),
-                                active.active_dock.as_mut(),
-                                active.queue_notice.as_deref_mut(),
-                            )? {
-                                ActiveInputOutcome::Continue => {}
-                                ActiveInputOutcome::Redraw => dock_redraw_requested = true,
-                                ActiveInputOutcome::PasteFence | ActiveInputOutcome::Eof => {
-                                    observe_failure(&mut stop, InteractiveError::Agent);
-                                    discard_pending(&mut pending, active.presenter);
+                            if approval_owns_active_input(active.joins, &approval_ui) {
+                                if let Some(decoder) = active.enhanced_decoder.as_deref_mut() {
+                                    decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+                                }
+                            } else {
+                                match handle_active_escape_expiry(
+                                    active.terminal,
+                                    active.enhanced_decoder.as_deref_mut(),
+                                    active.queued_input.as_deref_mut(),
+                                    active.active_dock.as_mut(),
+                                    active.queue_notice.as_deref_mut(),
+                                )? {
+                                    ActiveInputOutcome::Continue => {}
+                                    ActiveInputOutcome::Redraw => dock_redraw_requested = true,
+                                    ActiveInputOutcome::PasteFence | ActiveInputOutcome::Eof => {
+                                        observe_failure(&mut stop, InteractiveError::Agent);
+                                        discard_pending(&mut pending, active.presenter);
+                                    }
                                 }
                             }
                         }
@@ -3300,7 +3444,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         discard_pending(&mut pending, active.presenter);
                                     }
                                 }
-                            } else if approval_ui.is_inactive() {
+                            } else if !approval_owns_active_input(active.joins, &approval_ui) {
                                 let input_outcome = handle_active_input(
                                     active.terminal,
                                     active.enhanced_decoder.as_deref_mut(),
@@ -3447,16 +3591,23 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
 
     if active.enhanced && stop.is_none() {
         if let Ok(outcome) = &result {
+            let input = active
+                .queued_input
+                .as_deref()
+                .ok_or(InteractiveError::Agent)?;
+            let command_palette = active
+                .active_dock
+                .as_ref()
+                .map(|dock| active_command_palette_snapshot(input, dock))
+                .ok_or(InteractiveError::Agent)?;
             match active.live.receipt_frame(outcome) {
                 Ok(frame) => match write_enhanced_terminal_frame(
                     frame,
                     DockRenderModel {
-                        input: active
-                            .queued_input
-                            .as_deref()
-                            .ok_or(InteractiveError::Agent)?,
+                        input,
                         notice: active.queue_notice.as_deref().and_then(Option::as_deref),
                         interaction: DockInteraction::Running,
+                        command_palette,
                         live: active.live,
                     },
                     active
@@ -3548,37 +3699,55 @@ fn handle_active_input(
         rows: MIN_ENHANCED_ROWS,
         columns: MIN_ENHANCED_COLUMNS,
     });
-    match apply_enhanced_input(decoder, bytes, input, dock.view, dock.theme, size, notice)? {
+    match apply_enhanced_input(
+        decoder,
+        bytes,
+        input,
+        dock.command_palette,
+        dock.view,
+        dock.theme,
+        size,
+        notice,
+    )? {
         EnhancedInputAction::None => Ok(ActiveInputOutcome::Continue),
-        EnhancedInputAction::Redraw => Ok(ActiveInputOutcome::Redraw),
+        EnhancedInputAction::Redraw | EnhancedInputAction::RedrawFence => {
+            Ok(ActiveInputOutcome::Redraw)
+        }
         EnhancedInputAction::PasteFence => Ok(ActiveInputOutcome::PasteFence),
         EnhancedInputAction::Exit => Ok(ActiveInputOutcome::Eof),
         EnhancedInputAction::Submit => {
             match classify_enhanced_submission(input.composer().text()) {
-                EnhancedSubmission::Exit => return Ok(ActiveInputOutcome::Eof),
-                EnhancedSubmission::Help => {
-                    let _ = input.take_draft_for_turn()?;
-                    *notice = Some(
-                        "/inspect | /review | /focus | /theme | /help | /exit | Enter queue | Ctrl+J newline"
-                            .to_owned(),
-                    );
-                    return Ok(ActiveInputOutcome::Redraw);
-                }
-                EnhancedSubmission::Inspect
-                | EnhancedSubmission::Review
-                | EnhancedSubmission::Focus => {
-                    let mode = match classify_enhanced_submission(input.composer().text()) {
-                        EnhancedSubmission::Inspect => ViewMode::Inspect,
-                        EnhancedSubmission::Review => ViewMode::Review,
-                        EnhancedSubmission::Focus => ViewMode::Focus,
-                        _ => return Err(InteractiveError::Agent),
-                    };
-                    let _ = input.take_draft_for_turn()?;
-                    let _ = dock
-                        .view
-                        .request_mode(mode)
-                        .map_err(|_| InteractiveError::Output)?;
-                    *notice = None;
+                EnhancedSubmission::Command(command) => {
+                    match command {
+                        CommandId::Exit | CommandId::Quit => {
+                            return Ok(ActiveInputOutcome::Eof);
+                        }
+                        CommandId::Help => {
+                            let _ = input.take_draft_for_turn()?;
+                            *notice = Some(
+                                "/inspect | /review | /focus | /theme | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                    .to_owned(),
+                            );
+                        }
+                        CommandId::Inspect | CommandId::Review | CommandId::Focus => {
+                            let mode = match command {
+                                CommandId::Inspect => ViewMode::Inspect,
+                                CommandId::Review => ViewMode::Review,
+                                CommandId::Focus => ViewMode::Focus,
+                                _ => return Err(InteractiveError::Agent),
+                            };
+                            let _ = input.take_draft_for_turn()?;
+                            let _ = dock
+                                .view
+                                .request_mode(mode)
+                                .map_err(|_| InteractiveError::Output)?;
+                            *notice = None;
+                        }
+                        CommandId::Theme => {
+                            let _ = input.take_draft_for_turn()?;
+                            apply_theme_command(ThemeCommand::Show, dock.theme, notice)?;
+                        }
+                    }
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Theme(command) => {
@@ -3623,9 +3792,19 @@ fn handle_active_escape_expiry(
         rows: MIN_ENHANCED_ROWS,
         columns: MIN_ENHANCED_COLUMNS,
     });
-    match expire_enhanced_escape(decoder, input, dock.view, dock.theme, size, notice)? {
+    match expire_enhanced_escape(
+        decoder,
+        input,
+        dock.command_palette,
+        dock.view,
+        dock.theme,
+        size,
+        notice,
+    )? {
         EnhancedInputAction::None => Ok(ActiveInputOutcome::Continue),
-        EnhancedInputAction::Redraw => Ok(ActiveInputOutcome::Redraw),
+        EnhancedInputAction::Redraw | EnhancedInputAction::RedrawFence => {
+            Ok(ActiveInputOutcome::Redraw)
+        }
         EnhancedInputAction::PasteFence => Ok(ActiveInputOutcome::PasteFence),
         EnhancedInputAction::Exit | EnhancedInputAction::Submit => Err(InteractiveError::Agent),
     }
@@ -3945,7 +4124,11 @@ fn complete_ready_frame(
             let surface = enhanced_surface_frame_for_request(
                 input,
                 notice,
-                DockInteraction::Running,
+                command_palette_interaction(
+                    DockInteraction::Running,
+                    active_command_palette_snapshot(input, dock),
+                    dock.view.committed().mode(),
+                ),
                 size,
                 dock.view.committed(),
                 dock.theme.requested(),
@@ -3984,7 +4167,11 @@ fn complete_ready_frame(
         let surface = enhanced_surface_frame(
             input,
             notice,
-            interaction,
+            command_palette_interaction(
+                interaction,
+                active_command_palette_snapshot(input, dock),
+                dock.view.requested().mode(),
+            ),
             size,
             dock.view,
             dock.theme,
@@ -4303,18 +4490,21 @@ async fn finish_turn_disposition(
             if !turn_end_rendered {
                 let frame = LiveFrame::stopped(skipped).map_err(|_| InteractiveError::Output)?;
                 let signal = if defer_suspend {
+                    let input = input.ok_or(InteractiveError::Agent)?;
+                    let dock = active_dock.ok_or(InteractiveError::Agent)?;
                     write_enhanced_terminal_frame(
                         frame,
                         DockRenderModel {
-                            input: input.ok_or(InteractiveError::Agent)?,
+                            input,
                             notice,
                             interaction: DockInteraction::Running,
+                            command_palette: active_command_palette_snapshot(input, dock),
                             live,
                         },
                         enhanced_presenter.ok_or(InteractiveError::Agent)?,
                         terminal,
                         signals,
-                        active_dock.ok_or(InteractiveError::Agent)?,
+                        dock,
                     )
                     .await?
                 } else {
@@ -4387,7 +4577,11 @@ async fn write_enhanced_terminal_frame(
         let surface = enhanced_surface_frame_for_request(
             model.input,
             model.notice,
-            model.interaction,
+            command_palette_interaction(
+                model.interaction,
+                model.command_palette,
+                dock.view.committed().mode(),
+            ),
             size,
             dock.view.committed(),
             dock.theme.requested(),
@@ -4535,6 +4729,9 @@ mod tests {
             RequestContext, Session, SurfaceIntent, TurnEndReason,
         },
         tui::{
+            command_palette::{
+                CommandId, CommandPaletteSnapshot, CommandPaletteState, PaletteMove,
+            },
             dock::{DockApprovalSelection, DockInteraction},
             inline_screen::InlineScreen,
             input_memory::InputMemory,
@@ -4602,6 +4799,7 @@ mod tests {
     fn view_transitions_discard_same_read_submission_and_wait_for_screen_commit() {
         let mut decoder = KeyDecoder::default();
         let mut input = InputMemory::default();
+        let mut command_palette = CommandPaletteState::default();
         input.insert_text("SAFE_DRAFT").unwrap();
         let mut view = ViewState::default();
         let theme = ThemeState::default();
@@ -4615,6 +4813,7 @@ mod tests {
             &mut decoder,
             b"\x0f\r",
             &mut input,
+            &mut command_palette,
             &mut view,
             &theme,
             size,
@@ -4631,6 +4830,7 @@ mod tests {
             &mut decoder,
             b"hidden\r",
             &mut input,
+            &mut command_palette,
             &mut view,
             &theme,
             size,
@@ -4647,6 +4847,7 @@ mod tests {
             &mut decoder,
             b"\x1b[6~\r",
             &mut input,
+            &mut command_palette,
             &mut view,
             &theme,
             size,
@@ -4659,9 +4860,454 @@ mod tests {
     }
 
     #[test]
+    fn exact_palette_catalogue_is_the_local_submission_classifier() {
+        for command in CommandId::ALL {
+            assert_eq!(
+                super::classify_enhanced_submission(command.command()),
+                super::EnhancedSubmission::Command(command)
+            );
+        }
+        assert_eq!(
+            super::classify_enhanced_submission("/theme paper"),
+            super::EnhancedSubmission::Theme(ThemeCommand::Select(ThemePalette::Paper))
+        );
+        assert_eq!(
+            super::classify_enhanced_submission("/not-local"),
+            super::EnhancedSubmission::Prompt
+        );
+    }
+
+    #[test]
+    fn command_palette_navigation_completion_and_paste_require_fresh_reads() {
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let theme = ThemeState::default();
+        let mut view = ViewState::default();
+        let mut notice = None;
+
+        for (bytes, selected) in [
+            (b"\x1b[A\r".as_slice(), CommandId::Help),
+            (b"\x1b[B\r".as_slice(), CommandId::Inspect),
+            (b"\t\r".as_slice(), CommandId::Inspect),
+            (b"\x1b[Z\r".as_slice(), CommandId::Help),
+        ] {
+            let mut decoder = KeyDecoder::default();
+            let mut input = InputMemory::default();
+            input.insert_text("/").unwrap();
+            let mut palette = CommandPaletteState::default();
+            assert_eq!(
+                apply_enhanced_input(
+                    &mut decoder,
+                    bytes,
+                    &mut input,
+                    &mut palette,
+                    &mut view,
+                    &theme,
+                    size,
+                    &mut notice,
+                )
+                .unwrap(),
+                super::EnhancedInputAction::RedrawFence
+            );
+            assert_eq!(
+                palette.snapshot(input.composer()).selected(),
+                Some(selected)
+            );
+            assert_eq!(input.composer().text(), "/");
+            assert_eq!(input.queue().len(), 0);
+        }
+
+        for bytes in [
+            b"\x1b[A\r".as_slice(),
+            b"\x1b[B\r".as_slice(),
+            b"\t\r".as_slice(),
+            b"\x1b[Z\r".as_slice(),
+        ] {
+            let mut decoder = KeyDecoder::default();
+            let mut input = InputMemory::default();
+            input.insert_text("/unknown").unwrap();
+            let mut palette = CommandPaletteState::default();
+            assert_eq!(
+                apply_enhanced_input(
+                    &mut decoder,
+                    bytes,
+                    &mut input,
+                    &mut palette,
+                    &mut view,
+                    &theme,
+                    size,
+                    &mut notice,
+                )
+                .unwrap(),
+                super::EnhancedInputAction::RedrawFence
+            );
+            assert_eq!(palette.snapshot(input.composer()).selected(), None);
+            assert_eq!(input.composer().text(), "/unknown");
+            assert_eq!(input.queue().len(), 0);
+        }
+
+        let mut decoder = KeyDecoder::default();
+        let mut input = InputMemory::default();
+        input.insert_text("/exit").unwrap();
+        let mut palette = CommandPaletteState::default();
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"\x1b[B\r",
+                &mut input,
+                &mut palette,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::RedrawFence
+        );
+        assert_eq!(input.composer().text(), "/exit");
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"\r",
+                &mut input,
+                &mut palette,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::Submit
+        );
+
+        let mut decoder = KeyDecoder::default();
+        let mut input = InputMemory::default();
+        input.insert_text("/qu").unwrap();
+        let mut palette = CommandPaletteState::default();
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"\r\r",
+                &mut input,
+                &mut palette,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::RedrawFence
+        );
+        assert_eq!(input.composer().text(), "/quit");
+        assert_eq!(input.queue().len(), 0);
+
+        let mut decoder = KeyDecoder::default();
+        let mut input = InputMemory::default();
+        let mut palette = CommandPaletteState::default();
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"\x1b[200~/exit\x1b[201~\r",
+                &mut input,
+                &mut palette,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::PasteFence
+        );
+        assert_eq!(input.composer().text(), "/exit");
+        assert_eq!(input.queue().len(), 0);
+    }
+
+    #[test]
+    fn command_palette_escape_and_rejected_input_are_revision_scoped_dismissals() {
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let theme = ThemeState::default();
+
+        let mut decoder = KeyDecoder::default();
+        let mut input = InputMemory::default();
+        input.insert_text("/").unwrap();
+        let mut palette = CommandPaletteState::default();
+        let mut view = ViewState::default();
+        let mut notice = None;
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"\x1b",
+                &mut input,
+                &mut palette,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::None
+        );
+        assert!(palette.snapshot(input.composer()).is_visible());
+        assert_eq!(
+            expire_enhanced_escape(
+                &mut decoder,
+                &mut input,
+                &mut palette,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::Redraw
+        );
+        assert_eq!(
+            palette.snapshot(input.composer()),
+            CommandPaletteSnapshot::Hidden
+        );
+        assert_eq!(input.composer().text(), "/");
+        input.insert_char('h').unwrap();
+        assert!(palette.sync(input.composer()).is_visible());
+
+        for bytes in [b"\0".as_slice(), b"\x1b[200~\xff\x1b[201~".as_slice()] {
+            let mut decoder = KeyDecoder::default();
+            let mut input = InputMemory::default();
+            input.insert_text("/").unwrap();
+            let mut palette = CommandPaletteState::default();
+            assert!(palette.navigate(input.composer(), PaletteMove::Next));
+            let mut view = ViewState::default();
+            let mut notice = None;
+            let action = apply_enhanced_input(
+                &mut decoder,
+                bytes,
+                &mut input,
+                &mut palette,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap();
+            assert!(matches!(
+                action,
+                super::EnhancedInputAction::Redraw | super::EnhancedInputAction::PasteFence
+            ));
+            assert_eq!(
+                palette.snapshot(input.composer()),
+                CommandPaletteSnapshot::Hidden
+            );
+            assert_eq!(input.composer().text(), "/");
+            assert_eq!(palette.snapshot(input.composer()).selected(), None);
+            input.insert_char('h').unwrap();
+            assert_eq!(
+                palette.sync(input.composer()).selected(),
+                Some(CommandId::Help)
+            );
+        }
+
+        let mut input = InputMemory::default();
+        input.insert_text("/").unwrap();
+        let mut palette = CommandPaletteState::default();
+        for _ in 0..6 {
+            assert!(palette.navigate(input.composer(), PaletteMove::Next));
+        }
+        assert_eq!(
+            palette.snapshot(input.composer()).selected(),
+            Some(CommandId::Quit)
+        );
+        let mut decoder = KeyDecoder::default();
+        let mut view = ViewState::default();
+        let mut notice = None;
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"\x1b[200~h\x1b[201~",
+                &mut input,
+                &mut palette,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::PasteFence
+        );
+        assert_eq!(input.composer().text(), "/h");
+        assert_eq!(
+            palette.snapshot(input.composer()).selected(),
+            Some(CommandId::Help)
+        );
+        let mut decoder = KeyDecoder::default();
+        assert_eq!(
+            apply_enhanced_input(
+                &mut decoder,
+                b"\0",
+                &mut input,
+                &mut palette,
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::Redraw
+        );
+        assert_eq!(
+            palette.snapshot(input.composer()),
+            CommandPaletteSnapshot::Hidden
+        );
+        assert!(input.backspace().unwrap());
+        assert_eq!(
+            palette.sync(input.composer()).selected(),
+            Some(CommandId::Help)
+        );
+    }
+
+    #[test]
+    fn command_palette_yields_to_detail_and_approval_and_survives_partial_redraw() {
+        let mut input = InputMemory::default();
+        input.insert_text("/").unwrap();
+        let mut palette = CommandPaletteState::default();
+        for _ in 0..4 {
+            assert!(palette.navigate(input.composer(), PaletteMove::Next));
+        }
+        let snapshot = palette.snapshot(input.composer());
+        assert_eq!(snapshot.selected(), Some(CommandId::Theme));
+
+        let interaction =
+            super::command_palette_interaction(DockInteraction::Running, snapshot, ViewMode::Focus);
+        assert!(matches!(
+            interaction,
+            DockInteraction::CommandPalette {
+                running: true,
+                snapshot: visible,
+            } if visible.selected() == Some(CommandId::Theme)
+        ));
+        assert_eq!(
+            super::command_palette_interaction(interaction, snapshot, ViewMode::Focus),
+            interaction
+        );
+        assert_eq!(
+            super::command_palette_interaction(
+                interaction,
+                CommandPaletteSnapshot::Hidden,
+                ViewMode::Focus,
+            ),
+            DockInteraction::Running
+        );
+        assert_eq!(
+            super::command_palette_interaction(
+                DockInteraction::Approval(DockApprovalSelection::Reject),
+                snapshot,
+                ViewMode::Focus,
+            ),
+            DockInteraction::Approval(DockApprovalSelection::Reject)
+        );
+        assert_eq!(
+            super::command_palette_interaction(interaction, snapshot, ViewMode::Inspect),
+            DockInteraction::Running
+        );
+        assert_eq!(
+            super::command_palette_interaction(interaction, snapshot, ViewMode::Review),
+            DockInteraction::Running
+        );
+
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let frame = super::enhanced_dock_frame(&input, None, interaction, size).unwrap();
+        let mut screen = InlineScreen::default();
+        let mut attach = screen
+            .stage_attach(super::screen_size(size), &frame, ThemePalette::Adaptive)
+            .unwrap();
+        let attach_bytes = attach.bytes().len();
+        attach.advance(attach_bytes).unwrap();
+        screen.commit(attach).unwrap();
+
+        let view = ViewState::default();
+        let theme = ThemeState::default();
+        let zero_write = screen.stage_dock(&frame, ThemePalette::Adaptive).unwrap();
+        let mut pending = Some(PendingOutput::Inline(PendingInlineOutput {
+            write: zero_write,
+            intent: InlineIntent::Dock(interaction),
+            surface: SurfaceCommit {
+                request: view.requested(),
+                theme: theme.requested(),
+                offset: 0,
+                total_rows: 0,
+                page_rows: 0,
+            },
+        }));
+        assert!(!prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
+        assert!(!screen.is_poisoned());
+        assert!(matches!(
+            pending,
+            Some(PendingOutput::Dock(candidate)) if candidate == interaction
+        ));
+        assert_eq!(
+            palette.snapshot(input.composer()).selected(),
+            Some(CommandId::Theme)
+        );
+
+        let mut write = screen.stage_dock(&frame, ThemePalette::Adaptive).unwrap();
+        write.advance(1).unwrap();
+        let mut pending = Some(PendingOutput::Inline(PendingInlineOutput {
+            write,
+            intent: InlineIntent::Dock(interaction),
+            surface: SurfaceCommit {
+                request: view.requested(),
+                theme: theme.requested(),
+                offset: 0,
+                total_rows: 0,
+                page_rows: 0,
+            },
+        }));
+        assert!(prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
+        assert!(screen.is_poisoned());
+        assert!(matches!(
+            pending,
+            Some(PendingOutput::Dock(DockInteraction::CommandPalette {
+                running: true,
+                snapshot: visible,
+            })) if visible.selected() == Some(CommandId::Theme)
+        ));
+        assert_eq!(
+            palette.snapshot(input.composer()).selected(),
+            Some(CommandId::Theme)
+        );
+
+        screen.recover_after_visual_reset();
+        let compact_size = TerminalSize {
+            rows: 5,
+            columns: 12,
+        };
+        let compact = super::enhanced_dock_frame(&input, None, interaction, compact_size).unwrap();
+        let recovered = screen
+            .stage_attach(
+                super::screen_size(compact_size),
+                &compact,
+                ThemePalette::Adaptive,
+            )
+            .unwrap();
+        assert!(
+            recovered
+                .bytes()
+                .windows(b"> /theme".len())
+                .any(|row| row == b"> /theme")
+        );
+    }
+
+    #[test]
     fn theme_transition_discards_input_until_the_palette_redraw_commits() {
         let mut decoder = KeyDecoder::default();
         let mut input = InputMemory::default();
+        let mut command_palette = CommandPaletteState::default();
         let mut view = ViewState::default();
         let mut theme = ThemeState::default();
         let mut notice = None;
@@ -4682,6 +5328,7 @@ mod tests {
                 &mut decoder,
                 b"HIDDEN\r",
                 &mut input,
+                &mut command_palette,
                 &mut view,
                 &theme,
                 size,
@@ -4698,6 +5345,7 @@ mod tests {
                 &mut decoder,
                 b"fresh",
                 &mut input,
+                &mut command_palette,
                 &mut view,
                 &theme,
                 size,
@@ -4713,6 +5361,7 @@ mod tests {
     fn detail_escape_requires_a_fresh_input_after_returning_to_focus() {
         let mut decoder = KeyDecoder::default();
         let mut input = InputMemory::default();
+        let mut command_palette = CommandPaletteState::default();
         input.insert_text("SAFE_DRAFT").unwrap();
         let mut view = ViewState::default();
         let theme = ThemeState::default();
@@ -4729,6 +5378,7 @@ mod tests {
                 &mut decoder,
                 b"\x1b",
                 &mut input,
+                &mut command_palette,
                 &mut view,
                 &theme,
                 size,
@@ -4742,6 +5392,7 @@ mod tests {
             expire_enhanced_escape(
                 &mut decoder,
                 &mut input,
+                &mut command_palette,
                 &mut view,
                 &theme,
                 size,
@@ -4757,6 +5408,7 @@ mod tests {
                 &mut decoder,
                 b"\r",
                 &mut input,
+                &mut command_palette,
                 &mut view,
                 &theme,
                 size,

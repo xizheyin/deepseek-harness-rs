@@ -1,6 +1,7 @@
 //! Semantic terminal presentation state shared by enhanced and linear views.
 
 pub(crate) mod approval_preview;
+pub(crate) mod command_palette;
 pub(crate) mod composer;
 pub(crate) mod dock;
 pub(crate) mod inline_screen;

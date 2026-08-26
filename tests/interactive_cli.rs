@@ -97,17 +97,26 @@ fn request_json(request: &str) -> serde_json::Value {
     serde_json::from_str(body).expect("HTTP request body should be JSON")
 }
 
-fn last_user_content(request: &str) -> String {
+fn user_contents(request: &str) -> Vec<String> {
     let request = request_json(request);
     request["messages"]
         .as_array()
         .expect("request messages should be an array")
         .iter()
-        .rev()
-        .find(|message| message["role"] == "user")
-        .and_then(|message| message["content"].as_str())
+        .filter(|message| message["role"] == "user")
+        .map(|message| {
+            message["content"]
+                .as_str()
+                .expect("user messages should contain text")
+                .to_owned()
+        })
+        .collect()
+}
+
+fn last_user_content(request: &str) -> String {
+    user_contents(request)
+        .pop()
         .expect("request should contain a user text message")
-        .to_owned()
 }
 
 fn repeated_text_sse(delta_count: usize) -> String {
@@ -349,6 +358,68 @@ fn styled_terminal_uses_product_owned_color_and_semantic_labels() {
 }
 
 #[test]
+fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
+    let server = SequenceSseServer::start(Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"\x1b[200~/quit\x1b[201~\r");
+    dsh.expect(b"Paste ready");
+    dsh.expect(b"/quit");
+    dsh.write(&[0x15]);
+
+    dsh.write(b"/");
+    dsh.expect(b"> /quit");
+    dsh.expect(b"/help");
+    dsh.expect(b"/inspect");
+    dsh.expect(b"/review");
+    dsh.expect(b"/focus");
+    dsh.expect(b"/theme");
+    dsh.expect(b"/exit");
+    dsh.expect(b"/quit");
+    dsh.expect("Enter complete · Esc close".as_bytes());
+    dsh.write(b"\x1b[A");
+    dsh.expect(b"> /exit");
+
+    for (rows, columns, hint) in [
+        (12, 44, "Enter complete · Esc close"),
+        (5, 12, "Enter · Esc"),
+        (15, 80, "Enter complete · Esc close"),
+        (24, 112, "Enter complete · Esc close"),
+    ] {
+        let checkpoint = dsh.checkpoint();
+        dsh.resize(rows, columns);
+        dsh.expect_after(checkpoint, b"> /exit");
+        dsh.expect_after(checkpoint, hint.as_bytes());
+    }
+
+    let tab_fenced = dsh.checkpoint();
+    dsh.write(b"\t\r");
+    dsh.expect_after(tab_fenced, b"> /quit");
+    let back_tab = dsh.checkpoint();
+    dsh.write(b"\x1b[Z");
+    dsh.expect_after(back_tab, b"> /exit");
+    let down_fenced = dsh.checkpoint();
+    dsh.write(b"\x1b[B\r");
+    dsh.expect_after(down_fenced, b"> /quit");
+    let completed = dsh.checkpoint();
+    dsh.write(b"\r");
+    dsh.expect_after(completed, b"/quit");
+    dsh.expect_after(completed, "Enter complete · Esc close".as_bytes());
+    dsh.write(b"\r");
+    let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(5));
+
+    assert!(status.success());
+    assert!(
+        !transcript
+            .windows(b"Turn complete".len())
+            .any(|window| window == b"Turn complete")
+    );
+    assert!(server.finish().is_empty());
+}
+
+#[test]
 fn enhanced_streaming_markdown_and_diff_are_styled_without_replaying_source() {
     let body = fragmented_text_sse(&[
         "#",
@@ -568,7 +639,7 @@ fn enhanced_theme_commands_are_local_transactional_and_reach_all_six_palettes() 
 }
 
 #[test]
-fn active_theme_switch_never_enters_the_next_turn_fifo() {
+fn active_palette_theme_and_unknown_slash_keep_the_next_turn_fifo_truthful() {
     let first =
         "data: {\"choices\":[{\"delta\":{\"content\":\"active theme prefix\"}}]}\n\n".to_owned();
     let mut server = GatedThenStalledSseServer::start(first, text_sse(" active theme suffix"));
@@ -578,6 +649,16 @@ fn active_theme_switch_never_enters_the_next_turn_fifo() {
     dsh.expect("❯".as_bytes());
     dsh.write(b"start a themed active turn\r");
     dsh.expect(b"active theme prefix");
+    let help = dsh.checkpoint();
+    dsh.write(b"/he");
+    dsh.expect_after(help, b"> /help");
+    dsh.write(b"\r\r");
+    dsh.expect_after(help, b"/help");
+    server.assert_no_second_request(Duration::from_millis(150));
+    dsh.write(b"\r");
+    dsh.expect_after(help, b"/inspect | /review | /focus");
+    server.assert_no_second_request(Duration::from_millis(150));
+
     let themed = dsh.checkpoint();
     dsh.write(b"/theme mono\r");
     dsh.expect_after(themed, "Theme changed · mono".as_bytes());
@@ -616,7 +697,10 @@ fn active_theme_switch_never_enters_the_next_turn_fifo() {
         "Mono may use attributes and cursor controls, but no foreground color"
     );
 
-    dsh.write(b"fresh prompt after active theme\r");
+    let unknown = dsh.checkpoint();
+    dsh.write(b"/not-local");
+    dsh.expect_after(unknown, b"No matching local command");
+    dsh.write(b"\r");
     server.wait_until_second_request();
     dsh.expect(b"Working");
     dsh.write(&[0x03]);
@@ -631,10 +715,59 @@ fn active_theme_switch_never_enters_the_next_turn_fifo() {
         last_user_content(&requests[0]),
         "start a themed active turn"
     );
+    assert_eq!(last_user_content(&requests[1]), "/not-local");
     assert_eq!(
-        last_user_content(&requests[1]),
-        "fresh prompt after active theme"
+        user_contents(&requests[1]),
+        ["start a themed active turn", "/not-local"]
     );
+}
+
+#[test]
+fn active_exit_aliases_complete_then_cancel_and_clean_up_the_turn() {
+    for (prefix, command) in [(b"/ex".as_slice(), b"/exit".as_slice()), (b"/qu", b"/quit")] {
+        let partial =
+            concat!("data: {\"choices\":[{\"delta\":{\"content\":\"active exit cleanup\"}}]}\n\n")
+                .to_owned();
+        let server = StalledSseServer::start(partial);
+        let workspace = TestWorkspace::new();
+        let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+        dsh.expect("❯".as_bytes());
+        dsh.write(b"keep provider open while local exit runs\r");
+        dsh.expect(b"active exit cleanup");
+        let queued = dsh.checkpoint();
+        dsh.write(b"DO_NOT_ADMIT_AFTER_LOCAL_EXIT\r");
+        dsh.expect_after(queued, b"next-turn prompt(s) queued");
+        let palette = dsh.checkpoint();
+        dsh.write(prefix);
+        dsh.expect_after(palette, command);
+        let completion = dsh.checkpoint();
+        dsh.write(b"\r\r");
+        let mut completed_prompt = "❯ ".as_bytes().to_vec();
+        completed_prompt.extend_from_slice(command);
+        dsh.expect_after(completion, &completed_prompt);
+        let exact = dsh.checkpoint();
+        dsh.write(b"\r");
+        let (status, transcript) = dsh.wait_for_exit(Duration::from_secs(5));
+        let (request, closed) = server.finish();
+
+        assert!(status.success());
+        assert!(closed, "local exit must close the active provider request");
+        assert_eq!(
+            last_user_content(&request),
+            "keep provider open while local exit runs"
+        );
+        assert_eq!(
+            user_contents(&request),
+            ["keep provider open while local exit runs"]
+        );
+        assert!(
+            !transcript[exact..]
+                .windows(b"Turn complete".len())
+                .any(|window| window == b"Turn complete"),
+            "an active local exit is cancellation, not a completed turn"
+        );
+    }
 }
 
 #[test]
@@ -1073,6 +1206,9 @@ fn active_inspect_scroll_resize_and_same_read_enter_never_queue_a_hidden_prompt(
     let review_focus = dsh.checkpoint();
     dsh.write(&[0x0f]);
     dsh.expect_after(review_focus, b"Working");
+    let local_focus = dsh.checkpoint();
+    dsh.write(b"/focus\r");
+    dsh.expect_after(local_focus, b"Working");
     dsh.write(b"SAFE_NEXT_PROMPT");
     let inspect = dsh.checkpoint();
     dsh.write(b"\x0f\r");
@@ -1113,6 +1249,10 @@ fn active_inspect_scroll_resize_and_same_read_enter_never_queue_a_hidden_prompt(
         "inspect while the turn is active"
     );
     assert_eq!(last_user_content(&requests[1]), "SAFE_NEXT_PROMPT");
+    assert_eq!(
+        user_contents(&requests[1]),
+        ["inspect while the turn is active", "SAFE_NEXT_PROMPT"]
+    );
 }
 
 #[test]
@@ -1664,6 +1804,66 @@ fn enhanced_approval_takes_over_inspect_before_rendering_the_preview() {
 }
 
 #[test]
+fn enhanced_approval_suppresses_then_restores_the_command_palette_draft() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let partial = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"waiting with palette draft\"}}]}\n\n"
+    )
+    .to_owned();
+    let mut server = GatedFirstSseServer::start(
+        partial,
+        tool_sse(
+            "call-palette-takeover",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        vec![text_sse("rejected after palette takeover")],
+    );
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"open approval over palette\r");
+    dsh.expect(b"waiting with palette draft");
+    let palette = dsh.checkpoint();
+    dsh.write(b"/he");
+    dsh.expect_after(palette, b"> /help");
+
+    let takeover = dsh.checkpoint();
+    server.release();
+    dsh.expect_after(takeover, b"Requested  Patch");
+    dsh.expect_after(takeover, b"Proposed update");
+    dsh.write(b"\x15/exit\r");
+    let approval_dock = dsh.checkpoint();
+    dsh.approval_ready();
+    dsh.expect_after(approval_dock, b"> Reject");
+    assert!(
+        !dsh.snapshot()[approval_dock..]
+            .windows(b"> /help".len())
+            .any(|window| window == b"> /help"),
+        "approval owns the Dock and must suppress the command palette"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+
+    let settlement = dsh.checkpoint();
+    dsh.write(b"\r");
+    dsh.expect_after(settlement, b"Rejected");
+    dsh.expect_after(settlement, b"rejected after palette takeover");
+    dsh.expect_after(settlement, b"Turn complete");
+    dsh.expect_after(settlement, b"Ready");
+    dsh.expect_after(settlement, b"> /help");
+    dsh.write(b"\x15/exit\r");
+    let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
 fn enhanced_approval_rejects_printable_same_read_and_pasted_authority() {
     let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
     let server = SequenceSseServer::start(vec![
@@ -1763,8 +1963,23 @@ fn interactive_help_quit_and_idle_ctrl_d_are_real_terminal_commands() {
 
     quit.expect(b"dsh | interactive; new session ");
     quit.expect(b"dsh > ");
-    quit.write(b"/help\r");
+    let partial = quit.checkpoint();
+    quit.write(b"/he");
+    std::thread::sleep(Duration::from_millis(100));
+    let partial_output = quit.snapshot();
+    assert!(
+        !partial_output[partial..]
+            .windows(b"> /help".len())
+            .any(|window| window == b"> /help"),
+        "linear mode must not render the enhanced command palette"
+    );
+    assert!(
+        !partial_output.contains(&0x1b),
+        "linear mode must remain free of ANSI application-mode output"
+    );
+    quit.write(b"lp\r");
     quit.expect(b"[commands]");
+    quit.expect(b"/focus  return to Focus");
     quit.expect(b"/exit  exit dsh");
     quit.expect_occurrences(b"dsh > ", 2);
     quit.write(b"/quit\r");

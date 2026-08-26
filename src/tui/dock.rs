@@ -5,6 +5,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr;
 
 use super::{
+    command_palette::{CommandId, CommandPaletteSnapshot},
     composer::Composer,
     input_memory::PromptQueue,
     presentation::TextStyle,
@@ -25,6 +26,10 @@ const DETAIL_WRAPPED_OMISSION: &str = "[omitted] wrapped row limit";
 pub(crate) enum DockInteraction {
     Idle,
     Running,
+    CommandPalette {
+        running: bool,
+        snapshot: CommandPaletteSnapshot,
+    },
     Approval(DockApprovalSelection),
 }
 
@@ -64,6 +69,9 @@ enum DockRole {
     ApprovalChoice,
     ApprovalSelected,
     ApprovalWarning,
+    CommandChoice,
+    CommandSelected,
+    CommandEmpty,
     DetailTitle,
     DetailPlain,
     DetailMuted,
@@ -226,7 +234,18 @@ impl DockFrame {
             ));
             0
         } else {
-            if let Some(notice) = model.notice {
+            let palette = match model.interaction {
+                DockInteraction::CommandPalette { snapshot, .. } => Some(snapshot),
+                DockInteraction::Idle | DockInteraction::Running | DockInteraction::Approval(_) => {
+                    None
+                }
+            };
+            if compact && palette.is_some() {
+                lines.push(compact_command_line(
+                    palette.ok_or(DockError::InvalidState)?,
+                    width_usize,
+                ));
+            } else if let Some(notice) = model.notice {
                 let notice = render_visible_owned(notice, false)?;
                 lines.push(line(DockRole::Notice, truncate_cells(&notice, width_usize)));
             } else if model.queue.len() != 0 {
@@ -245,6 +264,10 @@ impl DockFrame {
                 let status = match model.interaction {
                     DockInteraction::Idle => "Ready",
                     DockInteraction::Running => "Working | type the next prompt while dsh runs",
+                    DockInteraction::CommandPalette { running: false, .. } => "Ready",
+                    DockInteraction::CommandPalette { running: true, .. } => {
+                        "Working | type the next prompt while dsh runs"
+                    }
                     DockInteraction::Approval(_) => "Approval required",
                 };
                 lines.push(line(DockRole::Queue, fit_ascii(status, width_usize)));
@@ -269,6 +292,11 @@ impl DockFrame {
             while lines.len() < composer_start + composer_rows {
                 lines.push(line(DockRole::Composer, "  ".to_owned()));
             }
+            if !compact {
+                if let Some(palette) = palette {
+                    push_command_lines(&mut lines, palette, rows, columns, width_usize)?;
+                }
+            }
             let hint = match model.interaction {
                 DockInteraction::Idle if compact => "Enter send",
                 DockInteraction::Idle => "Enter send | Ctrl+J newline | Up history | ? help",
@@ -276,6 +304,8 @@ impl DockFrame {
                 DockInteraction::Running => {
                     "Enter queue | Ctrl+J newline | Ctrl+C stop current turn"
                 }
+                DockInteraction::CommandPalette { .. } if compact => "Enter · Esc",
+                DockInteraction::CommandPalette { .. } => "Enter complete · Esc close",
                 DockInteraction::Approval(_) => "Arrow keys move | Enter confirms | Esc stops",
             };
             let mut hint = if wrapped.hidden_below {
@@ -508,6 +538,74 @@ fn line(role: DockRole, text: String) -> DockLine {
     DockLine { role, text }
 }
 
+fn compact_command_line(snapshot: CommandPaletteSnapshot, width: usize) -> DockLine {
+    let Some(command) = snapshot.selected() else {
+        return line(DockRole::CommandEmpty, fit_ascii("! No match", width));
+    };
+    line(
+        DockRole::CommandSelected,
+        fit_ascii(&format!(" > {}", command.command()), width),
+    )
+}
+
+fn push_command_lines(
+    lines: &mut Vec<DockLine>,
+    snapshot: CommandPaletteSnapshot,
+    terminal_rows: u16,
+    columns: u16,
+    width: usize,
+) -> Result<(), DockError> {
+    let count = snapshot.count();
+    if count == 0 {
+        lines.push(line(
+            DockRole::CommandEmpty,
+            truncate_cells(" ! No matching local command", width),
+        ));
+        return Ok(());
+    }
+    let width_cap = if columns < 60 { 3 } else { 7 };
+    let visible = count
+        .min(width_cap)
+        .min(usize::from(terminal_rows).saturating_sub(8));
+    if visible == 0 {
+        return Err(DockError::TooSmall);
+    }
+    let selected = snapshot.selected().ok_or(DockError::InvalidState)?;
+    let selected_index = (0..count)
+        .find(|index| snapshot.command_at(*index) == Some(selected))
+        .ok_or(DockError::InvalidState)?;
+    let start = selected_index
+        .saturating_sub((visible - 1) / 2)
+        .min(count - visible);
+    for index in start..start + visible {
+        let command = snapshot.command_at(index).ok_or(DockError::InvalidState)?;
+        lines.push(command_line(command, command == selected, width));
+    }
+    Ok(())
+}
+
+fn command_line(command: CommandId, selected: bool, width: usize) -> DockLine {
+    let marker = if selected { '>' } else { ' ' };
+    let prefix = format!(" {marker} {}", command.command());
+    let mut text = prefix.clone();
+    let suffix = format!(" | {}", command.description());
+    if text.len().saturating_add(suffix.len()) <= width {
+        text.push_str(&suffix);
+    } else if width > prefix.len() + 3 {
+        text.push_str(" | ");
+        text.push_str(command.description());
+        text = truncate_cells(&text, width);
+    }
+    line(
+        if selected {
+            DockRole::CommandSelected
+        } else {
+            DockRole::CommandChoice
+        },
+        text,
+    )
+}
+
 struct WrappedComposer {
     rows: VecDeque<String>,
     cursor_row: usize,
@@ -735,8 +833,9 @@ const fn style_for_role(role: DockRole) -> TextStyle {
         DockRole::Notice | DockRole::ApprovalWarning | DockRole::DetailCaution => {
             TextStyle::Warning
         }
-        DockRole::ApprovalChoice => TextStyle::Code,
-        DockRole::ApprovalSelected => TextStyle::Selection,
+        DockRole::ApprovalChoice | DockRole::CommandChoice => TextStyle::Code,
+        DockRole::ApprovalSelected | DockRole::CommandSelected => TextStyle::Selection,
+        DockRole::CommandEmpty => TextStyle::Warning,
         DockRole::DetailTitle => TextStyle::Heading,
         DockRole::DetailAccent => TextStyle::Accent,
         DockRole::DetailPositive => TextStyle::Success,
@@ -770,9 +869,10 @@ fn byte_at_cell(text: &str, target: usize) -> Option<usize> {
 mod tests {
     use super::{
         DETAIL_WRAPPED_OMISSION, DockApprovalSelection, DockFrame, DockInteraction, DockModel,
-        MAX_DETAIL_WRAPPED_ROWS,
+        DockRole, MAX_DETAIL_WRAPPED_ROWS,
     };
     use crate::tui::{
+        command_palette::{CommandPaletteState, PaletteMove},
         composer::Composer,
         input_memory::PromptQueue,
         presentation::TextStyle,
@@ -829,6 +929,111 @@ mod tests {
             }
             assert!(frame.cursor_column < columns);
         }
+    }
+
+    #[test]
+    fn command_palette_has_deterministic_windows_and_compact_rescue_geometry() {
+        let mut composer = Composer::default();
+        composer.insert_text("/").unwrap();
+        let queue = PromptQueue::default();
+        let mut palette = CommandPaletteState::default();
+        for _ in 0..5 {
+            assert!(palette.navigate(&composer, PaletteMove::Next));
+        }
+        let snapshot = palette.snapshot(&composer);
+
+        for (rows, columns, expected) in [
+            (
+                24,
+                80,
+                vec![
+                    "/help", "/inspect", "/review", "/focus", "/theme", "/exit", "/quit",
+                ],
+            ),
+            (
+                15,
+                80,
+                vec![
+                    "/help", "/inspect", "/review", "/focus", "/theme", "/exit", "/quit",
+                ],
+            ),
+            (12, 80, vec!["/focus", "/theme", "/exit", "/quit"]),
+            (12, 44, vec!["/theme", "/exit", "/quit"]),
+        ] {
+            let frame = DockFrame::layout(
+                DockModel {
+                    interaction: DockInteraction::CommandPalette {
+                        running: false,
+                        snapshot,
+                    },
+                    composer: &composer,
+                    queue: &queue,
+                    notice: None,
+                },
+                rows,
+                columns,
+            )
+            .unwrap();
+            let commands = frame
+                .lines
+                .iter()
+                .filter(|line| {
+                    matches!(
+                        line.role,
+                        DockRole::CommandChoice | DockRole::CommandSelected
+                    )
+                })
+                .map(|line| {
+                    expected
+                        .iter()
+                        .find(|command| line.text.contains(**command))
+                        .copied()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(commands, expected, "{columns}x{rows}");
+            assert!(frame.lines.iter().any(|line| line.text.contains("> /exit")));
+            assert!(frame.output_bottom() >= 1);
+        }
+
+        let compact = DockFrame::layout(
+            DockModel {
+                interaction: DockInteraction::CommandPalette {
+                    running: true,
+                    snapshot,
+                },
+                composer: &composer,
+                queue: &queue,
+                notice: None,
+            },
+            5,
+            12,
+        )
+        .unwrap();
+        assert_eq!(compact.rows().unwrap(), 4);
+        assert_eq!(compact.output_bottom(), 1);
+        assert_eq!(compact.lines[0].text, " > /exit");
+        assert_eq!(compact.lines[3].text, "Enter · Esc");
+
+        let mut unknown = Composer::default();
+        unknown.insert_text("/unknown").unwrap();
+        let empty = palette.sync(&unknown);
+        let compact_empty = DockFrame::layout(
+            DockModel {
+                interaction: DockInteraction::CommandPalette {
+                    running: false,
+                    snapshot: empty,
+                },
+                composer: &unknown,
+                queue: &queue,
+                notice: None,
+            },
+            5,
+            12,
+        )
+        .unwrap();
+        assert_eq!(compact_empty.lines[0].text, "! No match");
+        assert!(!compact_empty.lines[0].text.contains('>'));
     }
 
     #[test]
