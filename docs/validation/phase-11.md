@@ -748,6 +748,71 @@ This is a green, explicit opt-in approval-usability checkpoint, not permission
 to auto-run arbitrary commands and not Phase 11 completion. The Session picker
 and the previously listed terminal/release evidence remain pending.
 
+## Exact Shell process grant slice — 2026-08-26
+
+Design commit `29b37b2ffa567cee025e6ed3705e06c97c718a4f` freezes the
+boundary in `docs/design/approval-modes.md`; implementation commit
+`57103ffa05c06ca7d9df7316db30211a4cd82d0b` makes it production reachable.
+A fully prepared built-in Shell approval now has an explicit fourth choice,
+`Allow exact Shell for this process`. Default Reject and ordinary `Allow once`
+remain unchanged. The extra choice is terminal-only and never becomes a new
+durable Session approval outcome.
+
+`AgentLoop` owns one process-random HMAC-SHA256 key and at most 64 digests. The
+sealed identity covers the exact command, effective timeout, normalized
+working-directory text and retained root/directory device+inode identities,
+fixed child environment, and fixed Bash launcher/policy version. It excludes
+the model-facing description and call ID because neither changes the spawned
+process. Identity allocation, entropy, HMAC, or capacity failure disables the
+remembering path and leaves the ordinary per-call Ask path usable. Debug output
+contains only lengths/counts and never the command, path, environment, key, or
+digest.
+
+The first explicit choice still records the normal `approval/asked` followed by
+`approval/decided(allowed-once)`. A digest is installed only after an exit-zero,
+unsignalled, non-timeout, non-aborted, non-error process is fully quiescent and
+its preferred `tool/result` is committed. A hit consumes the digest before any
+side effect, skips only the human question, and creates no fabricated approval
+pair. It is restored only after another clean committed result and a final
+cancel/deadline sample. Failure, signal, timeout, cancellation, ownership loss,
+validation failure, or settlement failure therefore makes the next repetition
+ask again. New Agent construction, including resume, starts with a new key and
+empty store.
+
+Focused tests cover request-scoped selector/Dock presentation, fresh Enter,
+digest capacity/entropy/redaction, every execution-identity field, an injected
+identity-allocation fallback, and the clean/nonzero/signal/timeout/aborted/error
+predicate. Fake-Agent traces cover exact repetition, ordinary one-shot
+approval, nonzero first execution, failed cached execution followed by a third
+Ask, cached cancellation plus cleanup followed by a later Ask, exact event
+order/correlation, and same-Session Agent rebuilding. Real enhanced and linear
+PTY journeys execute normalized duplicate Shell calls after one explicit
+choice. A separate same-process enhanced PTY first creates a Shell grant and
+then calls a configured plugin; the plugin has no fourth choice, receives no
+call before its own approval, and keeps its own asked/decided pair. Existing
+real script tests retain Shell/plugin Deny.
+
+Local validation used Rust 1.85.0 on Darwin 27.0.0 arm64 with fake models,
+loopback HTTP, temporary workspaces, and obvious fake credentials. No real API
+key, public network request, or model billing was used. `./scripts/verify.sh`
+passed formatting, all-target/all-feature checks, example builds, 773 library
+tests plus 356 other tests (1,129 total), zero failed/ignored, Clippy with
+warnings denied, and both whitespace gates. The implementation commit was
+pushed non-forced to `origin/main`.
+
+Three independent read-only reviews audited digest construction, cache
+ownership and consumption, result/cancellation ordering, UI confirmation,
+workdir revalidation, plugin/script isolation, and the failure matrix. Final
+algorithm and safety reviews reported P0/P1/P2 = 0. The final test review
+reported P0/P1 = 0 and two non-blocking Phase 11 evidence suggestions: complete
+direction/Tab wraparound coverage for the fourth option and a real resume PTY
+in addition to the current same-Session Agent rebuild test.
+
+This is a green approval-usability checkpoint, not general automatic Shell
+permission, not a sandbox, and not Phase 11 completion. Exact repetition can
+repeat destructive filesystem or network side effects. The Session picker and
+the previously listed terminal/release evidence remain pending.
+
 ## Evidence pending
 
 - remaining product files and default-enabled Phase 11 acceptance tests;

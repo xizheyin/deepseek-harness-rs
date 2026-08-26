@@ -134,14 +134,16 @@ continue to ask, script mode continues to deny mutations, and the default
 remains `ask`. This checkpoint does not broaden the Phase 11 completion claim
 or add a sandbox.
 
-The next approval-friction checkpoint, requested on 2026-08-26, is also frozen
-in `docs/design/approval-modes.md` before implementation. A fully prepared
+The second approval-friction checkpoint, requested on 2026-08-26, is now green
+and recorded in `docs/design/approval-modes.md`. A fully prepared
 built-in Shell approval gains one explicit `Allow exact Shell for this process`
 choice. The Agent may remember at most 64 sealed execution identities in RAM,
 and only after a clean command plus committed result; it never restores them
 from Session. `Allow once`, default Reject, script Deny, plugin Ask, all
 workdir/process/resource checks, and the no-sandbox warning remain unchanged.
-This is planned work inside Phase 11, not a completion claim.
+Real enhanced and linear PTY journeys cover repeated calls, and a same-process
+Shell-then-plugin journey proves the grant cannot authorize a plugin. This is a
+completed checkpoint inside Phase 11, not a Phase 11 completion claim.
 
 ## Still deferred
 
