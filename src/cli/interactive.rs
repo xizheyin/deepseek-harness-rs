@@ -156,6 +156,7 @@ struct PendingInlineOutput {
     write: PendingScreenWrite,
     intent: InlineIntent,
     surface: SurfaceCommit,
+    working: Option<WorkingPresentation>,
     file_suggestions: StagedFileSuggestionPresentation,
 }
 
@@ -650,6 +651,7 @@ async fn run_enhanced(
                                 active_terminal,
                                 signals,
                                 &mut active_dock,
+                                None,
                             )
                             .await?
                             {
@@ -1676,6 +1678,7 @@ async fn render_enhanced_dock(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn render_active_dock(
     input: &InputMemory,
     notice: Option<&str>,
@@ -1684,6 +1687,7 @@ async fn render_active_dock(
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
     dock: &mut ActiveDock<'_>,
+    mut motion_clock: Option<&mut MotionClock>,
 ) -> Result<Option<UiSignal>, InteractiveError> {
     loop {
         if dock.screen.is_poisoned() {
@@ -1713,6 +1717,11 @@ async fn render_active_dock(
         } else {
             FileSuggestionSnapshot::Hidden
         };
+        let working = screen_working_candidate(
+            motion_clock.as_deref_mut(),
+            dock.motion.requested().preference(),
+            dock.working,
+        );
         let surface = enhanced_surface_frame(
             input,
             notice,
@@ -1727,7 +1736,7 @@ async fn render_active_dock(
             dock.motion,
             live,
             file_snapshot,
-            dock.working,
+            working,
         )?;
         let write = stage_surface(
             dock.screen,
@@ -1741,6 +1750,11 @@ async fn render_active_dock(
                 *dock.last_size = size;
                 commit_surface(dock.view, dock.theme, dock.motion, surface.commit);
                 dock.file_suggestions.commit_presentation(staged);
+                if let Some(clock) = motion_clock.as_deref_mut() {
+                    commit_screen_working(clock, &mut dock.working, Some(working));
+                } else {
+                    dock.working = working;
+                }
                 return Ok(None);
             }
             ScreenWriteOutcome::Signal(signal) => {
@@ -2531,6 +2545,8 @@ struct MotionClock {
     next_phase: Option<Instant>,
     phase: u8,
     animated: bool,
+    preference: Option<MotionPreference>,
+    baseline: Option<WorkingPresentation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2580,6 +2596,8 @@ impl MotionClock {
             next_phase: None,
             phase: 0,
             animated: false,
+            preference: None,
+            baseline: None,
         }
     }
 
@@ -2717,6 +2735,34 @@ impl MotionClock {
             }
         }
     }
+
+    fn pending_baseline(&self) -> Option<WorkingPresentation> {
+        self.baseline
+    }
+
+    fn pending_baseline_for(
+        &mut self,
+        preference: MotionPreference,
+    ) -> Option<WorkingPresentation> {
+        if self.preference != Some(preference) {
+            self.preference = Some(preference);
+            self.baseline = Some(self.presentation(preference, WorkingPhase::Static));
+        } else if self.baseline.is_none() && self.eligible_since.is_none() {
+            // Hidden surfaces may commit and consume an earlier baseline while
+            // the turn keeps running. A later direct reveal must derive age
+            // from started_at, not replay that older hidden credential.
+            self.baseline = Some(self.presentation(preference, WorkingPhase::Static));
+        }
+        let normalized = normalize_working_presentation(self.baseline?, preference);
+        self.baseline = Some(normalized);
+        Some(normalized)
+    }
+
+    fn commit_presentation(&mut self, working: WorkingPresentation) {
+        if self.baseline == Some(working) {
+            self.baseline = None;
+        }
+    }
 }
 
 fn synchronize_motion_clock(
@@ -2724,16 +2770,52 @@ fn synchronize_motion_clock(
     turn: TurnId,
     eligible: bool,
     preference: MotionPreference,
-    committed: &mut WorkingPresentation,
 ) -> Result<(), InteractiveError> {
-    if clock.synchronize(turn, eligible)? {
+    let preference_changed = clock.preference != Some(preference);
+    clock.preference = Some(preference);
+    if clock.synchronize(turn, eligible)? || preference_changed {
         // A new eligibility generation always starts from the stable phase.
         // Keeping an old completed animation phase here would replay it before
         // the fresh 300 ms delay. Elapsed time remains a turn fact, so it still
         // comes from the original turn-owned clock.
-        *committed = clock.presentation(preference, WorkingPhase::Static);
+        clock.baseline = Some(clock.presentation(preference, WorkingPhase::Static));
     }
     Ok(())
+}
+
+fn settle_motion_clock(
+    clock: &mut MotionClock,
+    preference: MotionPreference,
+) -> Result<(), InteractiveError> {
+    let turn = clock.turn;
+    let _ = clock.synchronize(turn, false)?;
+    clock.preference = Some(preference);
+    clock.baseline = Some(clock.presentation(preference, WorkingPhase::Static));
+    Ok(())
+}
+
+fn commit_screen_working(
+    clock: &mut MotionClock,
+    committed: &mut WorkingPresentation,
+    presented: Option<WorkingPresentation>,
+) {
+    if let Some(working) = presented {
+        *committed = working;
+        clock.commit_presentation(working);
+    }
+}
+
+fn screen_working_candidate(
+    motion_clock: Option<&mut MotionClock>,
+    preference: MotionPreference,
+    committed: WorkingPresentation,
+) -> WorkingPresentation {
+    normalize_working_presentation(
+        motion_clock
+            .and_then(|clock| clock.pending_baseline_for(preference))
+            .unwrap_or(committed),
+        preference,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -3034,6 +3116,7 @@ async fn next_turn_signal(signals: &mut SignalStreams, enhanced: bool) -> Intera
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn redraw_active_after_resize(
     enhanced: bool,
     live: &LiveRenderer,
@@ -3042,6 +3125,7 @@ async fn redraw_active_after_resize(
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
     dock: Option<&mut ActiveDock<'_>>,
+    motion_clock: &mut MotionClock,
 ) -> Result<Option<UiSignal>, InteractiveError> {
     if !enhanced {
         return Ok(None);
@@ -3054,6 +3138,7 @@ async fn redraw_active_after_resize(
         terminal,
         signals,
         dock.ok_or(InteractiveError::Agent)?,
+        Some(motion_clock),
     )
     .await
 }
@@ -3104,6 +3189,7 @@ async fn reconcile_active_geometry(
     interaction: DockInteraction,
     live: &LiveRenderer,
     dock: Option<&mut ActiveDock<'_>>,
+    motion_clock: &mut MotionClock,
     pending: &mut Option<PendingOutput>,
     presenter: Option<&mut EnhancedPresenter>,
 ) -> Result<Option<UiSignal>, InteractiveError> {
@@ -3128,6 +3214,7 @@ async fn reconcile_active_geometry(
         terminal,
         signals,
         dock,
+        Some(motion_clock),
     )
     .await?;
     if signal.is_none() {
@@ -3183,6 +3270,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
         tokio::pin!(future);
         let ui_result = std::panic::AssertUnwindSafe(async {
             loop {
+            let mut motion_eligible = false;
             if let Some(dock) = active.active_dock.as_mut() {
                 dock.palette_suppressed =
                     active.joins.question().is_some() || !approval_ui.is_inactive();
@@ -3219,14 +3307,22 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         && dock.motion.requested() == dock.motion.committed(),
                 }
                 .is_eligible();
+                motion_eligible = eligible;
                 synchronize_motion_clock(
                     &mut motion_clock,
                     turn,
                     eligible,
                     dock.motion.committed().preference(),
-                    &mut dock.working,
                 )?;
             }
+            enqueue_standalone_motion_baseline(
+                motion_eligible,
+                turn_end_seen,
+                &motion_clock,
+                &mut pending,
+                &mut frame_deadline,
+                &mut after_frame,
+            )?;
             if latch_observer_fault(active.events, &mut stop, &cancellation) {
                 discard_pending(&mut pending, active.presenter);
             }
@@ -3254,6 +3350,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 approval_ui.dock_interaction(),
                 active.live,
                 active.active_dock.as_mut(),
+                &mut motion_clock,
                 &mut pending,
                 active.enhanced_presenter.as_deref_mut(),
             )
@@ -3291,6 +3388,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     active.queue_notice.as_deref().and_then(Option::as_deref),
                     approval_ui.dock_interaction(),
                     active.live,
+                    &mut motion_clock,
                     active.active_dock.as_mut().ok_or(InteractiveError::Agent)?,
                 )
                 .await;
@@ -3321,6 +3419,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 &mut after_frame,
                 &mut approval_ui,
                 &mut turn_end_rendered,
+                &mut motion_clock,
                 active.presenter,
                 active.live,
                 active.terminal,
@@ -3349,6 +3448,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     active.terminal,
                     active.signals,
                     active.active_dock.as_mut(),
+                    &mut motion_clock,
                 )
                 .await
                 {
@@ -3391,6 +3491,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         active.terminal,
                         active.signals,
                         dock,
+                        Some(&mut motion_clock),
                     )
                     .await
                     {
@@ -3483,6 +3584,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                 approval_ui.dock_interaction(),
                                 active.live,
                                 active.active_dock.as_mut(),
+                                &mut motion_clock,
                                 &mut pending,
                                 active.enhanced_presenter.as_deref_mut(),
                             )
@@ -3906,6 +4008,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                                 active.terminal,
                                                 active.signals,
                                                 dock,
+                                                Some(&mut motion_clock),
                                             )
                                             .await
                                             {
@@ -4076,6 +4179,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 approval_ui.dock_interaction(),
                 active.live,
                 active.active_dock.as_mut(),
+                &mut motion_clock,
                 &mut pending,
                 active.enhanced_presenter.as_deref_mut(),
             )
@@ -4106,6 +4210,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     active.queue_notice.as_deref().and_then(Option::as_deref),
                     approval_ui.dock_interaction(),
                     active.live,
+                    &mut motion_clock,
                     active.active_dock.as_mut().ok_or(InteractiveError::Agent)?,
                 )
                 .await;
@@ -4129,6 +4234,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 &mut after_frame,
                 &mut approval_ui,
                 &mut turn_end_rendered,
+                &mut motion_clock,
                 active.presenter,
                 active.live,
                 active.terminal,
@@ -4152,6 +4258,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     active.terminal,
                     active.signals,
                     active.active_dock.as_mut(),
+                    &mut motion_clock,
                 )
                 .await
                 {
@@ -4207,6 +4314,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                 approval_ui.dock_interaction(),
                                 active.live,
                                 active.active_dock.as_mut(),
+                                &mut motion_clock,
                                 &mut pending,
                                 active.enhanced_presenter.as_deref_mut(),
                             )
@@ -4453,6 +4561,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                                 active.terminal,
                                                 active.signals,
                                                 dock,
+                                                Some(&mut motion_clock),
                                             )
                                             .await
                                             {
@@ -4588,6 +4697,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     active.terminal,
                     active.signals,
                     active.active_dock.as_mut().ok_or(InteractiveError::Agent)?,
+                    Some(&mut motion_clock),
                 )
                 .await
                 {
@@ -4632,6 +4742,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             .as_deref()
             .and_then(|notice| notice.as_deref()),
         active.enhanced_presenter.as_deref_mut(),
+        &mut motion_clock,
         active.active_dock.as_mut(),
     )
     .await?;
@@ -5012,6 +5123,22 @@ fn enqueue_motion_dock(
     Ok(())
 }
 
+fn enqueue_standalone_motion_baseline(
+    eligible: bool,
+    turn_end_seen: bool,
+    clock: &MotionClock,
+    pending: &mut Option<PendingOutput>,
+    deadline: &mut Option<Instant>,
+    pending_after: &mut AfterFrame,
+) -> Result<(), InteractiveError> {
+    if eligible && !turn_end_seen && pending.is_none() {
+        if let Some(working) = clock.pending_baseline() {
+            enqueue_motion_dock(working, pending, deadline, pending_after)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enqueue_approval_selector_surface(
     output: String,
@@ -5087,6 +5214,7 @@ fn complete_ready_frame(
     after: &mut AfterFrame,
     approval_ui: &mut ApprovalUiState<'_>,
     turn_end_rendered: &mut bool,
+    motion_clock: &mut MotionClock,
     presenter: &mut InteractivePresenter,
     live: &LiveRenderer,
     terminal: &AsyncTerminal,
@@ -5137,6 +5265,11 @@ fn complete_ready_frame(
             } else {
                 FileSuggestionSnapshot::Hidden
             };
+            let working = screen_working_candidate(
+                Some(motion_clock),
+                dock.motion.requested().preference(),
+                dock.working,
+            );
             let surface = enhanced_surface_frame_for_request(
                 input,
                 notice,
@@ -5154,7 +5287,7 @@ fn complete_ready_frame(
                 dock.motion.requested(),
                 live,
                 file_snapshot,
-                dock.working,
+                working,
             )?;
             let write = dock
                 .screen
@@ -5168,6 +5301,7 @@ fn complete_ready_frame(
                 write,
                 intent: InlineIntent::Transcript(presentation),
                 surface: surface.commit,
+                working: Some(working),
                 file_suggestions: staged_file_suggestions,
             }))
         })();
@@ -5205,6 +5339,11 @@ fn complete_ready_frame(
         } else {
             FileSuggestionSnapshot::Hidden
         };
+        let working = screen_working_candidate(
+            Some(motion_clock),
+            dock.motion.requested().preference(),
+            motion_working.unwrap_or(dock.working),
+        );
         let surface = enhanced_surface_frame(
             input,
             notice,
@@ -5219,7 +5358,7 @@ fn complete_ready_frame(
             dock.motion,
             live,
             file_snapshot,
-            motion_working.unwrap_or(dock.working),
+            working,
         )?;
         let write = stage_surface(
             dock.screen,
@@ -5239,6 +5378,7 @@ fn complete_ready_frame(
                 InlineIntent::Dock(interaction)
             },
             surface: surface.commit,
+            working: Some(working),
             file_suggestions: staged_file_suggestions,
         }));
     }
@@ -5280,6 +5420,7 @@ fn complete_ready_frame(
             commit_surface(dock.view, dock.theme, dock.motion, output.surface);
             dock.file_suggestions
                 .commit_presentation(output.file_suggestions);
+            commit_screen_working(motion_clock, &mut dock.working, output.working);
             match output.intent {
                 InlineIntent::Transcript(presentation) => {
                     transcript_presenter
@@ -5287,7 +5428,7 @@ fn complete_ready_frame(
                         .expect("transcript presenter was proven before screen commit")
                         .commit(presentation);
                 }
-                InlineIntent::MotionDock { working, .. } => dock.working = working,
+                InlineIntent::MotionDock { .. } => {}
                 InlineIntent::Dock(_) => {}
             }
         }
@@ -5350,9 +5491,20 @@ async fn reattach_motion_screen(
     notice: Option<&str>,
     interaction: DockInteraction,
     live: &LiveRenderer,
+    motion_clock: &mut MotionClock,
     dock: &mut ActiveDock<'_>,
 ) -> Result<Option<UiSignal>, InteractiveError> {
-    render_active_dock(input, notice, interaction, live, terminal, signals, dock).await
+    render_active_dock(
+        input,
+        notice,
+        interaction,
+        live,
+        terminal,
+        signals,
+        dock,
+        Some(motion_clock),
+    )
+    .await
 }
 
 fn latch_active_failure(
@@ -5617,6 +5769,7 @@ async fn finish_turn_disposition(
     input: Option<&InputMemory>,
     notice: Option<&str>,
     enhanced_presenter: Option<&mut EnhancedPresenter>,
+    motion_clock: &mut MotionClock,
     active_dock: Option<&mut ActiveDock<'_>>,
 ) -> Result<TurnDisposition, InteractiveError> {
     match stop {
@@ -5627,6 +5780,7 @@ async fn finish_turn_disposition(
                 let signal = if defer_suspend {
                     let input = input.ok_or(InteractiveError::Agent)?;
                     let dock = active_dock.ok_or(InteractiveError::Agent)?;
+                    settle_motion_clock(motion_clock, dock.motion.requested().preference())?;
                     write_enhanced_terminal_frame(
                         frame,
                         DockRenderModel {
@@ -5640,6 +5794,7 @@ async fn finish_turn_disposition(
                         terminal,
                         signals,
                         dock,
+                        Some(motion_clock),
                     )
                     .await?
                 } else {
@@ -5672,6 +5827,7 @@ async fn write_enhanced_terminal_frame(
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
     dock: &mut ActiveDock<'_>,
+    mut motion_clock: Option<&mut MotionClock>,
 ) -> Result<Option<UiSignal>, InteractiveError> {
     let mut presentation = presenter
         .prepare(frame)
@@ -5698,6 +5854,7 @@ async fn write_enhanced_terminal_frame(
                 terminal,
                 signals,
                 dock,
+                motion_clock.as_deref_mut(),
             )
             .await?
             {
@@ -5724,6 +5881,11 @@ async fn write_enhanced_terminal_frame(
         } else {
             FileSuggestionSnapshot::Hidden
         };
+        let working = screen_working_candidate(
+            motion_clock.as_deref_mut(),
+            dock.motion.requested().preference(),
+            dock.working,
+        );
         let surface = enhanced_surface_frame_for_request(
             model.input,
             model.notice,
@@ -5738,7 +5900,7 @@ async fn write_enhanced_terminal_frame(
             dock.motion.requested(),
             model.live,
             file_snapshot,
-            dock.working,
+            working,
         )?;
         let write = dock
             .screen
@@ -5753,6 +5915,11 @@ async fn write_enhanced_terminal_frame(
                 commit_surface(dock.view, dock.theme, dock.motion, surface.commit);
                 dock.file_suggestions
                     .commit_presentation(staged_file_suggestions);
+                if let Some(clock) = motion_clock.as_deref_mut() {
+                    commit_screen_working(clock, &mut dock.working, Some(working));
+                } else {
+                    dock.working = working;
+                }
                 presenter.commit(presentation);
                 return Ok(None);
             }
@@ -5880,14 +6047,16 @@ mod tests {
         PendingInlineOutput, PendingOutput, StagedFileSuggestionPresentation, StopIntent,
         SurfaceCommit, UiWork, apply_approval_update,
         apply_enhanced_input as apply_enhanced_input_with_files, apply_motion_command,
-        apply_theme_command, classify_enhanced_submission, commit_surface,
-        discard_ready_updates_after_stop,
+        apply_theme_command, classify_enhanced_submission, commit_screen_working, commit_surface,
+        discard_ready_updates_after_stop, enqueue_enhanced_dock,
+        enqueue_standalone_motion_baseline,
         expire_enhanced_escape as expire_enhanced_escape_with_files,
         fences_ordinary_input_after_motion_preemption, latch_observer_fault, next_ui_work,
         normalize_working_presentation, observe_enhanced_cleanup_signal, observe_failure,
         observe_signal, preempt_motion_pending, prepare_pending_for_resize,
-        presentation_uses_enhanced, reset_file_suggestion_decoder, session_context_estimate,
-        synchronize_motion_clock, turn_exhausted_session_capacity,
+        presentation_uses_enhanced, reset_file_suggestion_decoder, screen_working_candidate,
+        session_context_estimate, settle_motion_clock, synchronize_motion_clock,
+        turn_exhausted_session_capacity,
     };
     use crate::{
         agent::{ApprovalPrompt, ApprovalRequest},
@@ -6729,6 +6898,7 @@ mod tests {
                 total_rows: 0,
                 page_rows: 0,
             },
+            working: None,
             file_suggestions: StagedFileSuggestionPresentation::Absent,
         }));
         assert!(!prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
@@ -6755,6 +6925,7 @@ mod tests {
                 total_rows: 0,
                 page_rows: 0,
             },
+            working: None,
             file_suggestions: StagedFileSuggestionPresentation::Absent,
         }));
         assert!(prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
@@ -6903,6 +7074,10 @@ mod tests {
                 },
             },
             surface: surface(),
+            working: Some(WorkingPresentation {
+                phase: WorkingPhase::Animated(0),
+                age: WorkingAge::Fresh,
+            }),
             file_suggestions: StagedFileSuggestionPresentation::Absent,
         }));
         let mut deadline = Some(Instant::now() + Duration::from_secs(5));
@@ -6930,6 +7105,10 @@ mod tests {
                 },
             },
             surface: surface(),
+            working: Some(WorkingPresentation {
+                phase: WorkingPhase::Animated(0),
+                age: WorkingAge::Fresh,
+            }),
             file_suggestions: StagedFileSuggestionPresentation::Absent,
         }));
         assert!(preempt_motion_pending(
@@ -6958,6 +7137,10 @@ mod tests {
                 },
             },
             surface: surface(),
+            working: Some(WorkingPresentation {
+                phase: WorkingPhase::Animated(0),
+                age: WorkingAge::Fresh,
+            }),
             file_suggestions: StagedFileSuggestionPresentation::Absent,
         }));
         assert!(prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
@@ -7215,19 +7398,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_new_eligibility_generation_never_replays_a_completed_phase() {
+    async fn a_new_eligibility_generation_stages_a_fresh_static_baseline() {
         let turn = crate::session::TurnId::new(1).unwrap();
         let mut clock = MotionClock::new(turn);
         let motion = MotionState::default();
         let mut displayed = WorkingPresentation::STATIC;
-        synchronize_motion_clock(
-            &mut clock,
-            turn,
-            true,
-            MotionPreference::Full,
-            &mut displayed,
-        )
-        .unwrap();
+        synchronize_motion_clock(&mut clock, turn, true, MotionPreference::Full).unwrap();
+        clock.commit_presentation(WorkingPresentation::STATIC);
 
         tokio::time::advance(Duration::from_millis(300)).await;
         let tick = clock.deadline(MotionPreference::Full, displayed).unwrap();
@@ -7240,26 +7417,24 @@ mod tests {
         // the clock. Returning to Focus starts a fresh 300 ms generation and
         // must not expose the completed Animated(0) credential meanwhile.
         tokio::time::advance(Duration::from_secs(5)).await;
-        synchronize_motion_clock(
-            &mut clock,
-            turn,
-            false,
-            MotionPreference::Full,
-            &mut displayed,
-        )
-        .unwrap();
-        assert_eq!(displayed.phase, WorkingPhase::Static);
-        assert_eq!(displayed.age, WorkingAge::Long { seconds: 5 });
-        synchronize_motion_clock(
-            &mut clock,
-            turn,
-            true,
-            MotionPreference::Full,
-            &mut displayed,
-        )
-        .unwrap();
-        assert_eq!(displayed.phase, WorkingPhase::Static);
-        assert_eq!(displayed.age, WorkingAge::Long { seconds: 5 });
+        synchronize_motion_clock(&mut clock, turn, false, MotionPreference::Full).unwrap();
+        assert_eq!(displayed.phase, WorkingPhase::Animated(0));
+        assert_eq!(
+            clock.pending_baseline(),
+            Some(WorkingPresentation {
+                phase: WorkingPhase::Static,
+                age: WorkingAge::Long { seconds: 5 },
+            })
+        );
+        synchronize_motion_clock(&mut clock, turn, true, MotionPreference::Full).unwrap();
+        assert_eq!(displayed.phase, WorkingPhase::Animated(0));
+        assert_eq!(
+            clock.pending_baseline(),
+            Some(WorkingPresentation {
+                phase: WorkingPhase::Static,
+                age: WorkingAge::Long { seconds: 5 },
+            })
+        );
         assert_eq!(
             clock
                 .deadline(MotionPreference::Full, displayed)
@@ -7267,6 +7442,232 @@ mod tests {
                 .deadline,
             Instant::now() + Duration::from_millis(300)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reduced_hidden_milestone_commits_only_with_the_screen_transaction() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        let mut displayed = WorkingPresentation::STATIC;
+        synchronize_motion_clock(&mut clock, turn, true, MotionPreference::Reduced).unwrap();
+        clock.commit_presentation(displayed);
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        synchronize_motion_clock(&mut clock, turn, false, MotionPreference::Reduced).unwrap();
+        synchronize_motion_clock(&mut clock, turn, true, MotionPreference::Reduced).unwrap();
+        let candidate = clock.pending_baseline().unwrap();
+        assert_eq!(candidate.phase, WorkingPhase::Static);
+        assert_eq!(candidate.age, WorkingAge::Long { seconds: 5 });
+        assert_eq!(displayed, WorkingPresentation::STATIC);
+
+        let input = InputMemory::default();
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let old_frame = super::enhanced_dock_frame(
+            &input,
+            None,
+            DockInteraction::Running,
+            size,
+            FileSuggestionSnapshot::Hidden,
+            displayed,
+        )
+        .unwrap();
+        let new_frame = super::enhanced_dock_frame(
+            &input,
+            None,
+            DockInteraction::Running,
+            size,
+            FileSuggestionSnapshot::Hidden,
+            candidate,
+        )
+        .unwrap();
+        let mut screen = InlineScreen::default();
+        let mut attach = screen
+            .stage_attach(super::screen_size(size), &old_frame, ThemePalette::Adaptive)
+            .unwrap();
+        attach.advance(attach.bytes().len()).unwrap();
+        screen.commit(attach).unwrap();
+
+        let mut write = screen
+            .stage_dock(&new_frame, ThemePalette::Adaptive)
+            .unwrap();
+        write.advance(write.bytes().len()).unwrap();
+        assert_eq!(displayed, WorkingPresentation::STATIC);
+        assert_eq!(clock.pending_baseline(), Some(candidate));
+
+        screen.commit(write).unwrap();
+        commit_screen_working(&mut clock, &mut displayed, Some(candidate));
+        assert_eq!(displayed, candidate);
+        assert_eq!(clock.pending_baseline(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_preference_transition_normalizes_the_pending_baseline_once() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        synchronize_motion_clock(&mut clock, turn, true, MotionPreference::Full).unwrap();
+        assert_eq!(
+            clock.pending_baseline(),
+            Some(WorkingPresentation {
+                phase: WorkingPhase::Static,
+                age: WorkingAge::Long { seconds: 6 },
+            })
+        );
+
+        let rendered = clock
+            .pending_baseline_for(MotionPreference::Reduced)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            WorkingPresentation {
+                phase: WorkingPhase::Static,
+                age: WorkingAge::Long { seconds: 5 },
+            }
+        );
+        clock.commit_presentation(rendered);
+        assert_eq!(clock.pending_baseline(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ineligible_reduced_full_round_trip_restores_whole_turn_elapsed_age() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        tokio::time::advance(Duration::from_secs(42)).await;
+        synchronize_motion_clock(&mut clock, turn, false, MotionPreference::Full).unwrap();
+        let mut displayed = WorkingPresentation::STATIC;
+        let full = screen_working_candidate(Some(&mut clock), MotionPreference::Full, displayed);
+        assert_eq!(full.age, WorkingAge::Long { seconds: 42 });
+        commit_screen_working(&mut clock, &mut displayed, Some(full));
+
+        let reduced =
+            screen_working_candidate(Some(&mut clock), MotionPreference::Reduced, displayed);
+        assert_eq!(reduced.age, WorkingAge::Long { seconds: 5 });
+        commit_screen_working(&mut clock, &mut displayed, Some(reduced));
+        assert_eq!(clock.pending_baseline(), None);
+
+        let restored =
+            screen_working_candidate(Some(&mut clock), MotionPreference::Full, displayed);
+        assert_eq!(restored.phase, WorkingPhase::Static);
+        assert_eq!(restored.age, WorkingAge::Long { seconds: 42 });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_consumed_hidden_baseline_refreshes_before_direct_reveal() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        let mut displayed = WorkingPresentation::STATIC;
+        synchronize_motion_clock(&mut clock, turn, true, MotionPreference::Full).unwrap();
+        commit_screen_working(
+            &mut clock,
+            &mut displayed,
+            Some(WorkingPresentation::STATIC),
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        synchronize_motion_clock(&mut clock, turn, false, MotionPreference::Full).unwrap();
+        let hidden = screen_working_candidate(Some(&mut clock), MotionPreference::Full, displayed);
+        assert_eq!(hidden.age, WorkingAge::Long { seconds: 5 });
+        commit_screen_working(&mut clock, &mut displayed, Some(hidden));
+        assert_eq!(clock.pending_baseline(), None);
+
+        tokio::time::advance(Duration::from_secs(37)).await;
+        let revealed =
+            screen_working_candidate(Some(&mut clock), MotionPreference::Full, displayed);
+        assert_eq!(revealed.phase, WorkingPhase::Static);
+        assert_eq!(revealed.age, WorkingAge::Long { seconds: 42 });
+    }
+
+    #[test]
+    fn a_hidden_baseline_never_blocks_approval_takeover() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        synchronize_motion_clock(&mut clock, turn, true, MotionPreference::Full).unwrap();
+        clock.commit_presentation(WorkingPresentation::STATIC);
+        synchronize_motion_clock(&mut clock, turn, false, MotionPreference::Full).unwrap();
+
+        let mut pending = None;
+        let mut deadline = None;
+        let mut after = AfterFrame::None;
+        enqueue_standalone_motion_baseline(
+            false,
+            false,
+            &clock,
+            &mut pending,
+            &mut deadline,
+            &mut after,
+        )
+        .unwrap();
+        assert!(pending.is_none());
+        assert!(clock.pending_baseline().is_some());
+
+        enqueue_enhanced_dock(
+            DockInteraction::Approval(DockApprovalSelection::Reject),
+            AfterFrame::ApprovalFence,
+            &mut pending,
+            &mut deadline,
+            &mut after,
+        )
+        .unwrap();
+        assert!(matches!(
+            pending,
+            Some(PendingOutput::Dock(DockInteraction::Approval(
+                DockApprovalSelection::Reject
+            )))
+        ));
+    }
+
+    #[test]
+    fn a_zero_preempted_baseline_is_used_by_the_next_direct_screen_transaction() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        synchronize_motion_clock(&mut clock, turn, true, MotionPreference::Full).unwrap();
+        let baseline = clock.pending_baseline().unwrap();
+        let mut pending = Some(PendingOutput::MotionDock {
+            interaction: DockInteraction::Running,
+            working: baseline,
+        });
+        assert!(!preempt_motion_pending(
+            &mut pending,
+            &mut None,
+            &mut AfterFrame::None,
+            None,
+        ));
+        assert!(pending.is_none());
+
+        let old = WorkingPresentation {
+            phase: WorkingPhase::Animated(0),
+            age: WorkingAge::Fresh,
+        };
+        assert_eq!(
+            screen_working_candidate(Some(&mut clock), MotionPreference::Full, old),
+            baseline
+        );
+        assert_eq!(clock.pending_baseline(), Some(baseline));
+    }
+
+    #[test]
+    fn interrupt_cleanup_restages_static_even_after_an_ineligible_baseline_committed() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        synchronize_motion_clock(&mut clock, turn, true, MotionPreference::Full).unwrap();
+        clock.commit_presentation(WorkingPresentation::STATIC);
+        synchronize_motion_clock(&mut clock, turn, false, MotionPreference::Full).unwrap();
+        let hidden = clock.pending_baseline().unwrap();
+        clock.commit_presentation(hidden);
+        assert_eq!(clock.pending_baseline(), None);
+
+        settle_motion_clock(&mut clock, MotionPreference::Full).unwrap();
+        let abandoned = WorkingPresentation {
+            phase: WorkingPhase::Animated(3),
+            age: WorkingAge::Fresh,
+        };
+        let cleanup = screen_working_candidate(Some(&mut clock), MotionPreference::Full, abandoned);
+        assert_eq!(cleanup.phase, WorkingPhase::Static);
+        assert_eq!(clock.deadline(MotionPreference::Full, cleanup), None);
+        assert_eq!(clock.pending_baseline(), Some(cleanup));
     }
 
     #[test]
@@ -7455,6 +7856,7 @@ mod tests {
                 total_rows: 0,
                 page_rows: 0,
             },
+            working: None,
             file_suggestions: StagedFileSuggestionPresentation::Absent,
         }));
         assert!(prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
