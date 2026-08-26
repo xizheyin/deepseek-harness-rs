@@ -5,6 +5,7 @@ use thiserror::Error;
 use super::{
     command_palette::CommandId,
     composer::{Composer, ComposerError, MAX_PROMPT_BYTES},
+    file_suggestions::FileTokenHit,
 };
 
 const MAX_QUEUE_ITEMS: usize = 8;
@@ -539,6 +540,18 @@ impl InputMemory {
         Ok(())
     }
 
+    pub(crate) fn complete_file_reference(
+        &mut self,
+        hit: &FileTokenHit,
+        path: &str,
+    ) -> Result<bool, InputMemoryError> {
+        let changed = self.composer.complete_file_reference(hit, path)?;
+        if changed {
+            self.history_navigation = None;
+        }
+        Ok(changed)
+    }
+
     pub(crate) fn move_left(&mut self) -> bool {
         self.composer.move_left()
     }
@@ -823,7 +836,29 @@ mod tests {
         InputMemory, InputMemoryError, MAX_HISTORY_BYTES, MAX_HISTORY_ITEMS, MAX_QUEUE_BYTES,
         MAX_QUEUE_ITEMS, PromptHistory,
     };
-    use crate::tui::{command_palette::CommandId, composer::MAX_PROMPT_BYTES};
+    use crate::tui::{
+        command_palette::CommandId, composer::MAX_PROMPT_BYTES, file_suggestions::FileTokenHit,
+    };
+
+    #[test]
+    fn file_completion_detaches_history_without_changing_queue_or_history() {
+        let mut input = InputMemory::default();
+        input.record_committed_human("see @sr").unwrap();
+        assert!(input.history_previous().unwrap());
+        let hit = FileTokenHit::detect(input.composer()).unwrap().unwrap();
+        let history_items = input.history().len();
+        assert!(
+            input
+                .complete_file_reference(&hit, "src/my file.rs")
+                .unwrap()
+        );
+        assert_eq!(input.composer().text(), "see @src/my file.rs ");
+        assert_eq!(input.queue().len(), 0);
+        assert_eq!(input.history().len(), history_items);
+        assert!(!input.history_next().unwrap());
+        assert!(input.undo().unwrap());
+        assert_eq!(input.composer().text(), "see @sr");
+    }
 
     #[test]
     fn command_completion_is_one_undoable_edit_and_detaches_history_navigation() {

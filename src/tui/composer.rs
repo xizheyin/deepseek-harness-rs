@@ -4,6 +4,7 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr;
 
+use super::file_suggestions::FileTokenHit;
 use super::visible::VisibleChar;
 
 pub(crate) const MAX_PROMPT_BYTES: usize = 64 * 1024;
@@ -159,6 +160,34 @@ impl Composer {
         }
         let length = self.text.len();
         self.apply_edit(0..length, command, false)
+    }
+
+    pub(super) fn complete_file_reference(
+        &mut self,
+        hit: &FileTokenHit,
+        path: &str,
+    ) -> Result<bool, ComposerError> {
+        if self.content_revision != hit.composer_revision()
+            || self.cursor != hit.end()
+            || hit.start() >= hit.end()
+            || hit.end() > self.text.len()
+            || !self.text.is_char_boundary(hit.start())
+            || !self.text.is_char_boundary(hit.end())
+            || self.text.as_bytes().get(hit.start()) != Some(&b'@')
+        {
+            return Ok(false);
+        }
+        validate_file_reference_path(path)?;
+        let replacement_bytes = path.len().checked_add(2).ok_or(ComposerError::Capacity)?;
+        let mut replacement = String::new();
+        replacement
+            .try_reserve_exact(replacement_bytes)
+            .map_err(|_| ComposerError::Capacity)?;
+        replacement.push('@');
+        replacement.push_str(path);
+        replacement.push(' ');
+        self.apply_edit(hit.start()..hit.end(), &replacement, false)?;
+        Ok(true)
     }
 
     pub(crate) fn move_left(&mut self) -> bool {
@@ -540,6 +569,29 @@ fn try_copy(text: &str) -> Result<String, ComposerError> {
     Ok(copy)
 }
 
+fn validate_file_reference_path(path: &str) -> Result<(), ComposerError> {
+    use std::path::Component;
+
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return Err(ComposerError::InvalidState);
+    }
+    let path = std::path::Path::new(path);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::CurDir
+                    | Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ComposerError::InvalidState);
+    }
+    Ok(())
+}
+
 fn previous_grapheme_start(text: &str, cursor: usize) -> Option<usize> {
     text[..cursor]
         .grapheme_indices(true)
@@ -693,6 +745,41 @@ fn advance_cells(position: &mut CursorPosition, cell_width: usize, width: usize)
 #[cfg(test)]
 mod tests {
     use super::{Composer, ComposerError, MAX_PROMPT_BYTES};
+    use crate::tui::file_suggestions::FileTokenHit;
+
+    #[test]
+    fn file_completion_is_one_atomic_span_edit_and_stale_hits_are_no_ops() {
+        let mut composer = Composer::default();
+        composer.insert_text("please @sr").unwrap();
+        let hit = FileTokenHit::detect(&composer).unwrap().unwrap();
+        assert!(
+            composer
+                .complete_file_reference(&hit, "src/my file.rs")
+                .unwrap()
+        );
+        assert_eq!(composer.text(), "please @src/my file.rs ");
+        assert_eq!(composer.cursor(), composer.text().len());
+        assert!(composer.undo().unwrap());
+        assert_eq!(composer.text(), "please @sr");
+        assert_eq!(composer.cursor(), "please @sr".len());
+
+        composer.insert_char('c').unwrap();
+        let before = composer.text().to_owned();
+        assert!(
+            !composer
+                .complete_file_reference(&hit, "src/lib.rs")
+                .unwrap()
+        );
+        assert_eq!(composer.text(), before);
+        assert!(
+            composer
+                .complete_file_reference(
+                    &FileTokenHit::detect(&composer).unwrap().unwrap(),
+                    "../escape"
+                )
+                .is_err()
+        );
+    }
 
     #[test]
     fn grapheme_cursor_never_enters_combining_zwj_or_flag_clusters() {

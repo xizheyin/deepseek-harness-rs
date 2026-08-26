@@ -25,6 +25,8 @@ pub use registry::LocalToolRegistry;
 pub use registry::ReadOnlyToolRegistry;
 #[cfg(unix)]
 pub use registry::WorkspaceToolRegistry;
+#[cfg(unix)]
+pub(crate) use workspace::{WorkspaceFileCatalogue, WorkspaceFileCatalogueError};
 
 const MAX_TOOL_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_READ_CHUNK_BYTES: usize = 64 * 1024;

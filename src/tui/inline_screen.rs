@@ -741,6 +741,7 @@ mod tests {
     use crate::tui::{
         composer::Composer,
         dock::{DockFrame, DockInteraction, DockModel},
+        file_suggestions::FileSuggestionSnapshot,
         input_memory::PromptQueue,
         markup::MarkupState,
         presentation::{PresentedChunk, TextStyle},
@@ -760,6 +761,7 @@ mod tests {
                 composer,
                 queue,
                 notice: None,
+                file_suggestions: FileSuggestionSnapshot::Hidden,
             },
             rows,
             columns,

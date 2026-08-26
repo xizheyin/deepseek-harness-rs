@@ -249,6 +249,28 @@ pub(super) struct TerminalSession {
     state: TerminalSessionState,
 }
 
+/// Allocation-free emergency restoration used after an enhanced-UI panic.
+///
+/// `TerminalSession` remains the normal owner and performs the checked cleanup
+/// later. This borrowed copy exists so the UI can leave application mode before
+/// it waits for an already-polled Agent future to close its Session turn.
+pub(super) struct TerminalPanicRestore<'a> {
+    terminal: &'a AsyncTerminal,
+    original: Termios,
+}
+
+impl TerminalPanicRestore<'_> {
+    pub(super) fn restore_now(&self) {
+        let _ = rustix::io::write(self.terminal.output.get_ref(), POISON_TEARDOWN_BYTES);
+        let _ = tcsetattr(
+            self.terminal.input.get_ref(),
+            OptionalActions::Now,
+            &self.original,
+        );
+        let _ = self.terminal.flush_input();
+    }
+}
+
 impl TerminalSession {
     pub(super) const fn output_terminal(&self) -> &AsyncTerminal {
         &self.terminal
@@ -258,6 +280,20 @@ impl TerminalSession {
         (self.state == TerminalSessionState::Application)
             .then_some(&self.terminal)
             .ok_or(TerminalError::Unsupported)
+    }
+
+    pub(super) fn panic_restore(&self) -> Result<TerminalPanicRestore<'_>, TerminalError> {
+        if self.state != TerminalSessionState::Application {
+            return Err(TerminalError::Unsupported);
+        }
+        Ok(TerminalPanicRestore {
+            terminal: &self.terminal,
+            original: self
+                .original
+                .as_ref()
+                .ok_or(TerminalError::Unsupported)?
+                .clone(),
+        })
     }
 
     pub(super) fn restored_terminal(&self) -> Result<&AsyncTerminal, TerminalError> {

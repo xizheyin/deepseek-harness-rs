@@ -20,6 +20,7 @@ use crate::{
             DetailViewport, DockApprovalSelection, DockError, DockFrame, DockInteraction,
             DockModel, MIN_ENHANCED_COLUMNS, MIN_ENHANCED_ROWS,
         },
+        file_suggestions::FileSuggestionSnapshot,
         inline_screen::{
             InlineScreen, InlineScreenError, POISON_REATTACH_BYTES, POISON_TEARDOWN_BYTES,
             PendingScreenWrite, ScreenSize,
@@ -38,6 +39,10 @@ use super::{
         ApprovalInputProfile, ApprovalSelector, ESCAPE_SEQUENCE_WAIT, SelectorUpdate,
     },
     assembly::InteractiveAssembly,
+    file_suggestions::{
+        FileSuggestionController, FileSuggestionEnter, FileSuggestionMove, JobSettlement,
+        StagedFileSuggestionPresentation,
+    },
     identity::prepare_user_turn,
     input::{
         CanonicalRecordParser, IdleInput, InputRecordEvent, MAX_APPROVAL_RECORD_BYTES,
@@ -52,7 +57,7 @@ use super::{
     storage_failure,
     terminal::{
         ApprovalTerminalMode, AsyncTerminal, ENHANCED_VISUAL_RESET_BYTES, TERMINAL_READ_BYTES,
-        TerminalError, TerminalSession, TerminalSize,
+        TerminalError, TerminalPanicRestore, TerminalSession, TerminalSize,
     },
 };
 
@@ -114,6 +119,10 @@ enum AfterFrame {
     TurnEnd,
 }
 
+// Inline transactions deliberately retain their exact bounded presentation
+// credential until the screen commit; keeping it in-place avoids a second
+// fallible allocation on every redraw.
+#[allow(clippy::large_enum_variant)]
 enum PendingOutput {
     Unprepared(LiveFrame),
     Prepared(PreparedPresentation),
@@ -131,6 +140,7 @@ struct PendingInlineOutput {
     write: PendingScreenWrite,
     intent: InlineIntent,
     surface: SurfaceCommit,
+    file_suggestions: StagedFileSuggestionPresentation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -238,7 +248,9 @@ async fn run_enhanced(
         mut joins,
         session_id,
         resumed,
+        file_suggestions,
     } = assembly;
+    let mut file_suggestions = FileSuggestionController::new(file_suggestions);
     let mut live = LiveRenderer::for_session(resumed);
     live.set_context_estimate(session_context_estimate(agent.session(), None, None));
     let mut presenter = InteractivePresenter::with_color(true);
@@ -318,6 +330,9 @@ async fn run_enhanced(
     let mut theme = ThemeState::default();
     let mut notice = None;
     let mut screen = InlineScreen::default();
+    let _ = file_suggestions
+        .sync(input.composer(), false, false)
+        .map_err(|_| InteractiveError::Agent)?;
     let initial_dock = render_enhanced_dock(
         DockRenderModel {
             input: &input,
@@ -332,6 +347,7 @@ async fn run_enhanced(
         &mut screen,
         &mut view,
         &mut theme,
+        &mut file_suggestions,
     )
     .await;
     let mut pending_signal = match initial_dock {
@@ -345,8 +361,13 @@ async fn run_enhanced(
     let mut auto_queue_paused = false;
     let mut input_escape_deadline = None;
 
-    let result: Result<InteractiveExit, InteractiveError> = async {
+    let result = std::panic::AssertUnwindSafe(async {
         loop {
+            reset_file_suggestion_decoder(
+                &mut file_suggestions,
+                Some(&mut decoder),
+                &mut input_escape_deadline,
+            )?;
             let event = if let Some(signal) = pending_signal.take() {
                 EnhancedIdleEvent::Signal(signal)
             } else if input.queue().len() != 0 && !auto_queue_paused {
@@ -364,6 +385,9 @@ async fn run_enhanced(
                     () = tokio::time::sleep_until(escape_deadline), if escape_pending => {
                         EnhancedIdleEvent::EscapeExpired
                     }
+                    settlement = file_suggestions.wait_job(), if file_suggestions.has_job() => {
+                        EnhancedIdleEvent::FileSuggestion(settlement)
+                    }
                     read = terminal.read_once(&mut scratch) => {
                         let count = read.map_err(|_| InteractiveError::TerminalUnavailable)?;
                         if count == 0 {
@@ -374,7 +398,7 @@ async fn run_enhanced(
                     }
                 }
             };
-            let auto_submit = matches!(event, EnhancedIdleEvent::AutoSubmit);
+            let auto_submit = matches!(&event, EnhancedIdleEvent::AutoSubmit);
             let action = match event {
                 EnhancedIdleEvent::Signal(UiSignal::Interrupt) => {
                     decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
@@ -394,6 +418,7 @@ async fn run_enhanced(
                         view: &mut view,
                         theme: &mut theme,
                         command_palette: &mut command_palette,
+                        file_suggestions: &mut file_suggestions,
                         palette_suppressed: false,
                     };
                     pending_signal = suspend_enhanced(
@@ -417,12 +442,19 @@ async fn run_enhanced(
                 ) => break Ok(InteractiveExit::Signal(signal)),
                 EnhancedIdleEvent::Eof => break Ok(InteractiveExit::Ordinary(0)),
                 EnhancedIdleEvent::Resize => EnhancedInputAction::Redraw,
+                EnhancedIdleEvent::FileSuggestion(settlement) => {
+                    let _ = file_suggestions
+                        .accept_job(settlement)
+                        .map_err(|_| InteractiveError::Agent)?;
+                    EnhancedInputAction::Redraw
+                }
                 EnhancedIdleEvent::EscapeExpired => {
                     input_escape_deadline = None;
                     expire_enhanced_escape(
                         &mut decoder,
                         &mut input,
                         &mut command_palette,
+                        Some(&mut file_suggestions),
                         &mut view,
                         &theme,
                         last_size,
@@ -437,6 +469,7 @@ async fn run_enhanced(
                         &scratch[..count],
                         &mut input,
                         &mut command_palette,
+                        Some(&mut file_suggestions),
                         &mut view,
                         &theme,
                         last_size,
@@ -483,6 +516,11 @@ async fn run_enhanced(
                     } else {
                         classify_enhanced_submission(&draft)
                     };
+                    if queued_id.is_none() {
+                        let _ = file_suggestions
+                            .sync(input.composer(), false, false)
+                            .map_err(|_| InteractiveError::Agent)?;
+                    }
                     match submission {
                         EnhancedSubmission::Empty => notice = None,
                         EnhancedSubmission::Command(command) => match command {
@@ -530,6 +568,7 @@ async fn run_enhanced(
                                 view: &mut view,
                                 theme: &mut theme,
                                 command_palette: &mut command_palette,
+                                file_suggestions: &mut file_suggestions,
                                 palette_suppressed: false,
                             };
                             let _ = active_dock
@@ -557,6 +596,7 @@ async fn run_enhanced(
                                 pending_signal = Some(signal);
                                 continue;
                             }
+                            let panic_restore = terminal.panic_restore()?;
                             let disposition = run_turn(ActiveTurn {
                                 agent: &mut agent,
                                 events: &mut events,
@@ -565,6 +605,7 @@ async fn run_enhanced(
                                 live: &mut live,
                                 presenter: &mut presenter,
                                 terminal: active_terminal,
+                                panic_restore: Some(panic_restore),
                                 signals,
                                 parser: &mut parser,
                                 scratch: &mut scratch,
@@ -607,6 +648,7 @@ async fn run_enhanced(
                                         view: &mut view,
                                         theme: &mut theme,
                                         command_palette: &mut command_palette,
+                                        file_suggestions: &mut file_suggestions,
                                         palette_suppressed: false,
                                     };
                                     pending_signal = suspend_enhanced(
@@ -650,6 +692,7 @@ async fn run_enhanced(
                 &mut screen,
                 &mut view,
                 &mut theme,
+                &mut file_suggestions,
             )
             .await?;
             if action == EnhancedInputAction::PasteFence && pending_signal.is_none() {
@@ -678,6 +721,7 @@ async fn run_enhanced(
                             &mut screen,
                             &mut view,
                             &mut theme,
+                            &mut file_suggestions,
                         )
                         .await?;
                     }
@@ -686,10 +730,22 @@ async fn run_enhanced(
                 }
             }
         }
-    }
+    })
+    .catch_unwind()
     .await;
 
-    let mut result = result;
+    let mut result = match result {
+        Ok(result) => result,
+        Err(_) => {
+            file_suggestions.cancel_for_shutdown();
+            terminal.best_effort_visual_reset();
+            let _ = terminal.finish();
+            Err(InteractiveError::Agent)
+        }
+    };
+    // Stop filesystem work before terminal teardown; the blocking join is
+    // drained concurrently with Agent/tool cleanup after termios is restored.
+    file_suggestions.cancel_for_shutdown();
     let mut cleanup_signals = SignalLatch::default();
     let mut visual_reset_complete = false;
     let cleanup_geometry_changed = terminal.size().is_none_or(|size| size != last_size);
@@ -763,9 +819,14 @@ async fn run_enhanced(
         cleanup_signals.observe(DriverMode::Interactive, signal);
     }
     let initial_signal = cleanup_signals.observed();
-    let (shutdown, signal) =
-        shutdown::agent_with_signals(&mut agent, DriverMode::Interactive, signals, initial_signal)
-            .await;
+    let (agent_cleanup, suggestion_cleanup) = tokio::join!(
+        shutdown::agent_with_signals(&mut agent, DriverMode::Interactive, signals, initial_signal,),
+        file_suggestions.finish_shutdown(),
+    );
+    if suggestion_cleanup.is_err() && result.is_ok() {
+        result = Err(InteractiveError::Agent);
+    }
+    let (shutdown, signal) = agent_cleanup;
     if let Some(signal) = signal {
         if let Some(code) =
             finish_signal_after_shutdown(signal, terminal.restored_terminal()?, signals).await?
@@ -906,7 +967,6 @@ async fn shutdown_after_enhanced_error(
     Err(error)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EnhancedIdleEvent {
     Signal(UiSignal),
     Resize,
@@ -914,6 +974,7 @@ enum EnhancedIdleEvent {
     Eof,
     AutoSubmit,
     Bytes(usize),
+    FileSuggestion(Result<JobSettlement, tokio::task::JoinError>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -998,11 +1059,21 @@ fn apply_enhanced_input(
     bytes: &[u8],
     input: &mut InputMemory,
     command_palette: &mut CommandPaletteState,
+    mut file_suggestions: Option<&mut FileSuggestionController>,
     view: &mut ViewState,
     theme: &ThemeState,
     size: super::terminal::TerminalSize,
     notice: &mut Option<String>,
 ) -> Result<EnhancedInputAction, InteractiveError> {
+    if file_suggestions.as_deref().is_some_and(|controller| {
+        controller.presented_is_invalidated() || controller.decoder_reset_required()
+    }) {
+        decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+        if let Some(controller) = file_suggestions.as_deref_mut() {
+            controller.mark_decoder_reset();
+        }
+        return Ok(EnhancedInputAction::Redraw);
+    }
     if view.requested() != view.committed() || theme.is_transitioning() {
         decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
         return Ok(EnhancedInputAction::Redraw);
@@ -1023,31 +1094,71 @@ fn apply_enhanced_input(
         );
         let update = match decoded.event {
             InputEvent::PasteStarted => Ok(EnhancedInputAction::None),
-            InputEvent::Paste(text) => {
-                *notice = Some(match input.insert_paste(&text) {
-                    Ok(()) => {
-                        let _ = command_palette.sync(input.composer());
-                        "Paste inserted · Enter sends after the input fence".to_owned()
+            InputEvent::Paste(text) => match input.insert_paste(&text) {
+                Ok(()) => {
+                    let _ = command_palette.sync(input.composer());
+                    let sync = file_suggestions
+                        .as_deref_mut()
+                        .map_or(Ok(false), |controller| {
+                            controller
+                                .sync(input.composer(), false, false)
+                                .map_err(|_| InputMemoryError::InvalidState)
+                        });
+                    match sync {
+                        Ok(_) => {
+                            *notice = Some(
+                                "Paste inserted · Enter sends after the input fence".to_owned(),
+                            );
+                            Ok(EnhancedInputAction::PasteFence)
+                        }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => format!("{error} · draft kept behind the input fence"),
-                });
-                Ok(EnhancedInputAction::PasteFence)
-            }
+                }
+                Err(error) => {
+                    *notice = Some(format!("{error} · draft kept behind the input fence"));
+                    Ok(EnhancedInputAction::PasteFence)
+                }
+            },
             InputEvent::PasteRejected(error) => {
                 let _ = command_palette.dismiss(input.composer());
-                *notice = Some(error.to_string());
-                Ok(EnhancedInputAction::PasteFence)
+                let dismissal = file_suggestions
+                    .as_deref_mut()
+                    .map_or(Ok(false), |controller| {
+                        controller
+                            .dismiss(input.composer())
+                            .map_err(|_| InputMemoryError::InvalidState)
+                    });
+                dismissal.map(|_| {
+                    *notice = Some(error.to_string());
+                    EnhancedInputAction::PasteFence
+                })
             }
             InputEvent::Rejected(error) => {
                 let _ = command_palette.dismiss(input.composer());
-                *notice = Some(error.to_string());
-                Ok(EnhancedInputAction::Redraw)
+                let dismissal = file_suggestions
+                    .as_deref_mut()
+                    .map_or(Ok(false), |controller| {
+                        controller
+                            .dismiss(input.composer())
+                            .map_err(|_| InputMemoryError::InvalidState)
+                    });
+                dismissal.map(|_| {
+                    *notice = Some(error.to_string());
+                    EnhancedInputAction::Redraw
+                })
             }
             InputEvent::Key(Key::Inspect) => view
                 .toggle_inspect()
                 .map(|()| EnhancedInputAction::Redraw)
                 .map_err(|_| InputMemoryError::InvalidState),
-            InputEvent::Key(key) => apply_enhanced_key(key, input, command_palette, width, notice),
+            InputEvent::Key(key) => apply_enhanced_key(
+                key,
+                input,
+                command_palette,
+                file_suggestions.as_deref_mut(),
+                width,
+                notice,
+            ),
         };
         match update {
             Ok(EnhancedInputAction::None) => ControlFlow::Continue(()),
@@ -1164,15 +1275,41 @@ fn refresh_decoder_escape_deadline(decoder: &KeyDecoder, deadline: &mut Option<I
     }
 }
 
+fn reset_file_suggestion_decoder(
+    controller: &mut FileSuggestionController,
+    decoder: Option<&mut KeyDecoder>,
+    deadline: &mut Option<Instant>,
+) -> Result<(), InteractiveError> {
+    if !controller.decoder_reset_required() {
+        return Ok(());
+    }
+    let decoder = decoder.ok_or(InteractiveError::Agent)?;
+    decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+    *deadline = None;
+    controller.mark_decoder_reset();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn expire_enhanced_escape(
     decoder: &mut KeyDecoder,
     input: &mut InputMemory,
     command_palette: &mut CommandPaletteState,
+    mut file_suggestions: Option<&mut FileSuggestionController>,
     view: &mut ViewState,
     theme: &ThemeState,
     size: TerminalSize,
     notice: &mut Option<String>,
 ) -> Result<EnhancedInputAction, InteractiveError> {
+    if file_suggestions.as_deref().is_some_and(|controller| {
+        controller.presented_is_invalidated() || controller.decoder_reset_required()
+    }) {
+        decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+        if let Some(controller) = file_suggestions.as_deref_mut() {
+            controller.mark_decoder_reset();
+        }
+        return Ok(EnhancedInputAction::Redraw);
+    }
     if view.requested() != view.committed() || theme.is_transitioning() {
         decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
         return Ok(EnhancedInputAction::Redraw);
@@ -1185,6 +1322,7 @@ fn expire_enhanced_escape(
             key,
             input,
             command_palette,
+            file_suggestions.as_deref_mut(),
             usize::from(size.columns.saturating_sub(3)).max(1),
             notice,
         )
@@ -1194,6 +1332,11 @@ fn expire_enhanced_escape(
             .inspect(|_| *notice = None),
         InputEvent::Rejected(error) => {
             let _ = command_palette.dismiss(input.composer());
+            if let Some(controller) = file_suggestions {
+                controller
+                    .dismiss(input.composer())
+                    .map_err(|_| InteractiveError::Agent)?;
+            }
             *notice = Some(error.to_string());
             Ok(EnhancedInputAction::Redraw)
         }
@@ -1207,9 +1350,43 @@ fn apply_enhanced_key(
     key: Key,
     input: &mut InputMemory,
     command_palette: &mut CommandPaletteState,
+    mut file_suggestions: Option<&mut FileSuggestionController>,
     width: usize,
     notice: &mut Option<String>,
 ) -> Result<EnhancedInputAction, InputMemoryError> {
+    if let Some(controller) = file_suggestions.as_deref_mut() {
+        match key {
+            Key::Up | Key::BackTab
+                if controller
+                    .navigate_presented(FileSuggestionMove::Previous)
+                    .map_err(|_| InputMemoryError::InvalidState)? =>
+            {
+                return Ok(EnhancedInputAction::RedrawFence);
+            }
+            Key::Down | Key::Tab
+                if controller
+                    .navigate_presented(FileSuggestionMove::Next)
+                    .map_err(|_| InputMemoryError::InvalidState)? =>
+            {
+                return Ok(EnhancedInputAction::RedrawFence);
+            }
+            Key::Enter => match controller.enter_presented(input)? {
+                FileSuggestionEnter::Ordinary => {}
+                FileSuggestionEnter::Consumed | FileSuggestionEnter::Completed => {
+                    let _ = command_palette.sync(input.composer());
+                    return Ok(EnhancedInputAction::RedrawFence);
+                }
+            },
+            Key::Escape if controller.presented_menu_is_visible() => {
+                let _ = controller
+                    .dismiss(input.composer())
+                    .map_err(|_| InputMemoryError::InvalidState)?;
+                *notice = None;
+                return Ok(EnhancedInputAction::Redraw);
+            }
+            _ => {}
+        }
+    }
     if command_palette.sync(input.composer()).is_visible() {
         match key {
             Key::Up | Key::BackTab => {
@@ -1286,6 +1463,11 @@ fn apply_enhanced_key(
         }
     }
     let _ = command_palette.sync(input.composer());
+    if let Some(controller) = file_suggestions {
+        let _ = controller
+            .sync(input.composer(), false, false)
+            .map_err(|_| InputMemoryError::InvalidState)?;
+    }
     *notice = None;
     Ok(
         if changed
@@ -1301,6 +1483,7 @@ fn apply_enhanced_key(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn render_enhanced_dock(
     model: DockRenderModel<'_>,
     terminal: &TerminalSession,
@@ -1309,9 +1492,11 @@ async fn render_enhanced_dock(
     screen: &mut InlineScreen,
     view: &mut ViewState,
     theme: &mut ThemeState,
+    file_suggestions: &mut FileSuggestionController,
 ) -> Result<Option<UiSignal>, InteractiveError> {
     loop {
         if screen.is_poisoned() {
+            file_suggestions.invalidate_presentation();
             if let Some(signal) =
                 recover_poisoned_screen(terminal.output_terminal(), signals, screen).await?
             {
@@ -1320,18 +1505,32 @@ async fn render_enhanced_dock(
         }
         let size = terminal.size().unwrap_or(*last_size);
         let resized = size != *last_size;
+        if resized {
+            file_suggestions.invalidate_presentation();
+        }
+        let show_file_suggestions = view.requested().mode() == ViewMode::Focus
+            && !matches!(model.interaction, DockInteraction::Approval(_));
+        let staged = file_suggestions
+            .stage_presentation(show_file_suggestions)
+            .map_err(|_| InteractiveError::Agent)?;
+        let file_snapshot = if show_file_suggestions {
+            file_suggestions.snapshot()
+        } else {
+            FileSuggestionSnapshot::Hidden
+        };
         let surface = enhanced_surface_frame(
             model.input,
             model.notice,
             command_palette_interaction(
                 model.interaction,
-                model.command_palette,
+                palette_behind_files(model.command_palette, file_snapshot),
                 view.requested().mode(),
             ),
             size,
             view,
             theme,
             model.live,
+            file_snapshot,
         )?;
         let write = stage_surface(
             screen,
@@ -1344,11 +1543,21 @@ async fn render_enhanced_dock(
             ScreenWriteOutcome::Complete => {
                 *last_size = size;
                 commit_surface(view, theme, surface.commit);
+                file_suggestions.commit_presentation(staged);
                 return Ok(None);
             }
-            ScreenWriteOutcome::Signal(signal) => return Ok(Some(signal)),
-            ScreenWriteOutcome::Resize => continue,
+            ScreenWriteOutcome::Signal(signal) => {
+                if screen.is_poisoned() {
+                    file_suggestions.invalidate_presentation();
+                }
+                return Ok(Some(signal));
+            }
+            ScreenWriteOutcome::Resize => {
+                file_suggestions.invalidate_presentation();
+                continue;
+            }
             ScreenWriteOutcome::PoisonedResize => {
+                file_suggestions.invalidate_presentation();
                 if let Some(signal) =
                     recover_poisoned_screen(terminal.output_terminal(), signals, screen).await?
                 {
@@ -1370,25 +1579,45 @@ async fn render_active_dock(
 ) -> Result<Option<UiSignal>, InteractiveError> {
     loop {
         if dock.screen.is_poisoned() {
+            dock.file_suggestions.invalidate_presentation();
             if let Some(signal) = recover_poisoned_screen(terminal, signals, dock.screen).await? {
                 return Ok(Some(signal));
             }
         }
         let size = terminal.size().unwrap_or(*dock.last_size);
         let resized = size != *dock.last_size;
+        if resized {
+            dock.file_suggestions.invalidate_presentation();
+        }
         let palette = if dock.palette_suppressed {
             CommandPaletteSnapshot::Hidden
         } else {
             dock.command_palette.snapshot(input.composer())
         };
+        let show_file_suggestions = dock.view.requested().mode() == ViewMode::Focus
+            && !matches!(interaction, DockInteraction::Approval(_));
+        let staged = dock
+            .file_suggestions
+            .stage_presentation(show_file_suggestions)
+            .map_err(|_| InteractiveError::Agent)?;
+        let file_snapshot = if show_file_suggestions {
+            dock.file_suggestions.snapshot()
+        } else {
+            FileSuggestionSnapshot::Hidden
+        };
         let surface = enhanced_surface_frame(
             input,
             notice,
-            command_palette_interaction(interaction, palette, dock.view.requested().mode()),
+            command_palette_interaction(
+                interaction,
+                palette_behind_files(palette, file_snapshot),
+                dock.view.requested().mode(),
+            ),
             size,
             dock.view,
             dock.theme,
             live,
+            file_snapshot,
         )?;
         let write = stage_surface(
             dock.screen,
@@ -1401,11 +1630,21 @@ async fn render_active_dock(
             ScreenWriteOutcome::Complete => {
                 *dock.last_size = size;
                 commit_surface(dock.view, dock.theme, surface.commit);
+                dock.file_suggestions.commit_presentation(staged);
                 return Ok(None);
             }
-            ScreenWriteOutcome::Signal(signal) => return Ok(Some(signal)),
-            ScreenWriteOutcome::Resize => continue,
+            ScreenWriteOutcome::Signal(signal) => {
+                if dock.screen.is_poisoned() {
+                    dock.file_suggestions.invalidate_presentation();
+                }
+                return Ok(Some(signal));
+            }
+            ScreenWriteOutcome::Resize => {
+                dock.file_suggestions.invalidate_presentation();
+                continue;
+            }
             ScreenWriteOutcome::PoisonedResize => {
+                dock.file_suggestions.invalidate_presentation();
                 if let Some(signal) =
                     recover_poisoned_screen(terminal, signals, dock.screen).await?
                 {
@@ -1441,6 +1680,7 @@ fn enhanced_dock_frame(
     notice: Option<&str>,
     interaction: DockInteraction,
     size: TerminalSize,
+    file_suggestions: FileSuggestionSnapshot<'_>,
 ) -> Result<DockFrame, InteractiveError> {
     DockFrame::layout(
         DockModel {
@@ -1448,6 +1688,7 @@ fn enhanced_dock_frame(
             composer: input.composer(),
             queue: input.queue(),
             notice,
+            file_suggestions,
         },
         size.rows,
         size.columns,
@@ -1478,6 +1719,18 @@ fn command_palette_interaction(
     }
 }
 
+fn palette_behind_files(
+    command_palette: CommandPaletteSnapshot,
+    file_suggestions: FileSuggestionSnapshot<'_>,
+) -> CommandPaletteSnapshot {
+    if file_suggestions.is_visible() {
+        CommandPaletteSnapshot::Hidden
+    } else {
+        command_palette
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn enhanced_surface_frame(
     input: &InputMemory,
     notice: Option<&str>,
@@ -1486,6 +1739,7 @@ fn enhanced_surface_frame(
     view: &mut ViewState,
     theme: &ThemeState,
     live: &LiveRenderer,
+    file_suggestions: FileSuggestionSnapshot<'_>,
 ) -> Result<EnhancedSurface, InteractiveError> {
     if !matches!(
         interaction,
@@ -1506,9 +1760,11 @@ fn enhanced_surface_frame(
         request,
         theme.requested(),
         live,
+        file_suggestions,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enhanced_surface_frame_for_request(
     input: &InputMemory,
     notice: Option<&str>,
@@ -1517,10 +1773,11 @@ fn enhanced_surface_frame_for_request(
     request: ViewRequest,
     theme: ThemeRequest,
     live: &LiveRenderer,
+    file_suggestions: FileSuggestionSnapshot<'_>,
 ) -> Result<EnhancedSurface, InteractiveError> {
     match request.mode() {
         ViewMode::Focus => Ok(EnhancedSurface {
-            frame: enhanced_dock_frame(input, notice, interaction, size)?,
+            frame: enhanced_dock_frame(input, notice, interaction, size, file_suggestions)?,
             commit: SurfaceCommit {
                 request,
                 theme,
@@ -1807,6 +2064,7 @@ async fn suspend_enhanced(
                 dock.screen,
                 dock.view,
                 dock.theme,
+                dock.file_suggestions,
             )
             .await;
         }
@@ -1826,6 +2084,7 @@ async fn run_linear(
         mut joins,
         session_id,
         resumed,
+        file_suggestions: _file_suggestions,
     } = assembly;
     let mut live = LiveRenderer::for_session(resumed);
     live.set_context_estimate(session_context_estimate(agent.session(), None, None));
@@ -1991,6 +2250,7 @@ async fn run_linear(
                             live: &mut live,
                             presenter: &mut presenter,
                             terminal: &terminal,
+                            panic_restore: None,
                             signals,
                             parser: &mut parser,
                             scratch: &mut scratch,
@@ -2065,6 +2325,7 @@ struct ActiveTurn<'a> {
     live: &'a mut LiveRenderer,
     presenter: &'a mut InteractivePresenter,
     terminal: &'a AsyncTerminal,
+    panic_restore: Option<TerminalPanicRestore<'a>>,
     signals: &'a mut SignalStreams,
     parser: &'a mut CanonicalRecordParser,
     scratch: &'a mut [u8; TERMINAL_READ_BYTES],
@@ -2085,6 +2346,7 @@ struct ActiveDock<'a> {
     view: &'a mut ViewState,
     theme: &'a mut ThemeState,
     command_palette: &'a mut CommandPaletteState,
+    file_suggestions: &'a mut FileSuggestionController,
     palette_suppressed: bool,
 }
 
@@ -2462,6 +2724,7 @@ async fn reconcile_active_geometry(
     if size == *dock.last_size {
         return Ok(None);
     }
+    dock.file_suggestions.invalidate_presentation();
     if prepare_pending_for_resize(pending, dock.screen)? {
         if let Some(signal) = recover_poisoned_screen(terminal, signals, dock.screen).await? {
             return Ok(Some(signal));
@@ -2492,6 +2755,15 @@ fn approval_owns_active_input(joins: &ApprovalJoin, approval_ui: &ApprovalUiStat
     joins.question().is_some() || !approval_ui.is_inactive()
 }
 
+async fn wait_active_file_suggestion(
+    dock: Option<&mut ActiveDock<'_>>,
+) -> Result<JobSettlement, tokio::task::JoinError> {
+    match dock {
+        Some(dock) => dock.file_suggestions.wait_job().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, InteractiveError> {
     let prepared = prepare_user_turn(active.agent.session(), &active.prompt)
         .map_err(|_| InteractiveError::Agent)?;
@@ -2516,10 +2788,28 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             .agent
             .run_turn(prepared.proposal, cancellation.clone());
         tokio::pin!(future);
-        loop {
+        let ui_result = std::panic::AssertUnwindSafe(async {
+            loop {
             if let Some(dock) = active.active_dock.as_mut() {
                 dock.palette_suppressed =
                     active.joins.question().is_some() || !approval_ui.is_inactive();
+                let input = active
+                    .queued_input
+                    .as_deref()
+                    .ok_or(InteractiveError::Agent)?;
+                let _ = dock
+                    .file_suggestions
+                    .sync(
+                        input.composer(),
+                        dock.view.requested().mode() != ViewMode::Focus,
+                        dock.palette_suppressed,
+                    )
+                    .map_err(|_| InteractiveError::Agent)?;
+                reset_file_suggestion_decoder(
+                    dock.file_suggestions,
+                    active.enhanced_decoder.as_deref_mut(),
+                    &mut input_escape_deadline,
+                )?;
             }
             if latch_observer_fault(active.events, &mut stop, &cancellation) {
                 discard_pending(&mut pending, active.presenter);
@@ -2531,7 +2821,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 }
                 tokio::select! {
                     biased;
-                    result = &mut future => break result,
+                    result = &mut future => break Ok(result),
                     signal = active.signals.next() => {
                         observe_signal(&mut stop, signal);
                         cancellation.cancel();
@@ -2712,6 +3002,10 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 !(pending.is_some() && approval_ui.suppresses_read_while_pending()),
                 prefer_input,
             );
+            let suggestion_running = active
+                .active_dock
+                .as_ref()
+                .is_some_and(|dock| dock.file_suggestions.has_job());
             tokio::select! {
                 biased;
                 signal = next_turn_signal(active.signals, active.enhanced) => {
@@ -2755,7 +3049,15 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         }
                     }
                 }
-                result = &mut future => break result,
+                result = &mut future => break Ok(result),
+                settlement = wait_active_file_suggestion(active.active_dock.as_mut()), if suggestion_running => {
+                    let dock = active.active_dock.as_mut().ok_or(InteractiveError::Agent)?;
+                    let _ = dock
+                        .file_suggestions
+                        .accept_job(settlement)
+                        .map_err(|_| InteractiveError::Agent)?;
+                    dock_redraw_requested = true;
+                }
                 work = work => {
                     prefer_input = !prefer_input;
                     match work {
@@ -2849,6 +3151,11 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         }
                         UiWork::Write(write) => match write {
                         Ok(count) => {
+                            if count != 0 {
+                                if let Some(dock) = active.active_dock.as_mut() {
+                                    dock.file_suggestions.invalidate_presentation();
+                                }
+                            }
                             let advanced = pending
                                 .as_mut()
                                 .ok_or(InteractiveError::Agent)
@@ -2864,6 +3171,9 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             }
                         }
                         Err(_) => {
+                            if let Some(dock) = active.active_dock.as_mut() {
+                                dock.file_suggestions.invalidate_presentation();
+                            }
                             latch_active_failure(
                                 &mut stop,
                                 &cancellation,
@@ -3098,6 +3408,42 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 }
             }
         }
+        })
+        .catch_unwind()
+        .await;
+        match ui_result {
+            Ok(Ok(result)) => result,
+            failed => {
+                let error = match failed {
+                    Ok(Err(error)) => error,
+                    Err(_) => InteractiveError::Agent,
+                    Ok(Ok(_)) => return Err(InteractiveError::Agent),
+                };
+                cancellation.cancel();
+                discard_pending(&mut pending, active.presenter);
+                if let Some(dock) = active.active_dock.as_mut() {
+                    dock.file_suggestions.invalidate_presentation();
+                    dock.file_suggestions.cancel_for_shutdown();
+                }
+                let _ = approval_ui.restore();
+                if let Some(restorer) = active.panic_restore.as_ref() {
+                    restorer.restore_now();
+                }
+                // The Agent future has already been polled. It and any owned
+                // scanner/filter must both settle before this function may
+                // return, otherwise the append-only Session can keep an open
+                // turn tail or a blocking job can become detached.
+                if let Some(dock) = active.active_dock.as_mut() {
+                    let _ = tokio::join!((&mut future), dock.file_suggestions.finish_shutdown());
+                } else {
+                    let _ = (&mut future).await;
+                }
+                active
+                    .joins
+                    .finish_turn(active.approvals, ApprovalResetMode::Discard)?;
+                return Err(error);
+            }
+        }
     };
 
     tokio::task::yield_now().await;
@@ -3132,6 +3478,11 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             if let Some(dock) = active.active_dock.as_mut() {
                 dock.palette_suppressed =
                     active.joins.question().is_some() || !approval_ui.is_inactive();
+                reset_file_suggestion_decoder(
+                    dock.file_suggestions,
+                    active.enhanced_decoder.as_deref_mut(),
+                    &mut input_escape_deadline,
+                )?;
             }
             drain_active_signals(active.signals, &mut stop);
             if latch_observer_fault(active.events, &mut stop, &cancellation) {
@@ -3346,6 +3697,11 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         }
                         UiWork::Write(write) => match write {
                             Ok(count) => {
+                                if count != 0 {
+                                    if let Some(dock) = active.active_dock.as_mut() {
+                                        dock.file_suggestions.invalidate_presentation();
+                                    }
+                                }
                                 let advanced = pending
                                     .as_mut()
                                     .ok_or(InteractiveError::Agent)
@@ -3356,6 +3712,9 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                 }
                             }
                             Err(_) => {
+                                if let Some(dock) = active.active_dock.as_mut() {
+                                    dock.file_suggestions.invalidate_presentation();
+                                }
                                 observe_failure(&mut stop, InteractiveError::Output);
                                 discard_pending(&mut pending, active.presenter);
                             }
@@ -3704,6 +4063,7 @@ fn handle_active_input(
         bytes,
         input,
         dock.command_palette,
+        Some(dock.file_suggestions),
         dock.view,
         dock.theme,
         size,
@@ -3772,6 +4132,10 @@ fn handle_active_input(
                     *notice = Some(format!("{error} · draft kept"));
                 }
             }
+            let _ = dock
+                .file_suggestions
+                .sync(input.composer(), false, false)
+                .map_err(|_| InteractiveError::Agent)?;
             Ok(ActiveInputOutcome::Redraw)
         }
     }
@@ -3796,6 +4160,7 @@ fn handle_active_escape_expiry(
         decoder,
         input,
         dock.command_palette,
+        Some(dock.file_suggestions),
         dock.view,
         dock.theme,
         size,
@@ -4121,18 +4486,32 @@ fn complete_ready_frame(
             if size != *dock.last_size {
                 return Err(InteractiveError::TerminalUnsupported);
             }
+            let show_file_suggestions = dock.view.committed().mode() == ViewMode::Focus;
+            let staged_file_suggestions = dock
+                .file_suggestions
+                .stage_presentation(show_file_suggestions)
+                .map_err(|_| InteractiveError::Agent)?;
+            let file_snapshot = if show_file_suggestions {
+                dock.file_suggestions.snapshot()
+            } else {
+                FileSuggestionSnapshot::Hidden
+            };
             let surface = enhanced_surface_frame_for_request(
                 input,
                 notice,
                 command_palette_interaction(
                     DockInteraction::Running,
-                    active_command_palette_snapshot(input, dock),
+                    palette_behind_files(
+                        active_command_palette_snapshot(input, dock),
+                        file_snapshot,
+                    ),
                     dock.view.committed().mode(),
                 ),
                 size,
                 dock.view.committed(),
                 dock.theme.requested(),
                 live,
+                file_snapshot,
             )?;
             let write = dock
                 .screen
@@ -4146,6 +4525,7 @@ fn complete_ready_frame(
                 write,
                 intent: InlineIntent::Transcript(presentation),
                 surface: surface.commit,
+                file_suggestions: staged_file_suggestions,
             }))
         })();
         match staged {
@@ -4164,18 +4544,30 @@ fn complete_ready_frame(
         if size != *dock.last_size {
             return Err(InteractiveError::TerminalUnsupported);
         }
+        let show_file_suggestions = dock.view.requested().mode() == ViewMode::Focus
+            && !matches!(interaction, DockInteraction::Approval(_));
+        let staged_file_suggestions = dock
+            .file_suggestions
+            .stage_presentation(show_file_suggestions)
+            .map_err(|_| InteractiveError::Agent)?;
+        let file_snapshot = if show_file_suggestions {
+            dock.file_suggestions.snapshot()
+        } else {
+            FileSuggestionSnapshot::Hidden
+        };
         let surface = enhanced_surface_frame(
             input,
             notice,
             command_palette_interaction(
                 interaction,
-                active_command_palette_snapshot(input, dock),
+                palette_behind_files(active_command_palette_snapshot(input, dock), file_snapshot),
                 dock.view.requested().mode(),
             ),
             size,
             dock.view,
             dock.theme,
             live,
+            file_snapshot,
         )?;
         let write = stage_surface(
             dock.screen,
@@ -4188,6 +4580,7 @@ fn complete_ready_frame(
             write,
             intent: InlineIntent::Dock(interaction),
             surface: surface.commit,
+            file_suggestions: staged_file_suggestions,
         }));
     }
     let Some(frame) = pending.as_mut() else {
@@ -4223,6 +4616,8 @@ fn complete_ready_frame(
                 .commit(output.write)
                 .map_err(map_inline_screen_error)?;
             commit_surface(dock.view, dock.theme, output.surface);
+            dock.file_suggestions
+                .commit_presentation(output.file_suggestions);
             if let InlineIntent::Transcript(presentation) = output.intent {
                 transcript_presenter
                     .take()
@@ -4544,12 +4939,16 @@ async fn write_enhanced_terminal_frame(
     loop {
         let mut boundary_changed = false;
         if dock.screen.is_poisoned() {
+            dock.file_suggestions.invalidate_presentation();
             if let Some(signal) = recover_poisoned_screen(terminal, signals, dock.screen).await? {
                 return Ok(Some(signal));
             }
             boundary_changed = true;
         }
         let size = terminal.size().unwrap_or(*dock.last_size);
+        if size != *dock.last_size {
+            dock.file_suggestions.invalidate_presentation();
+        }
         if dock.screen.is_detached() || size != *dock.last_size {
             if let Some(signal) = render_active_dock(
                 model.input,
@@ -4574,18 +4973,30 @@ async fn write_enhanced_terminal_frame(
         if size != *dock.last_size {
             continue;
         }
+        let show_file_suggestions = dock.view.committed().mode() == ViewMode::Focus
+            && !matches!(model.interaction, DockInteraction::Approval(_));
+        let staged_file_suggestions = dock
+            .file_suggestions
+            .stage_presentation(show_file_suggestions)
+            .map_err(|_| InteractiveError::Agent)?;
+        let file_snapshot = if show_file_suggestions {
+            dock.file_suggestions.snapshot()
+        } else {
+            FileSuggestionSnapshot::Hidden
+        };
         let surface = enhanced_surface_frame_for_request(
             model.input,
             model.notice,
             command_palette_interaction(
                 model.interaction,
-                model.command_palette,
+                palette_behind_files(model.command_palette, file_snapshot),
                 dock.view.committed().mode(),
             ),
             size,
             dock.view.committed(),
             dock.theme.requested(),
             model.live,
+            file_snapshot,
         )?;
         let write = dock
             .screen
@@ -4598,11 +5009,21 @@ async fn write_enhanced_terminal_frame(
         match write_screen_transaction(terminal, signals, dock.screen, write).await? {
             ScreenWriteOutcome::Complete => {
                 commit_surface(dock.view, dock.theme, surface.commit);
+                dock.file_suggestions
+                    .commit_presentation(staged_file_suggestions);
                 presenter.commit(presentation);
                 return Ok(None);
             }
-            ScreenWriteOutcome::Signal(signal) => return Ok(Some(signal)),
-            ScreenWriteOutcome::Resize | ScreenWriteOutcome::PoisonedResize => continue,
+            ScreenWriteOutcome::Signal(signal) => {
+                if dock.screen.is_poisoned() {
+                    dock.file_suggestions.invalidate_presentation();
+                }
+                return Ok(Some(signal));
+            }
+            ScreenWriteOutcome::Resize | ScreenWriteOutcome::PoisonedResize => {
+                dock.file_suggestions.invalidate_presentation();
+                continue;
+            }
         }
     }
 }
@@ -4704,14 +5125,18 @@ fn discard_ready_updates_after_stop(
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use super::{
-        AfterFrame, ApprovalUiUpdate, InlineIntent, InteractiveError, InteractiveExit,
-        InteractivePresentation, PendingInlineOutput, PendingOutput, StopIntent, SurfaceCommit,
-        apply_approval_update, apply_enhanced_input, apply_theme_command, commit_surface,
-        discard_ready_updates_after_stop, expire_enhanced_escape, latch_observer_fault,
+        AfterFrame, ApprovalUiUpdate, FileSuggestionController, InlineIntent, InteractiveError,
+        InteractiveExit, InteractivePresentation, PendingInlineOutput, PendingOutput,
+        StagedFileSuggestionPresentation, StopIntent, SurfaceCommit, apply_approval_update,
+        apply_enhanced_input as apply_enhanced_input_with_files, apply_theme_command,
+        commit_surface, discard_ready_updates_after_stop,
+        expire_enhanced_escape as expire_enhanced_escape_with_files, latch_observer_fault,
         observe_enhanced_cleanup_signal, observe_failure, observe_signal,
-        prepare_pending_for_resize, presentation_uses_enhanced, session_context_estimate,
-        turn_exhausted_session_capacity,
+        prepare_pending_for_resize, presentation_uses_enhanced, reset_file_suggestion_decoder,
+        session_context_estimate, turn_exhausted_session_capacity,
     };
     use crate::{
         agent::{ApprovalPrompt, ApprovalRequest},
@@ -4728,19 +5153,120 @@ mod tests {
             ApprovalOutcome, ApprovalRequestId, EventKind, MAX_SESSION_EVENTS, NewEvent,
             RequestContext, Session, SurfaceIntent, TurnEndReason,
         },
+        tools::WorkspaceFileCatalogue,
         tui::{
             command_palette::{
                 CommandId, CommandPaletteSnapshot, CommandPaletteState, PaletteMove,
             },
             dock::{DockApprovalSelection, DockInteraction},
+            file_suggestions::FileSuggestionSnapshot,
             inline_screen::InlineScreen,
             input_memory::InputMemory,
             key_decoder::KeyDecoder,
             theme::{ThemeCommand, ThemePalette, ThemeState},
             view::{ViewMode, ViewState},
         },
+        workspace_authority::WorkspaceAuthority,
     };
-    use tokio::sync::oneshot;
+    use tokio::{sync::oneshot, time::Instant};
+
+    struct FileSuggestionWorkspace(std::path::PathBuf);
+
+    impl FileSuggestionWorkspace {
+        fn with_files(paths: &[&str]) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dsh-interactive-file-suggestions-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir(&root).unwrap();
+            for path in paths {
+                let target = root.join(path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::write(target, "safe\n").unwrap();
+            }
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn controller(&self) -> FileSuggestionController {
+            let authority = WorkspaceAuthority::open(self.path()).unwrap();
+            FileSuggestionController::new(WorkspaceFileCatalogue::from_authority(authority))
+        }
+    }
+
+    impl Drop for FileSuggestionWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn present_ready_file_menu(
+        controller: &mut FileSuggestionController,
+        input: &InputMemory,
+    ) {
+        controller.sync(input.composer(), false, false).unwrap();
+        for _ in 0..4 {
+            if !controller.has_job() {
+                break;
+            }
+            let settlement = controller.wait_job().await;
+            controller.accept_job(settlement).unwrap();
+        }
+        assert!(!controller.has_job());
+        let staged = controller.stage_presentation(true).unwrap();
+        controller.commit_presentation(staged);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_enhanced_input(
+        decoder: &mut KeyDecoder,
+        bytes: &[u8],
+        input: &mut InputMemory,
+        command_palette: &mut CommandPaletteState,
+        view: &mut ViewState,
+        theme: &ThemeState,
+        size: TerminalSize,
+        notice: &mut Option<String>,
+    ) -> Result<super::EnhancedInputAction, InteractiveError> {
+        apply_enhanced_input_with_files(
+            decoder,
+            bytes,
+            input,
+            command_palette,
+            None,
+            view,
+            theme,
+            size,
+            notice,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expire_enhanced_escape(
+        decoder: &mut KeyDecoder,
+        input: &mut InputMemory,
+        command_palette: &mut CommandPaletteState,
+        view: &mut ViewState,
+        theme: &ThemeState,
+        size: TerminalSize,
+        notice: &mut Option<String>,
+    ) -> Result<super::EnhancedInputAction, InteractiveError> {
+        expire_enhanced_escape_with_files(
+            decoder,
+            input,
+            command_palette,
+            None,
+            view,
+            theme,
+            size,
+            notice,
+        )
+    }
 
     fn fill(bytes: &mut [u8]) -> Result<(), EntropyError> {
         bytes.fill(0);
@@ -5024,6 +5550,194 @@ mod tests {
         assert_eq!(input.queue().len(), 0);
     }
 
+    #[tokio::test]
+    async fn file_menu_uses_only_presented_rows_and_fences_same_read_enter() {
+        let workspace = FileSuggestionWorkspace::with_files(&["a.rs", "b.rs"]);
+        let mut controller = workspace.controller();
+        let mut input = InputMemory::default();
+        input.insert_text("@").unwrap();
+        present_ready_file_menu(&mut controller, &input).await;
+        let mut decoder = KeyDecoder::default();
+        let mut palette = CommandPaletteState::default();
+        let mut view = ViewState::default();
+        let theme = ThemeState::default();
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let mut notice = None;
+
+        let action = apply_enhanced_input_with_files(
+            &mut decoder,
+            b"\x1b[B\r",
+            &mut input,
+            &mut palette,
+            Some(&mut controller),
+            &mut view,
+            &theme,
+            size,
+            &mut notice,
+        )
+        .unwrap();
+        assert_eq!(action, super::EnhancedInputAction::RedrawFence);
+        assert_eq!(input.composer().text(), "@");
+
+        let staged = controller.stage_presentation(true).unwrap();
+        controller.commit_presentation(staged);
+        let action = apply_enhanced_input_with_files(
+            &mut decoder,
+            b"\r",
+            &mut input,
+            &mut palette,
+            Some(&mut controller),
+            &mut view,
+            &theme,
+            size,
+            &mut notice,
+        )
+        .unwrap();
+        assert_eq!(action, super::EnhancedInputAction::RedrawFence);
+        assert_eq!(input.composer().text(), "@b.rs ");
+        controller.finish_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_real_menu_and_invalidated_screen_cannot_pick_or_submit() {
+        let workspace = FileSuggestionWorkspace::with_files(&["a.rs"]);
+        let mut controller = workspace.controller();
+        let mut input = InputMemory::default();
+        input.insert_text("@").unwrap();
+        present_ready_file_menu(&mut controller, &input).await;
+        let mut decoder = KeyDecoder::default();
+        let mut palette = CommandPaletteState::default();
+        let mut view = ViewState::default();
+        let theme = ThemeState::default();
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let mut notice = None;
+
+        let action = apply_enhanced_input_with_files(
+            &mut decoder,
+            b"x\r",
+            &mut input,
+            &mut palette,
+            Some(&mut controller),
+            &mut view,
+            &theme,
+            size,
+            &mut notice,
+        )
+        .unwrap();
+        assert_eq!(action, super::EnhancedInputAction::RedrawFence);
+        assert_eq!(input.composer().text(), "@x");
+        assert_eq!(input.queue().len(), 0);
+
+        controller.invalidate_presentation();
+        let action = apply_enhanced_input_with_files(
+            &mut decoder,
+            b"\rhidden",
+            &mut input,
+            &mut palette,
+            Some(&mut controller),
+            &mut view,
+            &theme,
+            size,
+            &mut notice,
+        )
+        .unwrap();
+        assert_eq!(action, super::EnhancedInputAction::Redraw);
+        assert_eq!(input.composer().text(), "@x");
+        assert_eq!(input.queue().len(), 0);
+        controller.finish_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn presentation_invalidation_clears_an_old_escape_epoch_before_recovery_input() {
+        let workspace = FileSuggestionWorkspace::with_files(&["a.rs"]);
+        let mut controller = workspace.controller();
+        let mut input = InputMemory::default();
+        input.insert_text("@").unwrap();
+        present_ready_file_menu(&mut controller, &input).await;
+        let mut decoder = KeyDecoder::default();
+        let mut palette = CommandPaletteState::default();
+        let mut view = ViewState::default();
+        let theme = ThemeState::default();
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let mut notice = None;
+
+        assert_eq!(
+            apply_enhanced_input_with_files(
+                &mut decoder,
+                b"\x1b",
+                &mut input,
+                &mut palette,
+                Some(&mut controller),
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::None
+        );
+        assert!(decoder.escape_pending());
+        let mut deadline = Some(Instant::now());
+        controller.invalidate_presentation();
+        let recovered = controller.stage_presentation(true).unwrap();
+        controller.commit_presentation(recovered);
+        assert!(controller.decoder_reset_required());
+
+        reset_file_suggestion_decoder(&mut controller, Some(&mut decoder), &mut deadline).unwrap();
+        assert!(!decoder.escape_pending());
+        assert_eq!(deadline, None);
+        assert!(!controller.decoder_reset_required());
+        assert!(controller.presented_menu_is_visible());
+        controller.finish_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn presented_loading_enter_keeps_the_ordinary_submit_path() {
+        let workspace = FileSuggestionWorkspace::with_files(&["a.rs"]);
+        let mut controller = workspace.controller();
+        let mut input = InputMemory::default();
+        input.insert_text("@").unwrap();
+        controller.sync(input.composer(), false, false).unwrap();
+        let staged = controller.stage_presentation(true).unwrap();
+        controller.commit_presentation(staged);
+        let mut decoder = KeyDecoder::default();
+        let mut palette = CommandPaletteState::default();
+        let mut view = ViewState::default();
+        let theme = ThemeState::default();
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let mut notice = None;
+
+        assert_eq!(
+            apply_enhanced_input_with_files(
+                &mut decoder,
+                b"\r",
+                &mut input,
+                &mut palette,
+                Some(&mut controller),
+                &mut view,
+                &theme,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::Submit
+        );
+        assert_eq!(input.composer().text(), "@");
+        controller.finish_shutdown().await.unwrap();
+    }
+
     #[test]
     fn command_palette_escape_and_rejected_input_are_revision_scoped_dismissals() {
         let size = TerminalSize {
@@ -5221,7 +5935,14 @@ mod tests {
             rows: 24,
             columns: 80,
         };
-        let frame = super::enhanced_dock_frame(&input, None, interaction, size).unwrap();
+        let frame = super::enhanced_dock_frame(
+            &input,
+            None,
+            interaction,
+            size,
+            FileSuggestionSnapshot::Hidden,
+        )
+        .unwrap();
         let mut screen = InlineScreen::default();
         let mut attach = screen
             .stage_attach(super::screen_size(size), &frame, ThemePalette::Adaptive)
@@ -5243,6 +5964,7 @@ mod tests {
                 total_rows: 0,
                 page_rows: 0,
             },
+            file_suggestions: StagedFileSuggestionPresentation::Absent,
         }));
         assert!(!prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
         assert!(!screen.is_poisoned());
@@ -5267,6 +5989,7 @@ mod tests {
                 total_rows: 0,
                 page_rows: 0,
             },
+            file_suggestions: StagedFileSuggestionPresentation::Absent,
         }));
         assert!(prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
         assert!(screen.is_poisoned());
@@ -5287,7 +6010,14 @@ mod tests {
             rows: 5,
             columns: 12,
         };
-        let compact = super::enhanced_dock_frame(&input, None, interaction, compact_size).unwrap();
+        let compact = super::enhanced_dock_frame(
+            &input,
+            None,
+            interaction,
+            compact_size,
+            FileSuggestionSnapshot::Hidden,
+        )
+        .unwrap();
         let recovered = screen
             .stage_attach(
                 super::screen_size(compact_size),
@@ -5429,7 +6159,14 @@ mod tests {
             rows: 24,
             columns: 80,
         };
-        let frame = super::enhanced_dock_frame(&input, None, interaction, size).unwrap();
+        let frame = super::enhanced_dock_frame(
+            &input,
+            None,
+            interaction,
+            size,
+            FileSuggestionSnapshot::Hidden,
+        )
+        .unwrap();
         let mut screen = InlineScreen::default();
         let mut attach = screen
             .stage_attach(super::screen_size(size), &frame, ThemePalette::Adaptive)
@@ -5453,6 +6190,7 @@ mod tests {
                 total_rows: 0,
                 page_rows: 0,
             },
+            file_suggestions: StagedFileSuggestionPresentation::Absent,
         }));
         assert!(prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
         assert!(screen.is_poisoned());
@@ -5471,7 +6209,14 @@ mod tests {
             rows: 6,
             columns: 15,
         };
-        let compact = super::enhanced_dock_frame(&input, None, interaction, compact_size).unwrap();
+        let compact = super::enhanced_dock_frame(
+            &input,
+            None,
+            interaction,
+            compact_size,
+            FileSuggestionSnapshot::Hidden,
+        )
+        .unwrap();
         let mut second_resize = screen
             .stage_attach(
                 super::screen_size(compact_size),

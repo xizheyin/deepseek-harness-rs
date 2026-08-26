@@ -6,6 +6,7 @@ mod approval_selector;
 mod args;
 mod assembly;
 mod entry;
+mod file_suggestions;
 mod identity;
 mod input;
 mod interactive;

@@ -4,6 +4,7 @@ pub(crate) mod approval_preview;
 pub(crate) mod command_palette;
 pub(crate) mod composer;
 pub(crate) mod dock;
+pub(crate) mod file_suggestions;
 pub(crate) mod inline_screen;
 pub(crate) mod input_memory;
 pub(crate) mod key_decoder;

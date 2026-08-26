@@ -14,7 +14,7 @@ use crate::{
         deepseek::{DEEPSEEK_PROVIDER, DeepSeekConfig, DeepSeekProvider},
     },
     session::{CommittedUiReceiver, Session, SessionStore, StoreError, SystemClock},
-    tools::{LocalToolRegistry, PluginConfig},
+    tools::{LocalToolRegistry, PluginConfig, WorkspaceFileCatalogue},
     workspace_authority::WorkspaceAuthority,
 };
 use tokio_util::sync::CancellationToken;
@@ -40,6 +40,7 @@ pub(super) struct InteractiveAssembly {
     pub(super) joins: ApprovalJoin,
     pub(super) session_id: String,
     pub(super) resumed: bool,
+    pub(super) file_suggestions: WorkspaceFileCatalogue,
 }
 
 pub(super) struct AssemblySession {
@@ -156,6 +157,11 @@ pub(super) async fn assemble_session(
         Err(_) => return Err(AssemblyFailure::new(AssemblyError::Provider, session)),
     };
 
+    // The suggestion scanner and local tools share the same retained
+    // workspace capability. No later UI path reopens the ambient pathname.
+    let file_suggestions =
+        interactive.then(|| WorkspaceFileCatalogue::from_authority(authority.clone()));
+
     let registry = match plugin_config {
         Some(plugin_config) => {
             LocalToolRegistry::from_authority_with_plugins(authority, plugin_config, cancellation)
@@ -202,6 +208,9 @@ pub(super) async fn assemble_session(
         let Some((events, joins)) = interactive_state else {
             return Err(AssemblyFailure::new(AssemblyError::Agent, session));
         };
+        let Some(file_suggestions) = file_suggestions else {
+            return Err(AssemblyFailure::new(AssemblyError::Agent, session));
+        };
         let (approval, approvals) = TerminalApprovalProvider::new();
         let config = config
             .with_approval_provider(Arc::new(approval))
@@ -222,6 +231,7 @@ pub(super) async fn assemble_session(
             joins,
             session_id,
             resumed,
+            file_suggestions,
         }))
     } else {
         let config = config

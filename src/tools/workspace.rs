@@ -13,6 +13,7 @@ use std::os::fd::OwnedFd;
 use cap_std::fs::{Dir, OpenOptions};
 #[cfg(unix)]
 use cap_std::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use thiserror::Error;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
@@ -25,6 +26,10 @@ use super::{
 };
 
 const DIRECTORY_BATCH_ENTRIES: usize = 256;
+#[cfg(unix)]
+const MAX_FILE_CATALOGUE_ENTRIES: usize = 10_000;
+#[cfg(unix)]
+const MAX_FILE_CATALOGUE_PATH_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct Workspace {
@@ -63,6 +68,93 @@ pub(crate) struct WorkspaceFile {
     pub(crate) relative: PathBuf,
     pub(crate) display: String,
     pub(crate) modified: SystemTime,
+}
+
+/// Read-only relative-path catalogue built from the retained workspace handle.
+#[cfg(unix)]
+#[derive(Clone)]
+pub(crate) struct WorkspaceFileCatalogue {
+    authority: WorkspaceAuthority,
+    #[cfg(test)]
+    before_directory_open: Option<CatalogueDirectoryHook>,
+}
+
+#[cfg(all(unix, test))]
+type CatalogueDirectoryHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(unix)]
+impl std::fmt::Debug for WorkspaceFileCatalogue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceFileCatalogue")
+            .field("workspace_capability", &true)
+            .finish()
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum WorkspaceFileCatalogueError {
+    #[error("CLI_FILE_CATALOGUE_CANCELLED")]
+    Cancelled,
+    #[error("CLI_FILE_CATALOGUE_CAPACITY")]
+    Capacity,
+    #[error("CLI_FILE_CATALOGUE_LIMIT")]
+    Limit,
+    #[error("CLI_FILE_CATALOGUE_UNAVAILABLE")]
+    Unavailable,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CatalogueEntryKind {
+    File,
+    Directory,
+    Ignored,
+}
+
+#[cfg(unix)]
+struct CatalogueEntry {
+    display: String,
+    kind: CatalogueEntryKind,
+}
+
+#[cfg(unix)]
+struct CatalogueFrame {
+    entries: Vec<CatalogueEntry>,
+    next: usize,
+    depth: usize,
+}
+
+#[cfg(unix)]
+struct CatalogueBudget {
+    entries: usize,
+    path_bytes: usize,
+}
+
+#[cfg(unix)]
+impl CatalogueBudget {
+    fn observe_entry(&mut self) -> Result<(), WorkspaceFileCatalogueError> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or(WorkspaceFileCatalogueError::Limit)?;
+        if self.entries > MAX_FILE_CATALOGUE_ENTRIES {
+            return Err(WorkspaceFileCatalogueError::Limit);
+        }
+        Ok(())
+    }
+
+    fn charge_path(&mut self, bytes: usize) -> Result<(), WorkspaceFileCatalogueError> {
+        self.path_bytes = self
+            .path_bytes
+            .checked_add(bytes)
+            .ok_or(WorkspaceFileCatalogueError::Limit)?;
+        if self.path_bytes > MAX_FILE_CATALOGUE_PATH_BYTES {
+            return Err(WorkspaceFileCatalogueError::Limit);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct ReadFile {
@@ -1100,6 +1192,288 @@ impl Workspace {
 }
 
 #[cfg(unix)]
+impl WorkspaceFileCatalogue {
+    pub(crate) fn from_authority(authority: WorkspaceAuthority) -> Self {
+        Self {
+            authority,
+            #[cfg(test)]
+            before_directory_open: None,
+        }
+    }
+
+    /// Run only from `spawn_blocking`; directory syscalls may block in the kernel.
+    pub(crate) fn scan_blocking(
+        self,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, WorkspaceFileCatalogueError> {
+        check_catalogue_cancel(cancellation)?;
+        let root = self.authority.root();
+        let mut budget = CatalogueBudget {
+            entries: 0,
+            path_bytes: 0,
+        };
+        let entries = read_catalogue_directory(root, "", &mut budget, cancellation)?;
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(MAX_DIRECTORY_DEPTH + 1)
+            .map_err(|_| WorkspaceFileCatalogueError::Capacity)?;
+        frames.push(CatalogueFrame {
+            entries,
+            next: 0,
+            depth: 0,
+        });
+        let mut files = Vec::new();
+        files
+            .try_reserve(MAX_FILE_CATALOGUE_ENTRIES.min(256))
+            .map_err(|_| WorkspaceFileCatalogueError::Capacity)?;
+
+        while let Some(frame) = frames.last_mut() {
+            check_catalogue_cancel(cancellation)?;
+            if frame.next == frame.entries.len() {
+                let _ = frames.pop();
+                continue;
+            }
+            let index = frame.next;
+            frame.next = frame
+                .next
+                .checked_add(1)
+                .ok_or(WorkspaceFileCatalogueError::Limit)?;
+            let entry = frame
+                .entries
+                .get_mut(index)
+                .ok_or(WorkspaceFileCatalogueError::Unavailable)?;
+            let display = std::mem::take(&mut entry.display);
+            match entry.kind {
+                CatalogueEntryKind::File => {
+                    files
+                        .try_reserve(1)
+                        .map_err(|_| WorkspaceFileCatalogueError::Capacity)?;
+                    files.push(display);
+                }
+                CatalogueEntryKind::Directory => {
+                    let depth = frame
+                        .depth
+                        .checked_add(1)
+                        .ok_or(WorkspaceFileCatalogueError::Limit)?;
+                    if depth > MAX_DIRECTORY_DEPTH {
+                        return Err(WorkspaceFileCatalogueError::Limit);
+                    }
+                    #[cfg(test)]
+                    if let Some(hook) = self.before_directory_open.as_ref() {
+                        hook(&display);
+                    }
+                    let entries =
+                        read_catalogue_directory(root, &display, &mut budget, cancellation)?;
+                    frames.push(CatalogueFrame {
+                        entries,
+                        next: 0,
+                        depth,
+                    });
+                }
+                CatalogueEntryKind::Ignored => {}
+            }
+        }
+        Ok(files)
+    }
+}
+
+#[cfg(unix)]
+fn read_catalogue_directory(
+    root: &Dir,
+    relative: &str,
+    budget: &mut CatalogueBudget,
+    cancellation: &CancellationToken,
+) -> Result<Vec<CatalogueEntry>, WorkspaceFileCatalogueError> {
+    check_catalogue_cancel(cancellation)?;
+    let directory = if relative.is_empty() {
+        open_child_directory_no_follow(root, Path::new("."))
+    } else {
+        open_parent_no_follow(root, Path::new(relative), Some(cancellation))
+    }
+    .map_err(|_| {
+        if cancellation.is_cancelled() {
+            WorkspaceFileCatalogueError::Cancelled
+        } else {
+            WorkspaceFileCatalogueError::Unavailable
+        }
+    })?;
+    check_catalogue_cancel(cancellation)?;
+    let cursor = directory
+        .read_dir(Path::new("."))
+        .map_err(|_| WorkspaceFileCatalogueError::Unavailable)?;
+    let mut entries = Vec::new();
+    for item in cursor {
+        check_catalogue_cancel(cancellation)?;
+        budget.observe_entry()?;
+        let item = item.map_err(|_| WorkspaceFileCatalogueError::Unavailable)?;
+        let name = item
+            .file_name()
+            .into_string()
+            .map_err(|_| WorkspaceFileCatalogueError::Unavailable)?;
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return Err(WorkspaceFileCatalogueError::Unavailable);
+        }
+        let display = join_catalogue_path(relative, &name)?;
+        budget.charge_path(display.len())?;
+        let file_type = item
+            .file_type()
+            .map_err(|_| WorkspaceFileCatalogueError::Unavailable)?;
+        let kind = if file_type.is_symlink() {
+            CatalogueEntryKind::Ignored
+        } else if file_type.is_file() {
+            CatalogueEntryKind::File
+        } else if file_type.is_dir() {
+            if is_file_catalogue_skipped_directory(&name) {
+                CatalogueEntryKind::Ignored
+            } else {
+                CatalogueEntryKind::Directory
+            }
+        } else {
+            CatalogueEntryKind::Ignored
+        };
+        entries
+            .try_reserve(1)
+            .map_err(|_| WorkspaceFileCatalogueError::Capacity)?;
+        entries.push(CatalogueEntry { display, kind });
+    }
+    sort_catalogue_entries(&mut entries, cancellation)?;
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn sort_catalogue_entries(
+    entries: &mut [CatalogueEntry],
+    cancellation: &CancellationToken,
+) -> Result<(), WorkspaceFileCatalogueError> {
+    if entries.len() < 2 {
+        return Ok(());
+    }
+    for root in (0..entries.len() / 2).rev() {
+        sift_catalogue_heap(entries, root, entries.len(), cancellation)?;
+    }
+    for end in (1..entries.len()).rev() {
+        check_catalogue_cancel(cancellation)?;
+        entries.swap(0, end);
+        sift_catalogue_heap(entries, 0, end, cancellation)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sift_catalogue_heap(
+    entries: &mut [CatalogueEntry],
+    mut root: usize,
+    end: usize,
+    cancellation: &CancellationToken,
+) -> Result<(), WorkspaceFileCatalogueError> {
+    loop {
+        let left = root
+            .checked_mul(2)
+            .and_then(|index| index.checked_add(1))
+            .ok_or(WorkspaceFileCatalogueError::Limit)?;
+        if left >= end {
+            return Ok(());
+        }
+        let right = left + 1;
+        let child = if right < end
+            && compare_catalogue_paths(
+                &entries[left].display,
+                &entries[right].display,
+                cancellation,
+            )?
+            .is_lt()
+        {
+            right
+        } else {
+            left
+        };
+        if !compare_catalogue_paths(
+            &entries[root].display,
+            &entries[child].display,
+            cancellation,
+        )?
+        .is_lt()
+        {
+            return Ok(());
+        }
+        entries.swap(root, child);
+        root = child;
+    }
+}
+
+#[cfg(unix)]
+fn compare_catalogue_paths(
+    left: &str,
+    right: &str,
+    cancellation: &CancellationToken,
+) -> Result<std::cmp::Ordering, WorkspaceFileCatalogueError> {
+    const CANCEL_INTERVAL: usize = 4 * 1_024;
+    let shared = left.len().min(right.len());
+    for offset in (0..shared).step_by(CANCEL_INTERVAL) {
+        check_catalogue_cancel(cancellation)?;
+        let end = offset.saturating_add(CANCEL_INTERVAL).min(shared);
+        let ordering = left.as_bytes()[offset..end].cmp(&right.as_bytes()[offset..end]);
+        if !ordering.is_eq() {
+            return Ok(ordering);
+        }
+    }
+    Ok(left.len().cmp(&right.len()))
+}
+
+#[cfg(unix)]
+fn join_catalogue_path(parent: &str, name: &str) -> Result<String, WorkspaceFileCatalogueError> {
+    let separator = usize::from(!parent.is_empty());
+    let capacity = parent
+        .len()
+        .checked_add(separator)
+        .and_then(|bytes| bytes.checked_add(name.len()))
+        .ok_or(WorkspaceFileCatalogueError::Limit)?;
+    let mut display = String::new();
+    display
+        .try_reserve_exact(capacity)
+        .map_err(|_| WorkspaceFileCatalogueError::Capacity)?;
+    if !parent.is_empty() {
+        display.push_str(parent);
+        display.push('/');
+    }
+    display.push_str(name);
+    Ok(display)
+}
+
+#[cfg(unix)]
+fn is_file_catalogue_skipped_directory(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".svn"
+            | ".hg"
+            | ".bzr"
+            | ".jj"
+            | ".sl"
+            | "target"
+            | "node_modules"
+            | ".venv"
+            | "venv"
+            | ".cache"
+            | ".next"
+            | "__pycache__"
+            | "build"
+            | "dist"
+    )
+}
+
+#[cfg(unix)]
+fn check_catalogue_cancel(
+    cancellation: &CancellationToken,
+) -> Result<(), WorkspaceFileCatalogueError> {
+    if cancellation.is_cancelled() {
+        Err(WorkspaceFileCatalogueError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn open_parent_no_follow(
     root: &Dir,
     relative: &Path,
@@ -1634,7 +2008,11 @@ mod tests {
         WorkspaceMutationOperation, publication_error,
     };
     use super::{Workspace, file_changed};
+    #[cfg(unix)]
+    use super::{WorkspaceFileCatalogue, WorkspaceFileCatalogueError};
     use crate::tools::error::ToolCallError;
+    #[cfg(unix)]
+    use crate::workspace_authority::WorkspaceAuthority;
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -1704,6 +2082,191 @@ mod tests {
             3,
             Some(timestamp + std::time::Duration::from_secs(1))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_catalogue_is_capability_relative_deterministic_and_skips_closed_directories() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempRoot::new();
+        fs::create_dir(root.0.join("src")).unwrap();
+        fs::write(root.0.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        fs::create_dir(root.0.join(".config")).unwrap();
+        fs::write(root.0.join(".config/visible"), b"visible\n").unwrap();
+        for skipped in [
+            ".git",
+            ".svn",
+            ".hg",
+            ".bzr",
+            ".jj",
+            ".sl",
+            "target",
+            "node_modules",
+            ".venv",
+            "venv",
+            ".cache",
+            ".next",
+            "__pycache__",
+            "build",
+            "dist",
+        ] {
+            fs::create_dir(root.0.join(skipped)).unwrap();
+            fs::write(root.0.join(skipped).join("hidden"), b"secret\n").unwrap();
+        }
+        let external = TempRoot::new();
+        fs::write(external.0.join("outside"), b"outside\n").unwrap();
+        symlink(&external.0, root.0.join("linked")).unwrap();
+
+        let authority = WorkspaceAuthority::open(&root.0).unwrap();
+        let source = WorkspaceFileCatalogue::from_authority(authority);
+        let debug = format!("{source:?}");
+        assert!(debug.contains("workspace_capability: true"));
+        assert!(!debug.contains(root.0.to_str().unwrap()));
+        let files = source.scan_blocking(&CancellationToken::new()).unwrap();
+        assert_eq!(files, [".config/visible", "src/main.rs"]);
+        assert!(files.iter().all(|path| !path.contains("outside")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_catalogue_cancellation_and_depth_fail_closed_without_partial_results() {
+        let root = TempRoot::new();
+        fs::write(root.0.join("visible"), b"visible\n").unwrap();
+        let authority = WorkspaceAuthority::open(&root.0).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert_eq!(
+            WorkspaceFileCatalogue::from_authority(authority).scan_blocking(&cancellation),
+            Err(WorkspaceFileCatalogueError::Cancelled)
+        );
+
+        let exact = TempRoot::new();
+        let mut exact_directory = exact.0.clone();
+        for index in 0..super::MAX_DIRECTORY_DEPTH {
+            exact_directory.push(format!("d{index}"));
+            fs::create_dir(&exact_directory).unwrap();
+        }
+        fs::write(exact_directory.join("inside"), b"inside\n").unwrap();
+        let authority = WorkspaceAuthority::open(&exact.0).unwrap();
+        let files = WorkspaceFileCatalogue::from_authority(authority)
+            .scan_blocking(&CancellationToken::new())
+            .unwrap();
+        assert_eq!(files.len(), 1);
+
+        let deep = TempRoot::new();
+        let mut directory = deep.0.clone();
+        for index in 0..=super::MAX_DIRECTORY_DEPTH {
+            directory.push(format!("d{index}"));
+            fs::create_dir(&directory).unwrap();
+        }
+        let authority = WorkspaceAuthority::open(&deep.0).unwrap();
+        assert_eq!(
+            WorkspaceFileCatalogue::from_authority(authority)
+                .scan_blocking(&CancellationToken::new()),
+            Err(WorkspaceFileCatalogueError::Limit)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_catalogue_budgets_accept_exact_limits_and_reject_one_over() {
+        let mut entries = super::CatalogueBudget {
+            entries: super::MAX_FILE_CATALOGUE_ENTRIES - 1,
+            path_bytes: 0,
+        };
+        entries.observe_entry().unwrap();
+        assert_eq!(entries.entries, super::MAX_FILE_CATALOGUE_ENTRIES);
+        assert_eq!(
+            entries.observe_entry(),
+            Err(WorkspaceFileCatalogueError::Limit)
+        );
+
+        let mut paths = super::CatalogueBudget {
+            entries: 0,
+            path_bytes: super::MAX_FILE_CATALOGUE_PATH_BYTES - 1,
+        };
+        paths.charge_path(1).unwrap();
+        assert_eq!(paths.path_bytes, super::MAX_FILE_CATALOGUE_PATH_BYTES);
+        assert_eq!(
+            paths.charge_path(1),
+            Err(WorkspaceFileCatalogueError::Limit)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_catalogue_real_walk_accepts_exact_combined_budgets_and_rejects_one_byte_over() {
+        let root = TempRoot::new();
+        let component = "d".repeat(200);
+        let mut directory = root.0.clone();
+        for _ in 0..4 {
+            directory.push(&component);
+            fs::create_dir(&directory).unwrap();
+        }
+        for index in 0..9_996_usize {
+            let padding = if index < 42 { 29 } else { 30 };
+            let name = format!("f{index:04}{}", "x".repeat(padding));
+            fs::write(directory.join(name), b"").unwrap();
+        }
+        let authority = WorkspaceAuthority::open(&root.0).unwrap();
+        let files = WorkspaceFileCatalogue::from_authority(authority)
+            .scan_blocking(&CancellationToken::new())
+            .unwrap();
+        assert_eq!(files.len(), 9_996);
+        assert_eq!(
+            files.iter().map(String::len).sum::<usize>()
+                + [200_usize, 401, 602, 803].into_iter().sum::<usize>(),
+            super::MAX_FILE_CATALOGUE_PATH_BYTES
+        );
+
+        let old = format!("f{index:04}{}", "x".repeat(30), index = 42);
+        let new = format!("{old}x");
+        fs::rename(directory.join(old), directory.join(new)).unwrap();
+        let authority = WorkspaceAuthority::open(&root.0).unwrap();
+        assert_eq!(
+            WorkspaceFileCatalogue::from_authority(authority)
+                .scan_blocking(&CancellationToken::new()),
+            Err(WorkspaceFileCatalogueError::Limit)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_catalogue_directory_replacement_never_crosses_a_symlink() {
+        use std::{
+            os::unix::fs::symlink,
+            sync::{Arc, Barrier},
+        };
+
+        let root = TempRoot::new();
+        fs::create_dir(root.0.join("swap")).unwrap();
+        fs::write(root.0.join("swap/inside"), b"inside\n").unwrap();
+        let external = TempRoot::new();
+        fs::write(external.0.join("outside"), b"outside\n").unwrap();
+        let authority = WorkspaceAuthority::open(&root.0).unwrap();
+        let reached = Arc::new(Barrier::new(2));
+        let released = Arc::new(Barrier::new(2));
+        let hook_reached = Arc::clone(&reached);
+        let hook_released = Arc::clone(&released);
+        let mut source = WorkspaceFileCatalogue::from_authority(authority);
+        source.before_directory_open = Some(Arc::new(move |relative| {
+            if relative == "swap" {
+                hook_reached.wait();
+                hook_released.wait();
+            }
+        }));
+        let scan = std::thread::spawn(move || source.scan_blocking(&CancellationToken::new()));
+
+        reached.wait();
+        fs::remove_dir_all(root.0.join("swap")).unwrap();
+        symlink(&external.0, root.0.join("swap")).unwrap();
+        released.wait();
+
+        assert_eq!(
+            scan.join().unwrap(),
+            Err(WorkspaceFileCatalogueError::Unavailable)
+        );
     }
 
     #[cfg(unix)]

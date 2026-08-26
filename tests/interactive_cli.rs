@@ -4,6 +4,7 @@ mod support;
 
 use std::{
     io::Write,
+    os::unix::fs::PermissionsExt as _,
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
@@ -420,6 +421,80 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
 }
 
 #[test]
+fn enhanced_workspace_file_completion_rescans_and_fences_same_read_enter() {
+    let server = SequenceSseServer::start(vec![text_sse("file references stayed literal")]);
+    let workspace = TestWorkspace::new();
+    std::fs::write(workspace.0.join("a file.rs"), "safe\n").unwrap();
+    std::fs::write(workspace.0.join("b.rs"), "safe\n").unwrap();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"review @");
+    dsh.expect(b"> @a file.rs");
+    for (rows, columns, expected) in [
+        (12, 44, "> @a file.rs"),
+        (5, 12, "> @a"),
+        (24, 80, "> @a file.rs"),
+        (34, 112, "> @a file.rs"),
+    ] {
+        let checkpoint = dsh.checkpoint();
+        dsh.resize(rows, columns);
+        dsh.expect_after(checkpoint, expected.as_bytes());
+    }
+
+    let first_pick = dsh.checkpoint();
+    dsh.write(b"\r");
+    dsh.expect_after(first_pick, b"review @a file.rs ");
+    std::fs::write(workspace.0.join("aa-new.rs"), "created later\n").unwrap();
+
+    let second_menu = dsh.checkpoint();
+    dsh.write(b"@");
+    dsh.expect_after(second_menu, b"> @a file.rs");
+    dsh.expect_after(second_menu, b"@aa-new.rs");
+    let same_read = dsh.checkpoint();
+    dsh.write(b"\x1b[B\r");
+    dsh.expect_after(same_read, b"> @aa-new.rs");
+    let second_pick = dsh.checkpoint();
+    dsh.write(b"\r");
+    dsh.expect_after(second_pick, b"review @a file.rs @aa-new.rs ");
+
+    dsh.write(b"\r");
+    dsh.expect(b"file references stayed literal");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        last_user_content(&requests[0]),
+        "review @a file.rs @aa-new.rs "
+    );
+}
+
+#[test]
+fn enhanced_workspace_file_scan_failure_is_local_and_enter_still_submits() {
+    let server = SequenceSseServer::start(vec![text_sse("unavailable menu stayed local")]);
+    let workspace = TestWorkspace::new();
+    let locked = workspace.0.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"@");
+    dsh.expect(b"Workspace files unavailable");
+    dsh.write(b"\r");
+    dsh.expect(b"unavailable menu stayed local");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "@");
+}
+
+#[test]
 fn enhanced_streaming_markdown_and_diff_are_styled_without_replaying_source() {
     let body = fragmented_text_sse(&[
         "#",
@@ -495,6 +570,37 @@ fn linear_tui_keeps_markdown_literal_and_emits_no_escape_bytes() {
     assert!(status.success());
     assert!(!transcript.contains(&0x1b));
     assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn linear_tui_treats_at_paths_as_literal_and_never_opens_a_dynamic_menu() {
+    let server = SequenceSseServer::start(vec![text_sse("literal at path")]);
+    let workspace = TestWorkspace::new();
+    std::fs::write(workspace.0.join("note.txt"), "safe\n").unwrap();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"read @note.txt literally\r");
+    dsh.expect(b"literal at path");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert!(!transcript.contains(&0x1b));
+    assert!(
+        !transcript
+            .windows(b"Scanning workspace".len())
+            .any(|window| { window == b"Scanning workspace" })
+    );
+    assert!(
+        !transcript
+            .windows(b"Workspace files".len())
+            .any(|window| { window == b"Workspace files" })
+    );
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "read @note.txt literally");
 }
 
 #[test]
@@ -720,6 +826,47 @@ fn active_palette_theme_and_unknown_slash_keep_the_next_turn_fifo_truthful() {
         user_contents(&requests[1]),
         ["start a themed active turn", "/not-local"]
     );
+}
+
+#[test]
+fn active_workspace_file_completion_queues_only_after_a_fresh_enter() {
+    let first =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"active file prefix\"}}]}\n\n".to_owned();
+    let mut server = GatedThenStalledSseServer::start(first, text_sse(" active file suffix"));
+    let workspace = TestWorkspace::new();
+    std::fs::write(workspace.0.join("note.txt"), "safe\n").unwrap();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"start active file turn\r");
+    dsh.expect(b"active file prefix");
+    let menu = dsh.checkpoint();
+    dsh.write(b"next @");
+    dsh.expect_after(menu, b"> @note.txt");
+    let completed = dsh.checkpoint();
+    dsh.write(b"\r");
+    dsh.expect_after(completed, b"next @note.txt ");
+    server.assert_no_second_request(Duration::from_millis(150));
+    let queued = dsh.checkpoint();
+    dsh.write(b"\r");
+    dsh.expect_after(queued, b"1 next-turn prompt(s) queued");
+    server.assert_no_second_request(Duration::from_millis(150));
+
+    server.release();
+    dsh.expect(b"active file suffix");
+    dsh.expect(b"Turn complete");
+    server.wait_until_second_request();
+    dsh.expect(b"Working");
+    dsh.write(&[0x03]);
+    dsh.expect(b"stopped; skipped");
+    let (status, _) = dsh.exit_cleanly();
+    let (requests, second_closed) = server.finish();
+
+    assert!(status.success());
+    assert!(second_closed);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(last_user_content(&requests[0]), "start active file turn");
+    assert_eq!(last_user_content(&requests[1]), "next @note.txt ");
 }
 
 #[test]
@@ -1855,6 +2002,59 @@ fn enhanced_approval_suppresses_then_restores_the_command_palette_draft() {
     dsh.expect_after(settlement, b"Ready");
     dsh.expect_after(settlement, b"> /help");
     dsh.write(b"\x15/exit\r");
+    let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn enhanced_approval_discards_stale_file_menu_input_and_rescans_after_reject() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let partial = "data: {\"choices\":[{\"delta\":{\"content\":\"waiting with file draft\"}}]}\n\n"
+        .to_owned();
+    let mut server = GatedFirstSseServer::start(
+        partial,
+        tool_sse(
+            "call-file-takeover",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        vec![text_sse("rejected after file takeover")],
+    );
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").unwrap();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"open approval over file menu\r");
+    dsh.expect(b"waiting with file draft");
+    let menu = dsh.checkpoint();
+    dsh.write(b"@note");
+    dsh.expect_after(menu, b"> @note.txt");
+
+    let takeover = dsh.checkpoint();
+    server.release();
+    dsh.expect_after(takeover, b"Requested  Patch");
+    dsh.expect_after(takeover, b"Proposed update");
+    dsh.write(b"\x1b[B\r");
+    let approval = dsh.checkpoint();
+    dsh.approval_ready();
+    dsh.expect_after(approval, b"> Reject");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+
+    let rejected = dsh.checkpoint();
+    dsh.write(b"\r");
+    dsh.expect_after(rejected, b"Rejected");
+    dsh.expect_after(rejected, b"rejected after file takeover");
+    dsh.expect_after(rejected, b"Turn complete");
+    dsh.expect_after(rejected, b"> @note.txt");
+    dsh.write(b"\x15/exit\r");
+    dsh.expect(b"> /exit");
+    dsh.write(b"\r");
     let (status, _) = dsh.wait_for_exit(Duration::from_secs(5));
     let requests = server.finish();
 

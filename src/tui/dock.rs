@@ -7,6 +7,7 @@ use unicode_width::UnicodeWidthStr;
 use super::{
     command_palette::{CommandId, CommandPaletteSnapshot},
     composer::Composer,
+    file_suggestions::FileSuggestionSnapshot,
     input_memory::PromptQueue,
     presentation::TextStyle,
     theme::ThemePalette,
@@ -45,6 +46,7 @@ pub(crate) struct DockModel<'a> {
     pub(crate) composer: &'a Composer,
     pub(crate) queue: &'a PromptQueue,
     pub(crate) notice: Option<&'a str>,
+    pub(crate) file_suggestions: FileSuggestionSnapshot<'a>,
 }
 
 impl fmt::Debug for DockModel<'_> {
@@ -55,6 +57,7 @@ impl fmt::Debug for DockModel<'_> {
             .field("composer_bytes", &self.composer.byte_len())
             .field("queued", &self.queue.len())
             .field("notice_bytes", &self.notice.map(str::len))
+            .field("file_suggestions", &self.file_suggestions)
             .finish()
     }
 }
@@ -72,6 +75,9 @@ enum DockRole {
     CommandChoice,
     CommandSelected,
     CommandEmpty,
+    FileChoice,
+    FileSelected,
+    FileStatus,
     DetailTitle,
     DetailPlain,
     DetailMuted,
@@ -240,10 +246,39 @@ impl DockFrame {
                     None
                 }
             };
-            if compact && palette.is_some() {
+            let file_suggestions = model
+                .file_suggestions
+                .is_visible()
+                .then_some(model.file_suggestions);
+            if compact && file_suggestions.is_some() {
+                lines.push(compact_file_line(
+                    file_suggestions.ok_or(DockError::InvalidState)?,
+                    width_usize,
+                )?);
+            } else if compact && palette.is_some() {
                 lines.push(compact_command_line(
                     palette.ok_or(DockError::InvalidState)?,
                     width_usize,
+                ));
+            } else if matches!(
+                file_suggestions,
+                Some(FileSuggestionSnapshot::Ready { capped: true, .. })
+            ) {
+                let running = matches!(
+                    model.interaction,
+                    DockInteraction::Running
+                        | DockInteraction::CommandPalette { running: true, .. }
+                );
+                lines.push(line(
+                    DockRole::Queue,
+                    fit_ascii(
+                        if running {
+                            "Working · Workspace files · showing top matches"
+                        } else {
+                            "Workspace files · showing top matches"
+                        },
+                        width_usize,
+                    ),
                 ));
             } else if let Some(notice) = model.notice {
                 let notice = render_visible_owned(notice, false)?;
@@ -293,20 +328,32 @@ impl DockFrame {
                 lines.push(line(DockRole::Composer, "  ".to_owned()));
             }
             if !compact {
-                if let Some(palette) = palette {
+                if let Some(file_suggestions) = file_suggestions {
+                    push_file_lines(&mut lines, file_suggestions, rows, width_usize)?;
+                } else if let Some(palette) = palette {
                     push_command_lines(&mut lines, palette, rows, columns, width_usize)?;
                 }
             }
-            let hint = match model.interaction {
-                DockInteraction::Idle if compact => "Enter send",
-                DockInteraction::Idle => "Enter send | Ctrl+J newline | Up history | ? help",
-                DockInteraction::Running if compact => "Enter queue",
-                DockInteraction::Running => {
-                    "Enter queue | Ctrl+J newline | Ctrl+C stop current turn"
+            let hint = if file_suggestions.is_some() {
+                if compact {
+                    "Enter · Esc"
+                } else if matches!(file_suggestions, Some(FileSuggestionSnapshot::Ready { .. })) {
+                    "Enter complete · Esc close"
+                } else {
+                    "Enter send · Esc close"
                 }
-                DockInteraction::CommandPalette { .. } if compact => "Enter · Esc",
-                DockInteraction::CommandPalette { .. } => "Enter complete · Esc close",
-                DockInteraction::Approval(_) => "Arrow keys move | Enter confirms | Esc stops",
+            } else {
+                match model.interaction {
+                    DockInteraction::Idle if compact => "Enter send",
+                    DockInteraction::Idle => "Enter send | Ctrl+J newline | Up history | ? help",
+                    DockInteraction::Running if compact => "Enter queue",
+                    DockInteraction::Running => {
+                        "Enter queue | Ctrl+J newline | Ctrl+C stop current turn"
+                    }
+                    DockInteraction::CommandPalette { .. } if compact => "Enter · Esc",
+                    DockInteraction::CommandPalette { .. } => "Enter complete · Esc close",
+                    DockInteraction::Approval(_) => "Arrow keys move | Enter confirms | Esc stops",
+                }
             };
             let mut hint = if wrapped.hidden_below {
                 format!("v more | {hint}")
@@ -546,6 +593,93 @@ fn compact_command_line(snapshot: CommandPaletteSnapshot, width: usize) -> DockL
         DockRole::CommandSelected,
         fit_ascii(&format!(" > {}", command.command()), width),
     )
+}
+
+fn compact_file_line(
+    snapshot: FileSuggestionSnapshot<'_>,
+    width: usize,
+) -> Result<DockLine, DockError> {
+    match snapshot {
+        FileSuggestionSnapshot::Ready {
+            candidates,
+            selected,
+            ..
+        } => file_line(
+            candidates.get(selected).ok_or(DockError::InvalidState)?,
+            true,
+            width,
+        ),
+        FileSuggestionSnapshot::Loading => {
+            Ok(line(DockRole::FileStatus, fit_ascii("… Scan", width)))
+        }
+        FileSuggestionSnapshot::Empty => {
+            Ok(line(DockRole::FileStatus, fit_ascii("! No match", width)))
+        }
+        FileSuggestionSnapshot::Unavailable => {
+            Ok(line(DockRole::FileStatus, fit_ascii("! Offline", width)))
+        }
+        FileSuggestionSnapshot::Hidden => Err(DockError::InvalidState),
+    }
+}
+
+fn push_file_lines(
+    lines: &mut Vec<DockLine>,
+    snapshot: FileSuggestionSnapshot<'_>,
+    terminal_rows: u16,
+    width: usize,
+) -> Result<(), DockError> {
+    match snapshot {
+        FileSuggestionSnapshot::Ready {
+            candidates,
+            selected,
+            ..
+        } => {
+            if selected >= candidates.len() || candidates.is_empty() {
+                return Err(DockError::InvalidState);
+            }
+            let visible = candidates
+                .len()
+                .min(12)
+                .min(usize::from(terminal_rows).saturating_sub(8));
+            if visible == 0 {
+                return Err(DockError::TooSmall);
+            }
+            let start = selected
+                .saturating_sub((visible - 1) / 2)
+                .min(candidates.len() - visible);
+            for (index, path) in candidates.iter().enumerate().skip(start).take(visible) {
+                lines.push(file_line(path, index == selected, width)?);
+            }
+        }
+        FileSuggestionSnapshot::Loading => lines.push(line(
+            DockRole::FileStatus,
+            fit_ascii(" … Scanning workspace...", width),
+        )),
+        FileSuggestionSnapshot::Empty => lines.push(line(
+            DockRole::FileStatus,
+            fit_ascii(" ! No matching workspace file", width),
+        )),
+        FileSuggestionSnapshot::Unavailable => lines.push(line(
+            DockRole::FileStatus,
+            fit_ascii(" ! Workspace files unavailable", width),
+        )),
+        FileSuggestionSnapshot::Hidden => return Err(DockError::InvalidState),
+    }
+    Ok(())
+}
+
+fn file_line(path: &str, selected: bool, width: usize) -> Result<DockLine, DockError> {
+    let visible = render_visible_owned(path, false)?;
+    let marker = if selected { '>' } else { ' ' };
+    let text = truncate_cells(&format!(" {marker} @{visible}"), width);
+    Ok(line(
+        if selected {
+            DockRole::FileSelected
+        } else {
+            DockRole::FileChoice
+        },
+        text,
+    ))
 }
 
 fn push_command_lines(
@@ -833,9 +967,13 @@ const fn style_for_role(role: DockRole) -> TextStyle {
         DockRole::Notice | DockRole::ApprovalWarning | DockRole::DetailCaution => {
             TextStyle::Warning
         }
-        DockRole::ApprovalChoice | DockRole::CommandChoice => TextStyle::Code,
-        DockRole::ApprovalSelected | DockRole::CommandSelected => TextStyle::Selection,
-        DockRole::CommandEmpty => TextStyle::Warning,
+        DockRole::ApprovalChoice | DockRole::CommandChoice | DockRole::FileChoice => {
+            TextStyle::Code
+        }
+        DockRole::ApprovalSelected | DockRole::CommandSelected | DockRole::FileSelected => {
+            TextStyle::Selection
+        }
+        DockRole::CommandEmpty | DockRole::FileStatus => TextStyle::Warning,
         DockRole::DetailTitle => TextStyle::Heading,
         DockRole::DetailAccent => TextStyle::Accent,
         DockRole::DetailPositive => TextStyle::Success,
@@ -874,6 +1012,7 @@ mod tests {
     use crate::tui::{
         command_palette::{CommandPaletteState, PaletteMove},
         composer::Composer,
+        file_suggestions::FileSuggestionSnapshot,
         input_memory::PromptQueue,
         presentation::TextStyle,
         theme::ThemePalette,
@@ -915,6 +1054,7 @@ mod tests {
                     composer: &composer,
                     queue: &queue,
                     notice: None,
+                    file_suggestions: FileSuggestionSnapshot::Hidden,
                 },
                 rows,
                 columns,
@@ -969,6 +1109,7 @@ mod tests {
                     composer: &composer,
                     queue: &queue,
                     notice: None,
+                    file_suggestions: FileSuggestionSnapshot::Hidden,
                 },
                 rows,
                 columns,
@@ -1005,6 +1146,7 @@ mod tests {
                 composer: &composer,
                 queue: &queue,
                 notice: None,
+                file_suggestions: FileSuggestionSnapshot::Hidden,
             },
             5,
             12,
@@ -1027,6 +1169,7 @@ mod tests {
                 composer: &unknown,
                 queue: &queue,
                 notice: None,
+                file_suggestions: FileSuggestionSnapshot::Hidden,
             },
             5,
             12,
@@ -1034,6 +1177,91 @@ mod tests {
         .unwrap();
         assert_eq!(compact_empty.lines[0].text, "! No match");
         assert!(!compact_empty.lines[0].text.contains('>'));
+    }
+
+    #[test]
+    fn file_suggestions_have_exact_windows_compact_rescue_and_safe_display() {
+        let mut composer = Composer::default();
+        composer.insert_text("see @src").unwrap();
+        let queue = PromptQueue::default();
+        let mut candidates = (0..20)
+            .map(|index| format!("src/module-{index:02}.rs"))
+            .collect::<Vec<_>>();
+        candidates[10] = "src/SECRET\u{1b}[2J.rs".to_owned();
+        let snapshot = FileSuggestionSnapshot::Ready {
+            candidates: &candidates,
+            selected: 10,
+            capped: true,
+        };
+
+        for (rows, columns, expected_rows) in [(34, 112, 12_usize), (24, 80, 12), (12, 44, 4)] {
+            let frame = DockFrame::layout(
+                DockModel {
+                    interaction: DockInteraction::Idle,
+                    composer: &composer,
+                    queue: &queue,
+                    notice: None,
+                    file_suggestions: snapshot,
+                },
+                rows,
+                columns,
+            )
+            .unwrap();
+            let file_rows = frame
+                .lines
+                .iter()
+                .filter(|line| matches!(line.role, DockRole::FileChoice | DockRole::FileSelected))
+                .count();
+            assert_eq!(file_rows, expected_rows, "{columns}x{rows}");
+            assert!(
+                frame
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("top matches"))
+            );
+            assert!(frame.lines.iter().any(|line| line.text.contains("> @src/")));
+            assert!(!frame.lines.iter().any(|line| line.text.contains('\u{1b}')));
+            assert_eq!(candidates[10], "src/SECRET\u{1b}[2J.rs");
+        }
+
+        let compact = DockFrame::layout(
+            DockModel {
+                interaction: DockInteraction::Running,
+                composer: &composer,
+                queue: &queue,
+                notice: None,
+                file_suggestions: snapshot,
+            },
+            5,
+            12,
+        )
+        .unwrap();
+        assert_eq!(compact.rows().unwrap(), 4);
+        assert_eq!(compact.output_bottom(), 1);
+        assert!(compact.lines[0].text.starts_with(" > @"));
+        assert_eq!(compact.lines[3].text, "Enter · Esc");
+        assert!(!compact.lines.iter().any(|line| line.text.contains("top")));
+
+        for (snapshot, expected) in [
+            (FileSuggestionSnapshot::Loading, "Scan"),
+            (FileSuggestionSnapshot::Empty, "No match"),
+            (FileSuggestionSnapshot::Unavailable, "Offline"),
+        ] {
+            let frame = DockFrame::layout(
+                DockModel {
+                    interaction: DockInteraction::Idle,
+                    composer: &composer,
+                    queue: &queue,
+                    notice: None,
+                    file_suggestions: snapshot,
+                },
+                5,
+                12,
+            )
+            .unwrap();
+            assert!(frame.lines[0].text.contains(expected));
+            assert!(!frame.lines[0].text.contains('>'));
+        }
     }
 
     #[test]
@@ -1051,6 +1279,7 @@ mod tests {
                     composer: &composer,
                     queue: &queue,
                     notice: None,
+                    file_suggestions: FileSuggestionSnapshot::Hidden,
                 },
                 6,
                 15,
@@ -1086,6 +1315,7 @@ mod tests {
                 composer: &composer,
                 queue: &queue,
                 notice: None,
+                file_suggestions: FileSuggestionSnapshot::Hidden,
             },
             5,
             12,
@@ -1107,6 +1337,7 @@ mod tests {
                     composer: &composer,
                     queue: &queue,
                     notice: None,
+                    file_suggestions: FileSuggestionSnapshot::Hidden,
                 },
                 5,
                 11,
@@ -1120,6 +1351,7 @@ mod tests {
                     composer: &composer,
                     queue: &queue,
                     notice: None,
+                    file_suggestions: FileSuggestionSnapshot::Hidden,
                 },
                 4,
                 12,
@@ -1139,6 +1371,7 @@ mod tests {
                     composer: &composer,
                     queue: &queue,
                     notice: None,
+                    file_suggestions: FileSuggestionSnapshot::Hidden,
                 },
                 rows,
                 columns,
@@ -1199,6 +1432,7 @@ mod tests {
                     composer: &composer,
                     queue: &queue,
                     notice: None,
+                    file_suggestions: FileSuggestionSnapshot::Hidden,
                 },
                 rows,
                 columns,
@@ -1241,6 +1475,7 @@ mod tests {
                 composer: &composer,
                 queue: &queue,
                 notice: None,
+                file_suggestions: FileSuggestionSnapshot::Hidden,
             },
             20,
             44,
@@ -1267,6 +1502,7 @@ mod tests {
             composer: &composer,
             queue: &queue,
             notice: Some("SECRET_NOTICE"),
+            file_suggestions: FileSuggestionSnapshot::Hidden,
         };
         let model_debug = format!("{model:?}");
         assert!(!model_debug.contains("SECRET_DRAFT"));
