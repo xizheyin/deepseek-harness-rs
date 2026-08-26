@@ -154,7 +154,7 @@ fn only_session_id(root: &Path) -> String {
 }
 
 #[test]
-fn configured_plugin_is_model_visible_but_dispatches_only_after_terminal_approval() {
+fn auto_edit_keeps_configured_plugin_behind_terminal_approval() {
     let workspace = PluginWorkspace::new();
     let config = plugin_fixture(&workspace.0);
     let configured_program = serde_json::from_str::<serde_json::Value>(
@@ -166,10 +166,11 @@ fn configured_plugin_is_model_visible_but_dispatches_only_after_terminal_approva
         .to_owned();
     let session_root = TestSessionRoot::new();
     let server = SequenceSseServer::start(vec![tool_sse(), text_sse("plugin round complete")]);
-    let mut dsh = PtyHarness::spawn_color_with_plugin_config_and_session_root(
+    let mut dsh = PtyHarness::spawn_color_with_plugin_config_approval_mode_and_session_root(
         &server.base_url,
         &workspace.0,
         &config,
+        "auto-edit",
         session_root.clone(),
     );
 

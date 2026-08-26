@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     approval::{ApprovalChallengePool, ApprovalEnvelopeReceiver, TerminalApprovalProvider},
     approval_join::ApprovalJoin,
-    args::DEFAULT_MODEL,
+    args::{ApprovalMode, DEFAULT_MODEL},
     identity::new_session_id,
 };
 
@@ -111,6 +111,7 @@ pub(super) async fn assemble_session(
     prepared: AssemblySession,
     requested_model: Option<String>,
     interactive: bool,
+    approval_mode: ApprovalMode,
     plugin_config: Option<PluginConfig>,
     cancellation: CancellationToken,
 ) -> Result<AgentAssembly, AssemblyFailure> {
@@ -212,11 +213,12 @@ pub(super) async fn assemble_session(
             return Err(AssemblyFailure::new(AssemblyError::Agent, session));
         };
         let (approval, approvals) = TerminalApprovalProvider::new();
+        let (file_change_policy, shell_policy, plugin_policy) = interactive_policies(approval_mode);
         let config = config
             .with_approval_provider(Arc::new(approval))
-            .with_file_change_policy(FileChangePolicy::Ask)
-            .with_shell_policy(ShellPolicy::Ask)
-            .with_plugin_policy(PluginPolicy::Ask);
+            .with_file_change_policy(file_change_policy)
+            .with_shell_policy(shell_policy)
+            .with_plugin_policy(plugin_policy);
         let agent = match AgentLoop::new_preserving_session(session, provider, tools, config) {
             Ok(agent) => agent,
             Err((_error, session)) => {
@@ -249,6 +251,16 @@ pub(super) async fn assemble_session(
     }
 }
 
+const fn interactive_policies(
+    approval_mode: ApprovalMode,
+) -> (FileChangePolicy, ShellPolicy, PluginPolicy) {
+    let file = match approval_mode {
+        ApprovalMode::Ask => FileChangePolicy::Ask,
+        ApprovalMode::AutoEdit => FileChangePolicy::Allow,
+    };
+    (file, ShellPolicy::Ask, PluginPolicy::Ask)
+}
+
 fn select_call(
     previous: Option<&crate::session::EpochHeader>,
     requested_model: Option<String>,
@@ -265,15 +277,34 @@ fn select_call(
 
 #[cfg(test)]
 mod tests {
-    use crate::{model::LlmCallConfig, session::EpochHeader};
+    use crate::{
+        agent::{FileChangePolicy, PluginPolicy, ShellPolicy},
+        model::LlmCallConfig,
+        session::EpochHeader,
+    };
 
-    use super::{DEEPSEEK_PROVIDER, DEFAULT_MODEL, SYSTEM_PROMPT, select_call};
+    use super::{
+        ApprovalMode, DEEPSEEK_PROVIDER, DEFAULT_MODEL, SYSTEM_PROMPT, interactive_policies,
+        select_call,
+    };
 
     #[test]
     fn system_prompt_does_not_claim_later_phase_features() {
         assert!(!SYSTEM_PROMPT.contains("no persistence"));
         assert!(SYSTEM_PROMPT.contains("no sandbox, Skills, Hooks"));
         assert!(!SYSTEM_PROMPT.contains("MCP"));
+    }
+
+    #[test]
+    fn auto_edit_changes_only_the_file_policy() {
+        assert_eq!(
+            interactive_policies(ApprovalMode::Ask),
+            (FileChangePolicy::Ask, ShellPolicy::Ask, PluginPolicy::Ask,)
+        );
+        assert_eq!(
+            interactive_policies(ApprovalMode::AutoEdit),
+            (FileChangePolicy::Allow, ShellPolicy::Ask, PluginPolicy::Ask,)
+        );
     }
 
     #[test]

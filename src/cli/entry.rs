@@ -38,6 +38,7 @@ const HELP: &str = concat!(
     "  -w, --workspace <PATH>       Workspace (new: current; resume: optional identity check)\n",
     "      --plugin-config <PATH>   Enable explicitly configured local tool plugins\n",
     "      --tui <MODE>             Terminal UI: auto (default), enhanced, or linear\n",
+    "      --approval-mode <MODE>   Interactive edits: ask (default) or auto-edit\n",
     "      --reduced-motion         Disable periodic enhanced-UI animation\n",
     "      --no-color               Disable color and force the linear terminal UI\n",
     "      --list-sessions          List persisted session headers\n",
@@ -105,7 +106,15 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         no_color,
         reduced_motion,
         tui,
+        approval_mode,
+        approval_mode_explicit,
     } = options;
+    let stdin_is_terminal = io::stdin().is_terminal();
+    if approval_mode_explicit && (prompt.is_some() || !stdin_is_terminal) {
+        return Err(EntryError::usage(
+            ParseError::ApprovalModeRequiresInteractive,
+        ));
+    }
     let plugin_config = plugin_config
         .map(|path| {
             let startup_directory = std::env::current_dir().map_err(|_| EntryError::workspace())?;
@@ -132,7 +141,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
     // journal lock exists.
     let surface = if let Some(prompt) = prompt {
         LaunchSurface::Script(prompt)
-    } else if !io::stdin().is_terminal() {
+    } else if !stdin_is_terminal {
         let prompt = runtime
             .block_on(read_piped_prompt_or_exit(&mut signals))
             .map_err(EntryError::input)?;
@@ -219,6 +228,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
                 prepared,
                 model,
                 interactive,
+                approval_mode,
                 plugin_config,
                 startup_cancellation.clone(),
             ),
@@ -597,6 +607,8 @@ mod tests {
         assert!(HELP.contains("--resume <SESSION_ID>"));
         assert!(HELP.contains("--plugin-config <PATH>"));
         assert!(HELP.contains("--tui <MODE>"));
+        assert!(HELP.contains("--approval-mode <MODE>"));
+        assert!(HELP.contains("ask (default) or auto-edit"));
         assert!(HELP.contains("auto (default), enhanced, or linear"));
         assert!(HELP.contains("force the linear terminal UI"));
         assert!(HELP.contains("resume: stored model"));
@@ -683,6 +695,23 @@ mod tests {
         assert_eq!(error.exit_code(), 2);
         assert_eq!(error.detail.as_deref(), Some("unknown command-line option"));
         let _ = EntryError::agent();
+    }
+
+    #[test]
+    fn explicit_approval_mode_rejects_script_before_product_assembly() {
+        let error = run([
+            OsString::from("--prompt"),
+            OsString::from("do not run"),
+            OsString::from("--approval-mode"),
+            OsString::from("auto-edit"),
+        ])
+        .unwrap_err();
+        assert_eq!(error.code, "CLI_USAGE");
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("--approval-mode is available only in interactive terminal mode")
+        );
     }
 
     #[test]

@@ -1938,6 +1938,131 @@ fn enhanced_resize_during_a_partial_stream_reanchors_without_cancelling_the_turn
 }
 
 #[test]
+fn auto_edit_commits_a_workspace_patch_without_opening_the_approval_selector() {
+    let patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-auto-edit",
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        ),
+        text_sse("auto edit finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let mut dsh =
+        PtyHarness::spawn_color_with_approval_mode(&server.base_url, &workspace.0, "auto-edit");
+
+    dsh.expect("❯".as_bytes());
+    let turn = dsh.checkpoint();
+    dsh.write(b"apply the prepared edit automatically\r");
+    dsh.expect_after(turn, b"Updated  note.txt");
+    dsh.expect_after(turn, b"auto edit finished");
+    dsh.expect_after(turn, b"Turn complete");
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert!(
+        !transcript
+            .windows(b"Proposed update".len())
+            .any(|window| { window == b"Proposed update" })
+    );
+    assert!(
+        !transcript
+            .windows(b"> Reject".len())
+            .any(|window| window == b"> Reject")
+    );
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
+    let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
+    let first_server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-auto-edit-seed",
+            "apply_patch",
+            serde_json::json!({ "patch": first_patch }),
+        ),
+        text_sse("auto-edit seed finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let caller_workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").unwrap();
+    let mut first = PtyHarness::spawn_color_with_approval_mode_and_session_root(
+        &first_server.base_url,
+        &workspace.0,
+        "auto-edit",
+        session_root.clone(),
+    );
+
+    first.expect("❯".as_bytes());
+    first.write(b"seed an auto-edit session\r");
+    first.expect(b"Updated  note.txt");
+    first.expect(b"auto-edit seed finished");
+    first.expect(b"Turn complete");
+    let (status, transcript) = first.exit_cleanly();
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "middle\n");
+    assert!(
+        !transcript
+            .windows(b"> Reject".len())
+            .any(|row| row == b"> Reject")
+    );
+    assert_eq!(first_server.finish().len(), 2);
+
+    let entries = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let filename = entries[0].file_name().into_string().unwrap();
+    let session_id = filename.strip_suffix(".jsonl").unwrap().to_owned();
+    let journal = std::fs::read(entries[0].path()).unwrap();
+    for event in [
+        b"\"type\":\"approval/asked\"".as_slice(),
+        b"\"type\":\"approval/decided\"".as_slice(),
+    ] {
+        assert!(!journal.windows(event.len()).any(|row| row == event));
+    }
+
+    let second_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-middle\n+new\n";
+    let second_server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-resumed-ask",
+            "apply_patch",
+            serde_json::json!({ "patch": second_patch }),
+        ),
+        text_sse("resume ask restored"),
+    ]);
+    let mut resumed = PtyHarness::spawn_resume_color_cargo(
+        &second_server.base_url,
+        &caller_workspace.0,
+        session_root,
+        &session_id,
+    );
+    resumed.expect("❯".as_bytes());
+    resumed.write(b"prove approval mode reset\r");
+    resumed.approval_ready();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "middle\n");
+    resumed.write(b"\r");
+    resumed.expect(b"Rejected");
+    resumed.expect(b"resume ask restored");
+    resumed.expect(b"Turn complete");
+    let (status, _) = resumed.exit_cleanly();
+    let requests = second_server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "middle\n");
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
 fn styled_approval_selector_is_visible_safe_and_restores_the_terminal() {
     let patch = concat!(
         "--- a/note.txt\n",
@@ -3663,6 +3788,43 @@ fn foreground_shell_runs_only_after_the_confirmed_terminal_approval() {
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "shell-ok");
     assert_eq!(requests.len(), 2);
     assert!(requests[1].contains("call-shell"));
+}
+
+#[test]
+fn auto_edit_mode_keeps_foreground_shell_behind_terminal_approval() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-auto-edit-shell",
+            "bash",
+            serde_json::json!({
+                "command": "printf shell-ok > shell-result.txt",
+                "description": "prove auto-edit does not authorize shell",
+                "timeoutMs": 25_000
+            }),
+        ),
+        text_sse("auto-edit shell finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("shell-result.txt");
+    let mut dsh =
+        PtyHarness::spawn_color_with_approval_mode(&server.base_url, &workspace.0, "auto-edit");
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"run shell while auto-edit is enabled\r");
+    dsh.approval_ready();
+    assert!(!target.exists());
+    dsh.write(b"\x1b[A");
+    dsh.expect(b"> Allow once");
+    assert!(!target.exists());
+    dsh.write(b"\r");
+    dsh.expect(b"auto-edit shell finished");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "shell-ok");
+    assert_eq!(requests.len(), 2);
 }
 
 #[test]

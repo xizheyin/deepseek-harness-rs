@@ -276,6 +276,31 @@ impl PtyHarness {
         Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None, launch)
     }
 
+    pub fn spawn_color_with_approval_mode(base_url: &str, workspace: &Path, mode: &str) -> Self {
+        let mut launch = PtyLaunch::cargo(true);
+        launch.extra_args = vec!["--approval-mode".into(), mode.into()];
+        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None, launch)
+    }
+
+    pub fn spawn_color_with_approval_mode_and_session_root(
+        base_url: &str,
+        workspace: &Path,
+        mode: &str,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        let mut launch = PtyLaunch::cargo(true);
+        launch.extra_args = vec!["--approval-mode".into(), mode.into()];
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            launch,
+        )
+    }
+
     pub fn spawn_color_with_session_root_cargo(
         base_url: &str,
         workspace: &Path,
@@ -363,6 +388,29 @@ impl PtyHarness {
             Some(session_root),
             None,
             PtyLaunch::cargo_with_plugin(true, plugin_config),
+        )
+    }
+
+    #[allow(dead_code)] // Used only by the separately compiled plugin-CLI binary.
+    pub fn spawn_color_with_plugin_config_approval_mode_and_session_root(
+        base_url: &str,
+        workspace: &Path,
+        plugin_config: &Path,
+        approval_mode: &str,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        let mut launch = PtyLaunch::cargo_with_plugin(true, plugin_config);
+        launch
+            .extra_args
+            .extend(["--approval-mode".into(), approval_mode.into()]);
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            launch,
         )
     }
 

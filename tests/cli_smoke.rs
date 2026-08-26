@@ -583,6 +583,8 @@ fn help_describes_only_available_options() {
         assert!(help.contains("--prompt"));
         assert!(help.contains("--model"));
         assert!(help.contains("--workspace"));
+        assert!(help.contains("--approval-mode <MODE>"));
+        assert!(help.contains("ask (default) or auto-edit"));
         assert!(help.contains("--resume <SESSION_ID>"));
         assert!(help.contains("resume: stored model"));
         assert!(help.contains("resume: optional identity check"));
@@ -621,6 +623,17 @@ fn help_version_and_usage_errors_stop_before_workspace_credentials_or_network() 
         (vec!["--version"], 0),
         (vec!["--help", "--workspace", missing_text], 2),
         (vec!["--workspace", missing_text, "--unknown"], 2),
+        (
+            vec![
+                "--prompt",
+                "do not run",
+                "--approval-mode",
+                "auto-edit",
+                "--workspace",
+                missing_text,
+            ],
+            2,
+        ),
     ] {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dsh"));
         command
@@ -2007,6 +2020,18 @@ fn empty_non_terminal_input_is_a_bounded_script_usage_error() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stdout(&output), "");
     assert_eq!(stderr(&output), "dsh: CLI_INPUT_INVALID\n");
+}
+
+#[test]
+fn explicit_approval_mode_rejects_piped_input_before_reading_it() {
+    let output = run(&["--approval-mode", "auto-edit"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "dsh: CLI_USAGE: --approval-mode is available only in interactive terminal mode\n"
+    );
 }
 
 #[test]

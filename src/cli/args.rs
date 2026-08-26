@@ -11,6 +11,7 @@ pub(super) const MAX_WORKSPACE_BYTES: usize = 4_096;
 pub(super) const MAX_PLUGIN_CONFIG_BYTES: usize = 4_096;
 pub(super) const MAX_MODEL_BYTES: usize = 256;
 pub(super) const MAX_SESSION_ID_BYTES: usize = 44;
+pub(super) const MAX_APPROVAL_MODE_BYTES: usize = 9;
 pub(super) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -19,6 +20,13 @@ pub(super) enum TuiMode {
     Auto,
     Enhanced,
     Linear,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ApprovalMode {
+    #[default]
+    Ask,
+    AutoEdit,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +53,8 @@ pub(super) struct CliOptions {
     pub(super) no_color: bool,
     pub(super) reduced_motion: bool,
     pub(super) tui: TuiMode,
+    pub(super) approval_mode: ApprovalMode,
+    pub(super) approval_mode_explicit: bool,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -79,6 +89,10 @@ pub(super) enum ParseError {
     InvalidSessionId,
     #[error("--tui accepts only auto, enhanced, or linear")]
     InvalidTuiMode,
+    #[error("--approval-mode accepts only ask or auto-edit")]
+    InvalidApprovalMode,
+    #[error("--approval-mode is available only in interactive terminal mode")]
+    ApprovalModeRequiresInteractive,
 }
 
 pub(super) fn parse_args_os(
@@ -106,6 +120,7 @@ pub(super) fn parse_args_os(
     let mut plugin_config_seen = false;
     let mut resume_seen = false;
     let mut tui_seen = false;
+    let mut approval_mode_seen = false;
     let mut no_color_seen = false;
     let mut reduced_motion_seen = false;
     let mut list_sessions_seen = false;
@@ -144,6 +159,7 @@ pub(super) fn parse_args_os(
             ("--plugin-config", "--plugin-config"),
             ("--resume", "--resume"),
             ("--tui", "--tui"),
+            ("--approval-mode", "--approval-mode"),
         ]
         .into_iter()
         .find_map(|(prefix, option)| {
@@ -163,6 +179,7 @@ pub(super) fn parse_args_os(
                 &mut plugin_config_seen,
                 &mut resume_seen,
                 &mut tui_seen,
+                &mut approval_mode_seen,
             )?;
             index += 1;
             continue;
@@ -175,6 +192,7 @@ pub(super) fn parse_args_os(
             "--plugin-config" => Some("--plugin-config"),
             "--resume" => Some("--resume"),
             "--tui" => Some("--tui"),
+            "--approval-mode" => Some("--approval-mode"),
             _ => None,
         };
         if let Some(option) = option {
@@ -191,6 +209,7 @@ pub(super) fn parse_args_os(
                 &mut plugin_config_seen,
                 &mut resume_seen,
                 &mut tui_seen,
+                &mut approval_mode_seen,
             )?;
             index += 2;
             continue;
@@ -210,6 +229,7 @@ pub(super) fn parse_args_os(
             || plugin_config_seen
             || resume_seen
             || tui_seen
+            || approval_mode_seen
             || reduced_motion_seen
         {
             return Err(ParseError::InvalidListSessionsOptions);
@@ -262,6 +282,7 @@ fn set_value(
     plugin_config_seen: &mut bool,
     resume_seen: &mut bool,
     tui_seen: &mut bool,
+    approval_mode_seen: &mut bool,
 ) -> Result<(), ParseError> {
     let (seen, maximum) = match option {
         "--prompt" => (&mut *prompt_seen, MAX_PROMPT_BYTES),
@@ -270,6 +291,7 @@ fn set_value(
         "--plugin-config" => (&mut *plugin_config_seen, MAX_PLUGIN_CONFIG_BYTES),
         "--resume" => (&mut *resume_seen, MAX_SESSION_ID_BYTES),
         "--tui" => (&mut *tui_seen, 8),
+        "--approval-mode" => (&mut *approval_mode_seen, MAX_APPROVAL_MODE_BYTES),
         _ => return Err(ParseError::UnknownOption),
     };
     mark_once(seen, option)?;
@@ -292,6 +314,14 @@ fn set_value(
                 "linear" => TuiMode::Linear,
                 _ => return Err(ParseError::InvalidTuiMode),
             }
+        }
+        "--approval-mode" => {
+            options.approval_mode = match value {
+                "ask" => ApprovalMode::Ask,
+                "auto-edit" => ApprovalMode::AutoEdit,
+                _ => return Err(ParseError::InvalidApprovalMode),
+            };
+            options.approval_mode_explicit = true;
         }
         _ => return Err(ParseError::UnknownOption),
     }
@@ -320,9 +350,9 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     use super::{
-        MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_MODEL_BYTES, MAX_PLUGIN_CONFIG_BYTES,
-        MAX_PROMPT_BYTES, MAX_SESSION_ID_BYTES, MAX_WORKSPACE_BYTES, ParseAction, ParseError,
-        TuiMode, admit_args_os, parse_args_os,
+        ApprovalMode, MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_MODEL_BYTES,
+        MAX_PLUGIN_CONFIG_BYTES, MAX_PROMPT_BYTES, MAX_SESSION_ID_BYTES, MAX_WORKSPACE_BYTES,
+        ParseAction, ParseError, TuiMode, admit_args_os, parse_args_os,
     };
 
     fn os(values: &[&str]) -> Vec<OsString> {
@@ -365,6 +395,8 @@ mod tests {
             "/tmp/plugins.json",
             "--tui",
             "enhanced",
+            "--approval-mode",
+            "auto-edit",
             "--reduced-motion",
             "--no-color",
         ]))
@@ -375,6 +407,7 @@ mod tests {
             "--workspace=/tmp/work",
             "--plugin-config=/tmp/plugins.json",
             "--tui=enhanced",
+            "--approval-mode=auto-edit",
             "--reduced-motion",
             "--no-color",
         ]))
@@ -388,6 +421,8 @@ mod tests {
         assert_eq!(options.workspace.as_deref(), Some("/tmp/work"));
         assert_eq!(options.plugin_config.as_deref(), Some("/tmp/plugins.json"));
         assert_eq!(options.tui, TuiMode::Enhanced);
+        assert_eq!(options.approval_mode, ApprovalMode::AutoEdit);
+        assert!(options.approval_mode_explicit);
         assert!(options.reduced_motion);
         assert!(options.no_color);
     }
@@ -425,6 +460,7 @@ mod tests {
             &["--no-color", "--no-color"][..],
             &["--reduced-motion", "--reduced-motion"][..],
             &["--tui", "auto", "--tui=linear"][..],
+            &["--approval-mode", "ask", "--approval-mode=auto-edit"][..],
         ] {
             assert!(matches!(
                 parse_args_os(os(values)),
@@ -442,6 +478,7 @@ mod tests {
             "--plugin-config",
             "--resume",
             "--tui",
+            "--approval-mode",
             "-p",
             "-m",
             "-w",
@@ -487,6 +524,7 @@ mod tests {
             &["--plugin-config="][..],
             &["--resume="][..],
             &["--tui="][..],
+            &["--approval-mode="][..],
         ] {
             assert!(matches!(
                 parse_args_os(os(values)),
@@ -572,6 +610,8 @@ mod tests {
         assert!(!options.no_color);
         assert!(!options.reduced_motion);
         assert_eq!(options.tui, TuiMode::Auto);
+        assert_eq!(options.approval_mode, ApprovalMode::Ask);
+        assert!(!options.approval_mode_explicit);
     }
 
     #[test]
@@ -594,6 +634,7 @@ mod tests {
             &["--list-sessions", "--plugin-config", "/tmp/plugins.json"][..],
             &["--list-sessions", "--tui", "linear"][..],
             &["--list-sessions", "--reduced-motion"][..],
+            &["--list-sessions", "--approval-mode", "auto-edit"][..],
             &[
                 "--list-sessions",
                 "--resume",
@@ -623,6 +664,35 @@ mod tests {
                 Err(ParseError::EmptyValue { option: "--tui" }) | Err(ParseError::InvalidTuiMode)
             ));
         }
+    }
+
+    #[test]
+    fn approval_mode_has_a_closed_process_local_surface() {
+        for (value, expected) in [
+            ("ask", ApprovalMode::Ask),
+            ("auto-edit", ApprovalMode::AutoEdit),
+        ] {
+            let ParseAction::Run(options) = parse_args_os(os(&["--approval-mode", value])).unwrap()
+            else {
+                panic!("expected run options");
+            };
+            assert_eq!(options.approval_mode, expected);
+            assert!(options.approval_mode_explicit);
+        }
+        for value in ["", "auto", "AUTO-EDIT", "allow"] {
+            assert!(matches!(
+                parse_args_os(os(&["--approval-mode", value])),
+                Err(ParseError::EmptyValue {
+                    option: "--approval-mode"
+                }) | Err(ParseError::InvalidApprovalMode)
+            ));
+        }
+        assert!(matches!(
+            parse_args_os(os(&["--approval-mode", "auto-edit "])),
+            Err(ParseError::ValueTooLarge {
+                option: "--approval-mode"
+            })
+        ));
     }
 
     #[test]
