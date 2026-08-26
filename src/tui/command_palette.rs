@@ -4,7 +4,7 @@ use std::fmt;
 
 use super::composer::Composer;
 
-pub(crate) const COMMAND_COUNT: usize = 7;
+pub(crate) const COMMAND_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandId {
@@ -13,6 +13,7 @@ pub(crate) enum CommandId {
     Review,
     Focus,
     Theme,
+    Motion,
     Exit,
     Quit,
 }
@@ -24,6 +25,7 @@ impl CommandId {
         Self::Review,
         Self::Focus,
         Self::Theme,
+        Self::Motion,
         Self::Exit,
         Self::Quit,
     ];
@@ -35,6 +37,7 @@ impl CommandId {
             Self::Review => "/review",
             Self::Focus => "/focus",
             Self::Theme => "/theme",
+            Self::Motion => "/motion",
             Self::Exit => "/exit",
             Self::Quit => "/quit",
         }
@@ -47,6 +50,7 @@ impl CommandId {
             Self::Review => "review last settled turn",
             Self::Focus => "return to Focus",
             Self::Theme => "show or select theme",
+            Self::Motion => "show or select motion",
             Self::Exit => "clean up and exit",
             Self::Quit => "clean up and exit",
         }
@@ -276,7 +280,7 @@ mod tests {
 
     #[test]
     fn catalogue_and_prefixes_are_closed_ordered_and_ascii() {
-        assert_eq!(CommandId::ALL.len(), 7);
+        assert_eq!(CommandId::ALL.len(), 8);
         assert_eq!(CommandId::ALL[0], CommandId::Help);
         for (index, command) in CommandId::ALL.into_iter().enumerate() {
             assert!(command.command().is_ascii());

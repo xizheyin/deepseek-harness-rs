@@ -114,6 +114,16 @@ pub(super) struct TerminalSize {
 }
 
 impl AsyncTerminal {
+    #[cfg(test)]
+    pub(super) fn from_owned_fds_for_test(input: OwnedFd, output: OwnedFd) -> Self {
+        Self {
+            input: AsyncFd::with_interest(input, Interest::READABLE)
+                .expect("test input descriptor should register"),
+            output: AsyncFd::with_interest(output, Interest::WRITABLE)
+                .expect("test output descriptor should register"),
+        }
+    }
+
     pub(super) fn revalidate(&self) -> Result<(), TerminalError> {
         validate_descriptors(self.input.get_ref().as_fd(), self.output.get_ref().as_fd())
     }

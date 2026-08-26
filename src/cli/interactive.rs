@@ -27,6 +27,10 @@ use crate::{
         },
         input_memory::{InputMemory, InputMemoryError, LocalPromptId},
         key_decoder::{InputEvent, Key, KeyDecoder},
+        motion::{
+            MotionCommand, MotionPreference, MotionRequest, MotionState, WorkingAge, WorkingPhase,
+            WorkingPresentation,
+        },
         theme::{ThemeCommand, ThemePalette, ThemeRequest, ThemeState},
         view::{ContextEstimate, ViewMode, ViewRequest, ViewState},
     },
@@ -65,6 +69,10 @@ const FRAME_DEADLINE: Duration = Duration::from_secs(5);
 const VISUAL_RESET_DEADLINE: Duration = Duration::from_millis(250);
 const APPROVAL_INPUT_QUIET: Duration = Duration::from_millis(100);
 const PASTE_INPUT_QUIET: Duration = Duration::from_millis(100);
+const MOTION_DELAY: Duration = Duration::from_millis(300);
+const MOTION_INTERVAL: Duration = Duration::from_millis(125);
+const MOTION_ONE_SECOND: Duration = Duration::from_secs(1);
+const MOTION_LONG_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(super) enum InteractiveError {
@@ -128,12 +136,20 @@ enum PendingOutput {
     Prepared(PreparedPresentation),
     Linear(PendingLiveFrame),
     Dock(DockInteraction),
+    MotionDock {
+        interaction: DockInteraction,
+        working: WorkingPresentation,
+    },
     Inline(PendingInlineOutput),
 }
 
 enum InlineIntent {
     Transcript(PreparedPresentation),
     Dock(DockInteraction),
+    MotionDock {
+        interaction: DockInteraction,
+        working: WorkingPresentation,
+    },
 }
 
 struct PendingInlineOutput {
@@ -147,6 +163,7 @@ struct PendingInlineOutput {
 struct SurfaceCommit {
     request: ViewRequest,
     theme: ThemeRequest,
+    motion: MotionRequest,
     offset: usize,
     total_rows: usize,
     page_rows: usize,
@@ -160,7 +177,9 @@ struct EnhancedSurface {
 impl PendingOutput {
     fn bytes(&self) -> &[u8] {
         match self {
-            Self::Unprepared(_) | Self::Prepared(_) | Self::Dock(_) => &[],
+            Self::Unprepared(_) | Self::Prepared(_) | Self::Dock(_) | Self::MotionDock { .. } => {
+                &[]
+            }
             Self::Linear(frame) => frame.bytes(),
             Self::Inline(output) => output.write.bytes(),
         }
@@ -168,7 +187,9 @@ impl PendingOutput {
 
     fn advance(&mut self, count: usize) -> Result<(), InteractiveError> {
         match self {
-            Self::Unprepared(_) | Self::Prepared(_) | Self::Dock(_) => Err(InteractiveError::Agent),
+            Self::Unprepared(_) | Self::Prepared(_) | Self::Dock(_) | Self::MotionDock { .. } => {
+                Err(InteractiveError::Agent)
+            }
             Self::Linear(frame) => frame.advance(count).map_err(|_| InteractiveError::Output),
             Self::Inline(output) => output.write.advance(count).map_err(map_inline_screen_error),
         }
@@ -176,10 +197,23 @@ impl PendingOutput {
 
     fn has_started(&self) -> bool {
         match self {
-            Self::Unprepared(_) | Self::Prepared(_) | Self::Dock(_) => false,
+            Self::Unprepared(_) | Self::Prepared(_) | Self::Dock(_) | Self::MotionDock { .. } => {
+                false
+            }
             Self::Linear(_) => false,
             Self::Inline(output) => output.write.has_started(),
         }
+    }
+
+    fn is_motion_only(&self) -> bool {
+        matches!(self, Self::MotionDock { .. })
+            || matches!(
+                self,
+                Self::Inline(PendingInlineOutput {
+                    intent: InlineIntent::MotionDock { .. },
+                    ..
+                })
+            )
     }
 }
 
@@ -188,6 +222,13 @@ impl InlineIntent {
         match self {
             Self::Transcript(presentation) => PendingOutput::Prepared(presentation),
             Self::Dock(interaction) => PendingOutput::Dock(interaction),
+            Self::MotionDock {
+                interaction,
+                working,
+            } => PendingOutput::MotionDock {
+                interaction,
+                working,
+            },
         }
     }
 }
@@ -217,10 +258,11 @@ pub(super) async fn run(
     terminal: AsyncTerminal,
     signals: &mut SignalStreams,
     presentation: InteractivePresentation,
+    reduced_motion: bool,
 ) -> Result<u8, InteractiveError> {
     let enhanced = presentation_uses_enhanced(presentation, terminal.size());
     if enhanced {
-        run_enhanced(assembly, terminal, signals).await
+        run_enhanced(assembly, terminal, signals, reduced_motion).await
     } else {
         run_linear(assembly, terminal, signals, false).await
     }
@@ -240,6 +282,7 @@ async fn run_enhanced(
     assembly: InteractiveAssembly,
     terminal: AsyncTerminal,
     signals: &mut SignalStreams,
+    reduced_motion: bool,
 ) -> Result<u8, InteractiveError> {
     let InteractiveAssembly {
         mut agent,
@@ -328,6 +371,11 @@ async fn run_enhanced(
     let mut command_palette = CommandPaletteState::default();
     let mut view = ViewState::default();
     let mut theme = ThemeState::default();
+    let mut motion = MotionState::new(if reduced_motion {
+        MotionPreference::Reduced
+    } else {
+        MotionPreference::Full
+    });
     let mut notice = None;
     let mut screen = InlineScreen::default();
     let _ = file_suggestions
@@ -347,6 +395,7 @@ async fn run_enhanced(
         &mut screen,
         &mut view,
         &mut theme,
+        &mut motion,
         &mut file_suggestions,
     )
     .await;
@@ -417,9 +466,11 @@ async fn run_enhanced(
                         last_size: &mut last_size,
                         view: &mut view,
                         theme: &mut theme,
+                        motion: &mut motion,
                         command_palette: &mut command_palette,
                         file_suggestions: &mut file_suggestions,
                         palette_suppressed: false,
+                        working: WorkingPresentation::STATIC,
                     };
                     pending_signal = suspend_enhanced(
                         &mut terminal,
@@ -457,6 +508,7 @@ async fn run_enhanced(
                         Some(&mut file_suggestions),
                         &mut view,
                         &theme,
+                        &motion,
                         last_size,
                         &mut notice,
                     )?
@@ -472,6 +524,7 @@ async fn run_enhanced(
                         Some(&mut file_suggestions),
                         &mut view,
                         &theme,
+                        &motion,
                         last_size,
                         &mut notice,
                     )?;
@@ -493,7 +546,9 @@ async fn run_enhanced(
                     let local_command = !auto_submit
                         && matches!(
                             composer_submission,
-                            EnhancedSubmission::Command(_) | EnhancedSubmission::Theme(_)
+                            EnhancedSubmission::Command(_)
+                                | EnhancedSubmission::Theme(_)
+                                | EnhancedSubmission::Motion(_)
                         );
                     let (draft, cursor) = if local_command {
                         let cursor = input.composer().cursor();
@@ -526,7 +581,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/inspect | /review | /focus | /theme | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -549,12 +604,22 @@ async fn run_enhanced(
                                     &mut notice,
                                 )?;
                             }
+                            CommandId::Motion => {
+                                apply_motion_command(
+                                    MotionCommand::Show,
+                                    &mut motion,
+                                    &mut notice,
+                                )?;
+                            }
                             CommandId::Exit | CommandId::Quit => {
                                 break Ok(InteractiveExit::Ordinary(0));
                             }
                         },
                         EnhancedSubmission::Theme(command) => {
                             apply_theme_command(command, &mut theme, &mut notice)?;
+                        }
+                        EnhancedSubmission::Motion(command) => {
+                            apply_motion_command(command, &mut motion, &mut notice)?;
                         }
                         EnhancedSubmission::Prompt => {
                             let prompt = copy_enhanced_prompt(&draft)?;
@@ -567,9 +632,11 @@ async fn run_enhanced(
                                 last_size: &mut last_size,
                                 view: &mut view,
                                 theme: &mut theme,
+                                motion: &mut motion,
                                 command_palette: &mut command_palette,
                                 file_suggestions: &mut file_suggestions,
                                 palette_suppressed: false,
+                                working: WorkingPresentation::STATIC,
                             };
                             let _ = active_dock
                                 .view
@@ -647,9 +714,11 @@ async fn run_enhanced(
                                         last_size: &mut last_size,
                                         view: &mut view,
                                         theme: &mut theme,
+                                        motion: &mut motion,
                                         command_palette: &mut command_palette,
                                         file_suggestions: &mut file_suggestions,
                                         palette_suppressed: false,
+                                        working: WorkingPresentation::STATIC,
                                     };
                                     pending_signal = suspend_enhanced(
                                         &mut terminal,
@@ -692,6 +761,7 @@ async fn run_enhanced(
                 &mut screen,
                 &mut view,
                 &mut theme,
+                &mut motion,
                 &mut file_suggestions,
             )
             .await?;
@@ -721,6 +791,7 @@ async fn run_enhanced(
                             &mut screen,
                             &mut view,
                             &mut theme,
+                            &mut motion,
                             &mut file_suggestions,
                         )
                         .await?;
@@ -1007,6 +1078,7 @@ enum EnhancedSubmission {
     Empty,
     Command(CommandId),
     Theme(ThemeCommand),
+    Motion(MotionCommand),
     Prompt,
 }
 
@@ -1018,9 +1090,38 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         EnhancedSubmission::Command(command)
     } else if let Some(theme) = ThemeCommand::parse(command) {
         EnhancedSubmission::Theme(theme)
+    } else if let Some(motion) = MotionCommand::parse(command) {
+        EnhancedSubmission::Motion(motion)
     } else {
         EnhancedSubmission::Prompt
     }
+}
+
+const MOTION_LIST_NOTICE: &str = "Motion modes · full · reduced";
+
+fn apply_motion_command(
+    command: MotionCommand,
+    motion: &mut MotionState,
+    notice: &mut Option<String>,
+) -> Result<(), InteractiveError> {
+    *notice = Some(match command {
+        MotionCommand::Show => format!(
+            "Motion · {} | {MOTION_LIST_NOTICE}",
+            motion.requested().preference().name()
+        ),
+        MotionCommand::Select(preference) => {
+            let changed = motion
+                .request(preference)
+                .map_err(|_| InteractiveError::Output)?;
+            if changed {
+                format!("Motion changed · {}", preference.name())
+            } else {
+                format!("Motion already active · {}", preference.name())
+            }
+        }
+        MotionCommand::Invalid => format!("Unknown motion mode | {MOTION_LIST_NOTICE}"),
+    });
+    Ok(())
 }
 
 const THEME_LIST_NOTICE: &str =
@@ -1062,6 +1163,7 @@ fn apply_enhanced_input(
     mut file_suggestions: Option<&mut FileSuggestionController>,
     view: &mut ViewState,
     theme: &ThemeState,
+    motion: &MotionState,
     size: super::terminal::TerminalSize,
     notice: &mut Option<String>,
 ) -> Result<EnhancedInputAction, InteractiveError> {
@@ -1074,7 +1176,8 @@ fn apply_enhanced_input(
         }
         return Ok(EnhancedInputAction::Redraw);
     }
-    if view.requested() != view.committed() || theme.is_transitioning() {
+    if view.requested() != view.committed() || theme.is_transitioning() || motion.is_transitioning()
+    {
         decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
         return Ok(EnhancedInputAction::Redraw);
     }
@@ -1298,6 +1401,7 @@ fn expire_enhanced_escape(
     mut file_suggestions: Option<&mut FileSuggestionController>,
     view: &mut ViewState,
     theme: &ThemeState,
+    motion: &MotionState,
     size: TerminalSize,
     notice: &mut Option<String>,
 ) -> Result<EnhancedInputAction, InteractiveError> {
@@ -1310,7 +1414,8 @@ fn expire_enhanced_escape(
         }
         return Ok(EnhancedInputAction::Redraw);
     }
-    if view.requested() != view.committed() || theme.is_transitioning() {
+    if view.requested() != view.committed() || theme.is_transitioning() || motion.is_transitioning()
+    {
         decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
         return Ok(EnhancedInputAction::Redraw);
     }
@@ -1419,7 +1524,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/inspect · /review · /focus · /theme · /help · /exit · /quit · Enter send · Ctrl+J newline"
+                "/inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -1492,6 +1597,7 @@ async fn render_enhanced_dock(
     screen: &mut InlineScreen,
     view: &mut ViewState,
     theme: &mut ThemeState,
+    motion: &mut MotionState,
     file_suggestions: &mut FileSuggestionController,
 ) -> Result<Option<UiSignal>, InteractiveError> {
     loop {
@@ -1529,8 +1635,10 @@ async fn render_enhanced_dock(
             size,
             view,
             theme,
+            motion,
             model.live,
             file_snapshot,
+            WorkingPresentation::PLAIN,
         )?;
         let write = stage_surface(
             screen,
@@ -1542,7 +1650,7 @@ async fn render_enhanced_dock(
         match write_screen_transaction(terminal.output_terminal(), signals, screen, write).await? {
             ScreenWriteOutcome::Complete => {
                 *last_size = size;
-                commit_surface(view, theme, surface.commit);
+                commit_surface(view, theme, motion, surface.commit);
                 file_suggestions.commit_presentation(staged);
                 return Ok(None);
             }
@@ -1616,8 +1724,10 @@ async fn render_active_dock(
             size,
             dock.view,
             dock.theme,
+            dock.motion,
             live,
             file_snapshot,
+            dock.working,
         )?;
         let write = stage_surface(
             dock.screen,
@@ -1629,7 +1739,7 @@ async fn render_active_dock(
         match write_screen_transaction(terminal, signals, dock.screen, write).await? {
             ScreenWriteOutcome::Complete => {
                 *dock.last_size = size;
-                commit_surface(dock.view, dock.theme, surface.commit);
+                commit_surface(dock.view, dock.theme, dock.motion, surface.commit);
                 dock.file_suggestions.commit_presentation(staged);
                 return Ok(None);
             }
@@ -1681,6 +1791,7 @@ fn enhanced_dock_frame(
     interaction: DockInteraction,
     size: TerminalSize,
     file_suggestions: FileSuggestionSnapshot<'_>,
+    working: WorkingPresentation,
 ) -> Result<DockFrame, InteractiveError> {
     DockFrame::layout(
         DockModel {
@@ -1689,6 +1800,7 @@ fn enhanced_dock_frame(
             queue: input.queue(),
             notice,
             file_suggestions,
+            working,
         },
         size.rows,
         size.columns,
@@ -1738,8 +1850,10 @@ fn enhanced_surface_frame(
     size: TerminalSize,
     view: &mut ViewState,
     theme: &ThemeState,
+    motion: &MotionState,
     live: &LiveRenderer,
     file_suggestions: FileSuggestionSnapshot<'_>,
+    working: WorkingPresentation,
 ) -> Result<EnhancedSurface, InteractiveError> {
     if !matches!(
         interaction,
@@ -1759,8 +1873,10 @@ fn enhanced_surface_frame(
         size,
         request,
         theme.requested(),
+        motion.requested(),
         live,
         file_suggestions,
+        working,
     )
 }
 
@@ -1772,15 +1888,26 @@ fn enhanced_surface_frame_for_request(
     size: TerminalSize,
     request: ViewRequest,
     theme: ThemeRequest,
+    motion: MotionRequest,
     live: &LiveRenderer,
     file_suggestions: FileSuggestionSnapshot<'_>,
+    working: WorkingPresentation,
 ) -> Result<EnhancedSurface, InteractiveError> {
+    let working = normalize_working_presentation(working, motion.preference());
     match request.mode() {
         ViewMode::Focus => Ok(EnhancedSurface {
-            frame: enhanced_dock_frame(input, notice, interaction, size, file_suggestions)?,
+            frame: enhanced_dock_frame(
+                input,
+                notice,
+                interaction,
+                size,
+                file_suggestions,
+                working,
+            )?,
             commit: SurfaceCommit {
                 request,
                 theme,
+                motion,
                 offset: 0,
                 total_rows: 0,
                 page_rows: 0,
@@ -1801,27 +1928,53 @@ fn enhanced_surface_frame_for_request(
                     .map_err(map_dock_error)?;
             Ok(EnhancedSurface {
                 frame,
-                commit: surface_commit(request, theme, viewport),
+                commit: surface_commit(request, theme, motion, viewport),
             })
         }
     }
 }
 
+fn normalize_working_presentation(
+    working: WorkingPresentation,
+    preference: MotionPreference,
+) -> WorkingPresentation {
+    let age = match (preference, working.age) {
+        (MotionPreference::Reduced, WorkingAge::OneSecond { .. }) => {
+            WorkingAge::OneSecond { seconds: 1 }
+        }
+        (MotionPreference::Reduced, WorkingAge::Long { .. }) => WorkingAge::Long { seconds: 5 },
+        (_, age) => age,
+    };
+    let phase = match preference {
+        MotionPreference::Reduced => WorkingPhase::Static,
+        MotionPreference::Full if working.phase == WorkingPhase::Plain => WorkingPhase::Static,
+        MotionPreference::Full => working.phase,
+    };
+    WorkingPresentation { phase, age }
+}
+
 fn surface_commit(
     request: ViewRequest,
     theme: ThemeRequest,
+    motion: MotionRequest,
     viewport: DetailViewport,
 ) -> SurfaceCommit {
     SurfaceCommit {
         request,
         theme,
+        motion,
         offset: viewport.offset,
         total_rows: viewport.total_rows,
         page_rows: viewport.page_rows,
     }
 }
 
-fn commit_surface(view: &mut ViewState, theme: &mut ThemeState, commit: SurfaceCommit) {
+fn commit_surface(
+    view: &mut ViewState,
+    theme: &mut ThemeState,
+    motion: &mut MotionState,
+    commit: SurfaceCommit,
+) {
     let _ = view.commit(
         commit.request,
         commit.offset,
@@ -1829,6 +1982,7 @@ fn commit_surface(view: &mut ViewState, theme: &mut ThemeState, commit: SurfaceC
         commit.page_rows,
     );
     let _ = theme.commit(commit.theme);
+    let _ = motion.commit(commit.motion);
 }
 
 fn stage_surface(
@@ -2064,6 +2218,7 @@ async fn suspend_enhanced(
                 dock.screen,
                 dock.view,
                 dock.theme,
+                dock.motion,
                 dock.file_suggestions,
             )
             .await;
@@ -2238,6 +2393,22 @@ async fn run_linear(
                             }
                         }
                     }
+                    IdleInput::Motion(command) => {
+                        let message = if matches!(command, MotionCommand::Invalid) {
+                            "[unknown motion mode; linear UI has no periodic animation]\n"
+                        } else {
+                            "[linear UI has no periodic animation]\n"
+                        };
+                        if let Some(signal) =
+                            write_notice(message, &mut presenter, &terminal, signals).await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
                     IdleInput::Exit => return Ok(InteractiveExit::Ordinary(0)),
                     IdleInput::Submit(prompt) => {
                         parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
@@ -2345,9 +2516,224 @@ struct ActiveDock<'a> {
     last_size: &'a mut TerminalSize,
     view: &'a mut ViewState,
     theme: &'a mut ThemeState,
+    motion: &'a mut MotionState,
     command_palette: &'a mut CommandPaletteState,
     file_suggestions: &'a mut FileSuggestionController,
     palette_suppressed: bool,
+    working: WorkingPresentation,
+}
+
+struct MotionClock {
+    turn: TurnId,
+    generation: u64,
+    started_at: Instant,
+    eligible_since: Option<Instant>,
+    next_phase: Option<Instant>,
+    phase: u8,
+    animated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MotionTick {
+    turn: TurnId,
+    generation: u64,
+    preference: MotionPreference,
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MotionEligibility {
+    enhanced: bool,
+    turn_open: bool,
+    approval_inactive: bool,
+    no_question: bool,
+    focus: bool,
+    no_notice: bool,
+    queue_empty: bool,
+    file_hidden: bool,
+    palette_hidden: bool,
+    motion_committed: bool,
+}
+
+impl MotionEligibility {
+    fn is_eligible(self) -> bool {
+        self.enhanced
+            && self.turn_open
+            && self.approval_inactive
+            && self.no_question
+            && self.focus
+            && self.no_notice
+            && self.queue_empty
+            && self.file_hidden
+            && self.palette_hidden
+            && self.motion_committed
+    }
+}
+
+impl MotionClock {
+    fn new(turn: TurnId) -> Self {
+        Self {
+            turn,
+            generation: 0,
+            started_at: Instant::now(),
+            eligible_since: None,
+            next_phase: None,
+            phase: 0,
+            animated: false,
+        }
+    }
+
+    fn synchronize(&mut self, turn: TurnId, eligible: bool) -> Result<bool, InteractiveError> {
+        if turn != self.turn {
+            return Err(InteractiveError::Agent);
+        }
+        if eligible == self.eligible_since.is_some() {
+            return Ok(false);
+        }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(InteractiveError::Output)?;
+        self.animated = false;
+        self.phase = 0;
+        if eligible {
+            let now = Instant::now();
+            self.eligible_since = Some(now);
+            self.next_phase = Some(now + MOTION_DELAY);
+        } else {
+            self.eligible_since = None;
+            self.next_phase = None;
+        }
+        Ok(true)
+    }
+
+    fn presentation(
+        &self,
+        preference: MotionPreference,
+        phase: WorkingPhase,
+    ) -> WorkingPresentation {
+        let elapsed = Instant::now().saturating_duration_since(self.started_at);
+        let seconds = elapsed.as_secs();
+        let age = if elapsed >= MOTION_LONG_WAIT {
+            WorkingAge::Long {
+                seconds: if preference == MotionPreference::Reduced {
+                    5
+                } else {
+                    seconds
+                },
+            }
+        } else if elapsed >= MOTION_ONE_SECOND {
+            WorkingAge::OneSecond {
+                seconds: if preference == MotionPreference::Reduced {
+                    1
+                } else {
+                    seconds
+                },
+            }
+        } else {
+            WorkingAge::Fresh
+        };
+        let phase = match preference {
+            MotionPreference::Reduced => WorkingPhase::Static,
+            MotionPreference::Full => phase,
+        };
+        WorkingPresentation { phase, age }
+    }
+
+    fn deadline(
+        &self,
+        preference: MotionPreference,
+        committed: WorkingPresentation,
+    ) -> Option<MotionTick> {
+        self.eligible_since?;
+        let deadline = match preference {
+            MotionPreference::Full => self.next_phase,
+            MotionPreference::Reduced => {
+                let now = Instant::now();
+                let current = self.presentation(preference, WorkingPhase::Static);
+                if current != committed {
+                    return Some(MotionTick {
+                        turn: self.turn,
+                        generation: self.generation,
+                        preference,
+                        deadline: now,
+                    });
+                }
+                for deadline in [
+                    self.started_at + MOTION_ONE_SECOND,
+                    self.started_at + MOTION_LONG_WAIT,
+                ] {
+                    if deadline > now {
+                        return Some(MotionTick {
+                            turn: self.turn,
+                            generation: self.generation,
+                            preference,
+                            deadline,
+                        });
+                    }
+                }
+                None
+            }
+        }?;
+        Some(MotionTick {
+            turn: self.turn,
+            generation: self.generation,
+            preference,
+            deadline,
+        })
+    }
+
+    fn advance(
+        &mut self,
+        tick: MotionTick,
+        requested: MotionRequest,
+        committed: MotionRequest,
+    ) -> Option<WorkingPresentation> {
+        if tick.turn != self.turn
+            || tick.generation != self.generation
+            || self.eligible_since.is_none()
+            || requested != committed
+            || tick.preference != committed.preference()
+        {
+            return None;
+        }
+        let now = Instant::now();
+        match tick.preference {
+            MotionPreference::Reduced => {
+                Some(self.presentation(MotionPreference::Reduced, WorkingPhase::Static))
+            }
+            MotionPreference::Full => {
+                if self.next_phase != Some(tick.deadline) || tick.deadline > now {
+                    return None;
+                }
+                if self.animated {
+                    self.phase = (self.phase + 1) % 4;
+                } else {
+                    self.animated = true;
+                    self.phase = 0;
+                }
+                self.next_phase = Some(now + MOTION_INTERVAL);
+                Some(self.presentation(MotionPreference::Full, WorkingPhase::Animated(self.phase)))
+            }
+        }
+    }
+}
+
+fn synchronize_motion_clock(
+    clock: &mut MotionClock,
+    turn: TurnId,
+    eligible: bool,
+    preference: MotionPreference,
+    committed: &mut WorkingPresentation,
+) -> Result<(), InteractiveError> {
+    if clock.synchronize(turn, eligible)? {
+        // A new eligibility generation always starts from the stable phase.
+        // Keeping an old completed animation phase here would replay it before
+        // the fresh 300 ms delay. Elapsed time remains a turn fact, so it still
+        // comes from the original turn-owned clock.
+        *committed = clock.presentation(preference, WorkingPhase::Static);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -2680,7 +3066,7 @@ fn prepare_pending_for_resize(
         && !matches!(
             pending.as_ref(),
             Some(PendingOutput::Inline(PendingInlineOutput {
-                intent: InlineIntent::Dock(_),
+                intent: InlineIntent::Dock(_) | InlineIntent::MotionDock { .. },
                 ..
             }))
         )
@@ -2690,8 +3076,9 @@ fn prepare_pending_for_resize(
     let Some(output) = pending.take() else {
         return Ok(false);
     };
+    let motion_only = output.is_motion_only();
     let mut recover_visual_state = false;
-    *pending = Some(match output {
+    let restored = match output {
         PendingOutput::Inline(output) => {
             recover_visual_state = output.write.has_started();
             screen.abort(output.write);
@@ -2701,7 +3088,10 @@ fn prepare_pending_for_resize(
             output.intent.into_pending()
         }
         output => output,
-    });
+    };
+    if !motion_only {
+        *pending = Some(restored);
+    }
     Ok(recover_visual_state)
 }
 
@@ -2781,7 +3171,10 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
     let mut stop = None;
     let mut prefer_input = true;
     let mut dock_redraw_requested = false;
+    let mut motion_reattach_required = false;
+    let mut motion_reattach_wait_for_fact = false;
     let mut input_escape_deadline = None;
+    let mut motion_clock = MotionClock::new(turn);
 
     let result = {
         let future = active
@@ -2809,6 +3202,29 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     dock.file_suggestions,
                     active.enhanced_decoder.as_deref_mut(),
                     &mut input_escape_deadline,
+                )?;
+                let file_snapshot = dock.file_suggestions.snapshot();
+                let palette_snapshot = active_command_palette_snapshot(input, dock);
+                let eligible = MotionEligibility {
+                    enhanced: active.enhanced,
+                    turn_open: !turn_end_seen,
+                    approval_inactive: approval_ui.is_inactive(),
+                    no_question: active.joins.question().is_none(),
+                    focus: dock.view.requested().mode() == ViewMode::Focus,
+                    no_notice: active.queue_notice.as_deref().is_none_or(|notice| notice.is_none()),
+                    queue_empty: input.queue().len() == 0,
+                    file_hidden: !file_snapshot.is_visible(),
+                    palette_hidden: !palette_snapshot.is_visible(),
+                    motion_committed: !dock.motion.is_transitioning()
+                        && dock.motion.requested() == dock.motion.committed(),
+                }
+                .is_eligible();
+                synchronize_motion_clock(
+                    &mut motion_clock,
+                    turn,
+                    eligible,
+                    dock.motion.committed().preference(),
+                    &mut dock.working,
                 )?;
             }
             if latch_observer_fault(active.events, &mut stop, &cancellation) {
@@ -2859,6 +3275,43 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         error,
                     );
                     continue;
+                }
+            }
+
+            if motion_reattach_required {
+                motion_reattach_required = false;
+                motion_reattach_wait_for_fact = false;
+                let reattached = reattach_motion_screen(
+                    active.terminal,
+                    active.signals,
+                    active
+                        .queued_input
+                        .as_deref()
+                        .ok_or(InteractiveError::Agent)?,
+                    active.queue_notice.as_deref().and_then(Option::as_deref),
+                    approval_ui.dock_interaction(),
+                    active.live,
+                    active.active_dock.as_mut().ok_or(InteractiveError::Agent)?,
+                )
+                .await;
+                match reattached {
+                    Ok(Some(signal)) => {
+                        observe_signal(&mut stop, signal);
+                        cancellation.cancel();
+                        discard_pending(&mut pending, active.presenter);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        latch_active_failure(
+                            &mut stop,
+                            &cancellation,
+                            &mut pending,
+                            active.presenter,
+                            error,
+                        );
+                        continue;
+                    }
                 }
             }
 
@@ -2999,6 +3452,9 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 approval_ui.arm_deadline(),
                 approval_ui.escape_deadline(),
                 input_escape_deadline,
+                active.active_dock.as_ref().and_then(|dock| {
+                    motion_clock.deadline(dock.motion.committed().preference(), dock.working)
+                }),
                 !(pending.is_some() && approval_ui.suppresses_read_while_pending()),
                 prefer_input,
             );
@@ -3049,8 +3505,63 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         }
                     }
                 }
-                result = &mut future => break Ok(result),
+                result = &mut future => {
+                    if preempt_motion_pending(
+                        &mut pending,
+                        &mut frame_deadline,
+                        &mut after_frame,
+                        active.active_dock.as_mut(),
+                    ) {
+                        let dock = active.active_dock.as_mut().ok_or(InteractiveError::Agent)?;
+                        let recovered =
+                            recover_poisoned_screen(active.terminal, active.signals, dock.screen)
+                                .await;
+                        match recovered {
+                            Ok(Some(signal)) => {
+                                observe_signal(&mut stop, signal);
+                                cancellation.cancel();
+                            }
+                            Ok(None) => {
+                                motion_reattach_required = true;
+                                motion_reattach_wait_for_fact = true;
+                            }
+                            Err(error) => {
+                                observe_failure(&mut stop, error);
+                                cancellation.cancel();
+                            }
+                        }
+                    }
+                    break Ok(result);
+                },
                 settlement = wait_active_file_suggestion(active.active_dock.as_mut()), if suggestion_running => {
+                    if preempt_motion_pending(
+                        &mut pending,
+                        &mut frame_deadline,
+                        &mut after_frame,
+                        active.active_dock.as_mut(),
+                    ) {
+                        let dock = active.active_dock.as_mut().ok_or(InteractiveError::Agent)?;
+                        match recover_poisoned_screen(active.terminal, active.signals, dock.screen)
+                            .await
+                        {
+                            Ok(Some(signal)) => {
+                                observe_signal(&mut stop, signal);
+                                cancellation.cancel();
+                                continue;
+                            }
+                            Ok(None) => motion_reattach_required = true,
+                            Err(error) => {
+                                latch_active_failure(
+                                    &mut stop,
+                                    &cancellation,
+                                    &mut pending,
+                                    active.presenter,
+                                    error,
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     let dock = active.active_dock.as_mut().ok_or(InteractiveError::Agent)?;
                     let _ = dock
                         .file_suggestions
@@ -3060,6 +3571,56 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 }
                 work = work => {
                     prefer_input = !prefer_input;
+                    let preempts_motion = matches!(
+                        &work,
+                        UiWork::ApprovalArmed
+                            | UiWork::EscapeExpired
+                            | UiWork::InputEscapeExpired
+                            | UiWork::Envelope(_)
+                            | UiWork::Event(_)
+                            | UiWork::Read(_)
+                    );
+                    let motion_write_started = preempts_motion
+                        && preempt_motion_pending(
+                            &mut pending,
+                            &mut frame_deadline,
+                            &mut after_frame,
+                            active.active_dock.as_mut(),
+                        );
+                    if motion_write_started {
+                        let dock = active.active_dock.as_mut().ok_or(InteractiveError::Agent)?;
+                        match recover_poisoned_screen(
+                            active.terminal,
+                            active.signals,
+                            dock.screen,
+                        )
+                        .await {
+                            Ok(Some(signal)) => {
+                                observe_signal(&mut stop, signal);
+                                cancellation.cancel();
+                                continue;
+                            }
+                            Ok(None) => motion_reattach_required = true,
+                            Err(error) => {
+                                latch_active_failure(
+                                    &mut stop,
+                                    &cancellation,
+                                    &mut pending,
+                                    active.presenter,
+                                    error,
+                                );
+                                continue;
+                            }
+                        }
+                        if fences_ordinary_input_after_motion_preemption(&work) {
+                            if let Some(decoder) = active.enhanced_decoder.as_deref_mut() {
+                                decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
+                            }
+                            input_escape_deadline = None;
+                            dock_redraw_requested = true;
+                            continue;
+                        }
+                    }
                     match work {
                         UiWork::FrameExpired => latch_active_failure(
                             &mut stop,
@@ -3068,6 +3629,21 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             active.presenter,
                             InteractiveError::Output,
                         ),
+                        UiWork::MotionTick(tick) => {
+                            let dock = active.active_dock.as_mut().ok_or(InteractiveError::Agent)?;
+                            if let Some(working) = motion_clock.advance(
+                                tick,
+                                dock.motion.requested(),
+                                dock.motion.committed(),
+                            ) {
+                                enqueue_motion_dock(
+                                    working,
+                                    &mut pending,
+                                    &mut frame_deadline,
+                                    &mut after_frame,
+                                )?;
+                            }
+                        }
                         UiWork::ApprovalArmed => {
                             let prepared = approval_ui
                                 .begin_rendering(active.terminal, active.color, active.enhanced)
@@ -3517,6 +4093,36 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     continue;
                 }
             }
+            if motion_reattach_required && (!motion_reattach_wait_for_fact || pending.is_some()) {
+                motion_reattach_required = false;
+                motion_reattach_wait_for_fact = false;
+                let reattached = reattach_motion_screen(
+                    active.terminal,
+                    active.signals,
+                    active
+                        .queued_input
+                        .as_deref()
+                        .ok_or(InteractiveError::Agent)?,
+                    active.queue_notice.as_deref().and_then(Option::as_deref),
+                    approval_ui.dock_interaction(),
+                    active.live,
+                    active.active_dock.as_mut().ok_or(InteractiveError::Agent)?,
+                )
+                .await;
+                match reattached {
+                    Ok(Some(signal)) => {
+                        observe_signal(&mut stop, signal);
+                        discard_pending(&mut pending, active.presenter);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        observe_failure(&mut stop, error);
+                        discard_pending(&mut pending, active.presenter);
+                        continue;
+                    }
+                }
+            }
             if let Err(error) = complete_ready_frame(
                 &mut pending,
                 &mut frame_deadline,
@@ -3576,7 +4182,9 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 approval_ui.arm_deadline(),
                 approval_ui.escape_deadline(),
                 input_escape_deadline,
-                !(pending.is_some() && approval_ui.suppresses_read_while_pending()),
+                None,
+                !(motion_reattach_wait_for_fact
+                    || pending.is_some() && approval_ui.suppresses_read_while_pending()),
                 prefer_input,
             );
             tokio::select! {
@@ -3914,6 +4522,10 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             observe_failure(&mut stop, InteractiveError::TerminalUnavailable);
                             discard_pending(&mut pending, active.presenter);
                         }
+                        UiWork::MotionTick(_) => {
+                            observe_failure(&mut stop, InteractiveError::Agent);
+                            discard_pending(&mut pending, active.presenter);
+                        }
                     }
                 }
             }
@@ -4066,6 +4678,7 @@ fn handle_active_input(
         Some(dock.file_suggestions),
         dock.view,
         dock.theme,
+        dock.motion,
         size,
         notice,
     )? {
@@ -4085,7 +4698,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/inspect | /review | /focus | /theme | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -4107,12 +4720,21 @@ fn handle_active_input(
                             let _ = input.take_draft_for_turn()?;
                             apply_theme_command(ThemeCommand::Show, dock.theme, notice)?;
                         }
+                        CommandId::Motion => {
+                            let _ = input.take_draft_for_turn()?;
+                            apply_motion_command(MotionCommand::Show, dock.motion, notice)?;
+                        }
                     }
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Theme(command) => {
                     let _ = input.take_draft_for_turn()?;
                     apply_theme_command(command, dock.theme, notice)?;
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::Motion(command) => {
+                    let _ = input.take_draft_for_turn()?;
+                    apply_motion_command(command, dock.motion, notice)?;
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Empty => {
@@ -4163,6 +4785,7 @@ fn handle_active_escape_expiry(
         Some(dock.file_suggestions),
         dock.view,
         dock.theme,
+        dock.motion,
         size,
         notice,
     )? {
@@ -4371,6 +4994,24 @@ fn enqueue_enhanced_dock(
     Ok(())
 }
 
+fn enqueue_motion_dock(
+    working: WorkingPresentation,
+    pending: &mut Option<PendingOutput>,
+    deadline: &mut Option<Instant>,
+    pending_after: &mut AfterFrame,
+) -> Result<(), InteractiveError> {
+    if pending.is_some() {
+        return Err(InteractiveError::Agent);
+    }
+    *pending = Some(PendingOutput::MotionDock {
+        interaction: DockInteraction::Running,
+        working,
+    });
+    *deadline = Some(Instant::now() + FRAME_DEADLINE);
+    *pending_after = AfterFrame::None;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enqueue_approval_selector_surface(
     output: String,
@@ -4510,8 +5151,10 @@ fn complete_ready_frame(
                 size,
                 dock.view.committed(),
                 dock.theme.requested(),
+                dock.motion.requested(),
                 live,
                 file_snapshot,
+                dock.working,
             )?;
             let write = dock
                 .screen
@@ -4533,9 +5176,16 @@ fn complete_ready_frame(
             Err(error) => return Err(error),
         }
     }
-    if matches!(pending, Some(PendingOutput::Dock(_))) {
-        let interaction = match pending.take() {
-            Some(PendingOutput::Dock(interaction)) => interaction,
+    if matches!(
+        pending,
+        Some(PendingOutput::Dock(_) | PendingOutput::MotionDock { .. })
+    ) {
+        let (interaction, motion_working) = match pending.take() {
+            Some(PendingOutput::Dock(interaction)) => (interaction, None),
+            Some(PendingOutput::MotionDock {
+                interaction,
+                working,
+            }) => (interaction, Some(working)),
             _ => return Err(InteractiveError::Agent),
         };
         let input = input.ok_or(InteractiveError::Agent)?;
@@ -4566,8 +5216,10 @@ fn complete_ready_frame(
             size,
             dock.view,
             dock.theme,
+            dock.motion,
             live,
             file_snapshot,
+            motion_working.unwrap_or(dock.working),
         )?;
         let write = stage_surface(
             dock.screen,
@@ -4578,7 +5230,14 @@ fn complete_ready_frame(
         )?;
         *pending = Some(PendingOutput::Inline(PendingInlineOutput {
             write,
-            intent: InlineIntent::Dock(interaction),
+            intent: if let Some(working) = motion_working {
+                InlineIntent::MotionDock {
+                    interaction,
+                    working,
+                }
+            } else {
+                InlineIntent::Dock(interaction)
+            },
             surface: surface.commit,
             file_suggestions: staged_file_suggestions,
         }));
@@ -4587,7 +5246,10 @@ fn complete_ready_frame(
         return Ok(());
     };
     match frame {
-        PendingOutput::Unprepared(_) | PendingOutput::Prepared(_) | PendingOutput::Dock(_) => {
+        PendingOutput::Unprepared(_)
+        | PendingOutput::Prepared(_)
+        | PendingOutput::Dock(_)
+        | PendingOutput::MotionDock { .. } => {
             return Err(InteractiveError::Agent);
         }
         PendingOutput::Linear(frame) => {
@@ -4615,14 +5277,18 @@ fn complete_ready_frame(
             dock.screen
                 .commit(output.write)
                 .map_err(map_inline_screen_error)?;
-            commit_surface(dock.view, dock.theme, output.surface);
+            commit_surface(dock.view, dock.theme, dock.motion, output.surface);
             dock.file_suggestions
                 .commit_presentation(output.file_suggestions);
-            if let InlineIntent::Transcript(presentation) = output.intent {
-                transcript_presenter
-                    .take()
-                    .expect("transcript presenter was proven before screen commit")
-                    .commit(presentation);
+            match output.intent {
+                InlineIntent::Transcript(presentation) => {
+                    transcript_presenter
+                        .take()
+                        .expect("transcript presenter was proven before screen commit")
+                        .commit(presentation);
+                }
+                InlineIntent::MotionDock { working, .. } => dock.working = working,
+                InlineIntent::Dock(_) => {}
             }
         }
     }
@@ -4655,6 +5321,40 @@ fn discard_pending(pending: &mut Option<PendingOutput>, presenter: &mut Interact
     }
 }
 
+fn preempt_motion_pending(
+    pending: &mut Option<PendingOutput>,
+    deadline: &mut Option<Instant>,
+    after: &mut AfterFrame,
+    dock: Option<&mut ActiveDock<'_>>,
+) -> bool {
+    if !pending.as_ref().is_some_and(PendingOutput::is_motion_only) {
+        return false;
+    }
+    let started = pending.as_ref().is_some_and(PendingOutput::has_started);
+    let _ = pending.take();
+    *deadline = None;
+    *after = AfterFrame::None;
+    if started {
+        if let Some(dock) = dock {
+            dock.file_suggestions.invalidate_presentation();
+        }
+    }
+    started
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reattach_motion_screen(
+    terminal: &AsyncTerminal,
+    signals: &mut SignalStreams,
+    input: &InputMemory,
+    notice: Option<&str>,
+    interaction: DockInteraction,
+    live: &LiveRenderer,
+    dock: &mut ActiveDock<'_>,
+) -> Result<Option<UiSignal>, InteractiveError> {
+    render_active_dock(input, notice, interaction, live, terminal, signals, dock).await
+}
+
 fn latch_active_failure(
     stop: &mut Option<StopIntent>,
     cancellation: &CancellationToken,
@@ -4676,6 +5376,12 @@ enum UiWork {
     Envelope(Option<ApprovalEnvelope>),
     Event(Option<crate::session::CommittedUiEvent>),
     Read(std::io::Result<usize>),
+    MotionTick(MotionTick),
+}
+
+fn fences_ordinary_input_after_motion_preemption(work: &UiWork) -> bool {
+    matches!(work, UiWork::Read(Ok(count)) if *count != 0)
+        || matches!(work, UiWork::InputEscapeExpired)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4689,6 +5395,7 @@ async fn next_ui_work(
     approval_arm_deadline: Option<Instant>,
     escape_deadline: Option<Instant>,
     input_escape_deadline: Option<Instant>,
+    motion_deadline: Option<MotionTick>,
     read_enabled: bool,
     prefer_input: bool,
 ) -> UiWork {
@@ -4698,6 +5405,37 @@ async fn next_ui_work(
     let escape_deadline_at = escape_deadline.unwrap_or_else(Instant::now);
     let input_escape_pending = input_escape_deadline.is_some();
     let input_escape_deadline_at = input_escape_deadline.unwrap_or_else(Instant::now);
+    let motion_deadline_at = motion_deadline
+        .map(|tick| tick.deadline)
+        .unwrap_or_else(Instant::now);
+    let motion_pending = pending.is_some_and(PendingOutput::is_motion_only);
+    if motion_pending {
+        return if prefer_input {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => UiWork::FrameExpired,
+                () = tokio::time::sleep_until(arm_deadline), if approval_arm_deadline.is_some() => UiWork::ApprovalArmed,
+                () = tokio::time::sleep_until(escape_deadline_at), if escape_pending => UiWork::EscapeExpired,
+                () = tokio::time::sleep_until(input_escape_deadline_at), if input_escape_pending => UiWork::InputEscapeExpired,
+                read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
+                envelope = approvals.recv() => UiWork::Envelope(envelope),
+                event = events.recv() => UiWork::Event(event),
+                write = write_pending(terminal, pending) => UiWork::Write(write),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(deadline) => UiWork::FrameExpired,
+                () = tokio::time::sleep_until(arm_deadline), if approval_arm_deadline.is_some() => UiWork::ApprovalArmed,
+                () = tokio::time::sleep_until(escape_deadline_at), if escape_pending => UiWork::EscapeExpired,
+                () = tokio::time::sleep_until(input_escape_deadline_at), if input_escape_pending => UiWork::InputEscapeExpired,
+                envelope = approvals.recv() => UiWork::Envelope(envelope),
+                event = events.recv() => UiWork::Event(event),
+                read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
+                write = write_pending(terminal, pending) => UiWork::Write(write),
+            }
+        };
+    }
     if prefer_input {
         tokio::select! {
             biased;
@@ -4709,6 +5447,7 @@ async fn next_ui_work(
             write = write_pending(terminal, pending), if pending.is_some() => UiWork::Write(write),
             envelope = approvals.recv() => UiWork::Envelope(envelope),
             event = events.recv(), if pending.is_none() => UiWork::Event(event),
+            () = tokio::time::sleep_until(motion_deadline_at), if motion_deadline.is_some() && pending.is_none() => motion_deadline.map(UiWork::MotionTick).unwrap_or(UiWork::FrameExpired),
         }
     } else {
         tokio::select! {
@@ -4721,6 +5460,7 @@ async fn next_ui_work(
             envelope = approvals.recv() => UiWork::Envelope(envelope),
             event = events.recv(), if pending.is_none() => UiWork::Event(event),
             read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
+            () = tokio::time::sleep_until(motion_deadline_at), if motion_deadline.is_some() && pending.is_none() => motion_deadline.map(UiWork::MotionTick).unwrap_or(UiWork::FrameExpired),
         }
     }
 }
@@ -4995,8 +5735,10 @@ async fn write_enhanced_terminal_frame(
             size,
             dock.view.committed(),
             dock.theme.requested(),
+            dock.motion.requested(),
             model.live,
             file_snapshot,
+            dock.working,
         )?;
         let write = dock
             .screen
@@ -5008,7 +5750,7 @@ async fn write_enhanced_terminal_frame(
             .map_err(map_inline_screen_error)?;
         match write_screen_transaction(terminal, signals, dock.screen, write).await? {
             ScreenWriteOutcome::Complete => {
-                commit_surface(dock.view, dock.theme, surface.commit);
+                commit_surface(dock.view, dock.theme, dock.motion, surface.commit);
                 dock.file_suggestions
                     .commit_presentation(staged_file_suggestions);
                 presenter.commit(presentation);
@@ -5125,18 +5867,27 @@ fn discard_ready_updates_after_stop(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{
+        fs,
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        path::Path,
+        time::Duration,
+    };
 
     use super::{
-        AfterFrame, ApprovalUiUpdate, FileSuggestionController, InlineIntent, InteractiveError,
-        InteractiveExit, InteractivePresentation, PendingInlineOutput, PendingOutput,
-        StagedFileSuggestionPresentation, StopIntent, SurfaceCommit, apply_approval_update,
-        apply_enhanced_input as apply_enhanced_input_with_files, apply_theme_command,
-        commit_surface, discard_ready_updates_after_stop,
-        expire_enhanced_escape as expire_enhanced_escape_with_files, latch_observer_fault,
-        observe_enhanced_cleanup_signal, observe_failure, observe_signal,
-        prepare_pending_for_resize, presentation_uses_enhanced, reset_file_suggestion_decoder,
-        session_context_estimate, turn_exhausted_session_capacity,
+        AfterFrame, ApprovalUiUpdate, EnhancedSubmission, FileSuggestionController, InlineIntent,
+        InteractiveError, InteractiveExit, InteractivePresentation, MotionClock, MotionEligibility,
+        PendingInlineOutput, PendingOutput, StagedFileSuggestionPresentation, StopIntent,
+        SurfaceCommit, UiWork, apply_approval_update,
+        apply_enhanced_input as apply_enhanced_input_with_files, apply_motion_command,
+        apply_theme_command, classify_enhanced_submission, commit_surface,
+        discard_ready_updates_after_stop,
+        expire_enhanced_escape as expire_enhanced_escape_with_files,
+        fences_ordinary_input_after_motion_preemption, latch_observer_fault, next_ui_work,
+        normalize_working_presentation, observe_enhanced_cleanup_signal, observe_failure,
+        observe_signal, preempt_motion_pending, prepare_pending_for_resize,
+        presentation_uses_enhanced, reset_file_suggestion_decoder, session_context_estimate,
+        synchronize_motion_clock, turn_exhausted_session_capacity,
     };
     use crate::{
         agent::{ApprovalPrompt, ApprovalRequest},
@@ -5145,7 +5896,7 @@ mod tests {
             approval_join::ApprovalJoin,
             input::CanonicalRecordParser,
             signal::{SignalLatch, UiSignal},
-            terminal::TerminalSize,
+            terminal::{AsyncTerminal, TerminalSize},
         },
         entropy::{EntropyError, EntropySource},
         model::{CallId, ContentBlock, LlmFailure, Message, MessageSource, NonNegativeSafeInteger},
@@ -5163,6 +5914,10 @@ mod tests {
             inline_screen::InlineScreen,
             input_memory::InputMemory,
             key_decoder::KeyDecoder,
+            motion::{
+                MotionCommand, MotionPreference, MotionState, WorkingAge, WorkingPhase,
+                WorkingPresentation,
+            },
             theme::{ThemeCommand, ThemePalette, ThemeState},
             view::{ViewMode, ViewState},
         },
@@ -5241,6 +5996,7 @@ mod tests {
             None,
             view,
             theme,
+            &MotionState::default(),
             size,
             notice,
         )
@@ -5263,6 +6019,7 @@ mod tests {
             None,
             view,
             theme,
+            &MotionState::default(),
             size,
             notice,
         )
@@ -5575,6 +6332,7 @@ mod tests {
             Some(&mut controller),
             &mut view,
             &theme,
+            &MotionState::default(),
             size,
             &mut notice,
         )
@@ -5592,6 +6350,7 @@ mod tests {
             Some(&mut controller),
             &mut view,
             &theme,
+            &MotionState::default(),
             size,
             &mut notice,
         )
@@ -5626,6 +6385,7 @@ mod tests {
             Some(&mut controller),
             &mut view,
             &theme,
+            &MotionState::default(),
             size,
             &mut notice,
         )
@@ -5643,6 +6403,7 @@ mod tests {
             Some(&mut controller),
             &mut view,
             &theme,
+            &MotionState::default(),
             size,
             &mut notice,
         )
@@ -5679,6 +6440,7 @@ mod tests {
                 Some(&mut controller),
                 &mut view,
                 &theme,
+                &MotionState::default(),
                 size,
                 &mut notice,
             )
@@ -5728,6 +6490,7 @@ mod tests {
                 Some(&mut controller),
                 &mut view,
                 &theme,
+                &MotionState::default(),
                 size,
                 &mut notice,
             )
@@ -5827,7 +6590,7 @@ mod tests {
         let mut input = InputMemory::default();
         input.insert_text("/").unwrap();
         let mut palette = CommandPaletteState::default();
-        for _ in 0..6 {
+        for _ in 0..7 {
             assert!(palette.navigate(input.composer(), PaletteMove::Next));
         }
         assert_eq!(
@@ -5941,6 +6704,7 @@ mod tests {
             interaction,
             size,
             FileSuggestionSnapshot::Hidden,
+            WorkingPresentation::PLAIN,
         )
         .unwrap();
         let mut screen = InlineScreen::default();
@@ -5960,6 +6724,7 @@ mod tests {
             surface: SurfaceCommit {
                 request: view.requested(),
                 theme: theme.requested(),
+                motion: MotionState::default().requested(),
                 offset: 0,
                 total_rows: 0,
                 page_rows: 0,
@@ -5985,6 +6750,7 @@ mod tests {
             surface: SurfaceCommit {
                 request: view.requested(),
                 theme: theme.requested(),
+                motion: MotionState::default().requested(),
                 offset: 0,
                 total_rows: 0,
                 page_rows: 0,
@@ -6016,6 +6782,7 @@ mod tests {
             interaction,
             compact_size,
             FileSuggestionSnapshot::Hidden,
+            WorkingPresentation::PLAIN,
         )
         .unwrap();
         let recovered = screen
@@ -6085,6 +6852,502 @@ mod tests {
             super::EnhancedInputAction::Redraw
         );
         assert_eq!(input.composer().text(), "fresh");
+    }
+
+    #[test]
+    fn motion_only_screen_writes_abort_cleanly_or_poison_and_are_never_replayed() {
+        let input = InputMemory::default();
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+        let frame = super::enhanced_dock_frame(
+            &input,
+            None,
+            DockInteraction::Running,
+            size,
+            FileSuggestionSnapshot::Hidden,
+            WorkingPresentation {
+                phase: WorkingPhase::Animated(0),
+                age: WorkingAge::Fresh,
+            },
+        )
+        .unwrap();
+        let mut screen = InlineScreen::default();
+        let mut attach = screen
+            .stage_attach(super::screen_size(size), &frame, ThemePalette::Adaptive)
+            .unwrap();
+        attach.advance(attach.bytes().len()).unwrap();
+        screen.commit(attach).unwrap();
+
+        let view = ViewState::default();
+        let theme = ThemeState::default();
+        let motion = MotionState::default();
+        let surface = || SurfaceCommit {
+            request: view.requested(),
+            theme: theme.requested(),
+            motion: motion.requested(),
+            offset: 0,
+            total_rows: 0,
+            page_rows: 0,
+        };
+
+        let write = screen.stage_dock(&frame, ThemePalette::Adaptive).unwrap();
+        let mut pending = Some(PendingOutput::Inline(PendingInlineOutput {
+            write,
+            intent: InlineIntent::MotionDock {
+                interaction: DockInteraction::Running,
+                working: WorkingPresentation {
+                    phase: WorkingPhase::Animated(0),
+                    age: WorkingAge::Fresh,
+                },
+            },
+            surface: surface(),
+            file_suggestions: StagedFileSuggestionPresentation::Absent,
+        }));
+        let mut deadline = Some(Instant::now() + Duration::from_secs(5));
+        let mut after = AfterFrame::TurnEnd;
+        assert!(!preempt_motion_pending(
+            &mut pending,
+            &mut deadline,
+            &mut after,
+            None,
+        ));
+        assert!(pending.is_none());
+        assert_eq!(deadline, None);
+        assert_eq!(after, AfterFrame::None);
+        assert!(!screen.is_poisoned());
+
+        let mut write = screen.stage_dock(&frame, ThemePalette::Adaptive).unwrap();
+        write.advance(1).unwrap();
+        let mut pending = Some(PendingOutput::Inline(PendingInlineOutput {
+            write,
+            intent: InlineIntent::MotionDock {
+                interaction: DockInteraction::Running,
+                working: WorkingPresentation {
+                    phase: WorkingPhase::Animated(0),
+                    age: WorkingAge::Fresh,
+                },
+            },
+            surface: surface(),
+            file_suggestions: StagedFileSuggestionPresentation::Absent,
+        }));
+        assert!(preempt_motion_pending(
+            &mut pending,
+            &mut None,
+            &mut AfterFrame::None,
+            None,
+        ));
+        assert!(screen.is_poisoned());
+        screen.recover_after_visual_reset();
+
+        let mut attach = screen
+            .stage_attach(super::screen_size(size), &frame, ThemePalette::Adaptive)
+            .unwrap();
+        attach.advance(attach.bytes().len()).unwrap();
+        screen.commit(attach).unwrap();
+        let mut write = screen.stage_dock(&frame, ThemePalette::Adaptive).unwrap();
+        write.advance(1).unwrap();
+        let mut pending = Some(PendingOutput::Inline(PendingInlineOutput {
+            write,
+            intent: InlineIntent::MotionDock {
+                interaction: DockInteraction::Running,
+                working: WorkingPresentation {
+                    phase: WorkingPhase::Animated(0),
+                    age: WorkingAge::Fresh,
+                },
+            },
+            surface: surface(),
+            file_suggestions: StagedFileSuggestionPresentation::Absent,
+        }));
+        assert!(prepare_pending_for_resize(&mut pending, &mut screen).unwrap());
+        assert!(screen.is_poisoned());
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn motion_commands_are_local_closed_and_commit_through_the_screen_revision() {
+        assert_eq!(
+            classify_enhanced_submission(" /motion "),
+            EnhancedSubmission::Command(CommandId::Motion)
+        );
+        assert_eq!(
+            classify_enhanced_submission(" /motion reduced "),
+            EnhancedSubmission::Motion(MotionCommand::Select(MotionPreference::Reduced))
+        );
+        assert_eq!(
+            classify_enhanced_submission("/motion hidden extra"),
+            EnhancedSubmission::Motion(MotionCommand::Invalid)
+        );
+        for command in ["/motions", "/Motion reduced"] {
+            assert_eq!(
+                classify_enhanced_submission(command),
+                EnhancedSubmission::Motion(MotionCommand::Invalid)
+            );
+        }
+
+        let mut motion = MotionState::default();
+        let mut notice = None;
+        apply_motion_command(
+            MotionCommand::Select(MotionPreference::Reduced),
+            &mut motion,
+            &mut notice,
+        )
+        .unwrap();
+        assert_eq!(notice.as_deref(), Some("Motion changed · reduced"));
+        assert!(motion.is_transitioning());
+        assert_eq!(motion.committed().preference(), MotionPreference::Full);
+        assert!(motion.commit(motion.requested()));
+        assert!(!motion.is_transitioning());
+
+        apply_motion_command(MotionCommand::Show, &mut motion, &mut notice).unwrap();
+        assert_eq!(
+            notice.as_deref(),
+            Some("Motion · reduced | Motion modes · full · reduced")
+        );
+        apply_motion_command(MotionCommand::Invalid, &mut motion, &mut notice).unwrap();
+        assert_eq!(
+            notice.as_deref(),
+            Some("Unknown motion mode | Motion modes · full · reduced")
+        );
+    }
+
+    #[test]
+    fn motion_transition_fences_same_read_input_until_the_dock_commits() {
+        let mut decoder = KeyDecoder::default();
+        let mut input = InputMemory::default();
+        let mut command_palette = CommandPaletteState::default();
+        let mut view = ViewState::default();
+        let theme = ThemeState::default();
+        let mut motion = MotionState::default();
+        let mut notice = None;
+        let size = TerminalSize {
+            rows: 24,
+            columns: 80,
+        };
+
+        assert!(motion.request(MotionPreference::Reduced).unwrap());
+        assert_eq!(
+            apply_enhanced_input_with_files(
+                &mut decoder,
+                b"HIDDEN\r",
+                &mut input,
+                &mut command_palette,
+                None,
+                &mut view,
+                &theme,
+                &motion,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::Redraw
+        );
+        assert!(input.composer().is_empty());
+
+        assert!(motion.commit(motion.requested()));
+        assert_eq!(
+            apply_enhanced_input_with_files(
+                &mut decoder,
+                b"fresh",
+                &mut input,
+                &mut command_palette,
+                None,
+                &mut view,
+                &theme,
+                &motion,
+                size,
+                &mut notice,
+            )
+            .unwrap(),
+            super::EnhancedInputAction::Redraw
+        );
+        assert_eq!(input.composer().text(), "fresh");
+    }
+
+    #[test]
+    fn motion_recovery_fences_only_real_input_bytes_not_eof_or_read_failure() {
+        assert!(fences_ordinary_input_after_motion_preemption(
+            &UiWork::Read(Ok(1))
+        ));
+        assert!(fences_ordinary_input_after_motion_preemption(
+            &UiWork::InputEscapeExpired
+        ));
+        assert!(!fences_ordinary_input_after_motion_preemption(
+            &UiWork::Read(Ok(0))
+        ));
+        assert!(!fences_ordinary_input_after_motion_preemption(
+            &UiWork::Read(Err(std::io::Error::other("test")))
+        ));
+    }
+
+    #[test]
+    fn requested_preference_normalizes_every_visible_working_surface() {
+        let animated = WorkingPresentation {
+            phase: WorkingPhase::Animated(2),
+            age: WorkingAge::Long { seconds: 42 },
+        };
+        assert_eq!(
+            normalize_working_presentation(animated, MotionPreference::Reduced),
+            WorkingPresentation {
+                phase: WorkingPhase::Static,
+                age: WorkingAge::Long { seconds: 5 },
+            }
+        );
+        assert_eq!(
+            normalize_working_presentation(WorkingPresentation::PLAIN, MotionPreference::Full),
+            WorkingPresentation::STATIC
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn motion_clock_has_exact_delays_milestones_and_stale_tick_fences() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        let full = MotionState::default();
+        let mut displayed = WorkingPresentation::STATIC;
+        clock.synchronize(turn, true).unwrap();
+        assert_eq!(
+            clock.presentation(MotionPreference::Full, WorkingPhase::Static),
+            WorkingPresentation::STATIC
+        );
+        let first = clock.deadline(MotionPreference::Full, displayed).unwrap();
+        assert_eq!(first.deadline, Instant::now() + Duration::from_millis(300));
+
+        tokio::time::advance(Duration::from_millis(299)).await;
+        assert_eq!(
+            clock.advance(first, full.requested(), full.committed()),
+            None
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let abandoned = clock
+            .advance(first, full.requested(), full.committed())
+            .unwrap();
+        assert_eq!(abandoned.phase, WorkingPhase::Animated(0));
+        assert_eq!(displayed, WorkingPresentation::STATIC);
+
+        let second = clock.deadline(MotionPreference::Full, displayed).unwrap();
+        assert_eq!(second.deadline, Instant::now() + Duration::from_millis(125));
+        tokio::time::advance(Duration::from_millis(125)).await;
+        displayed = clock
+            .advance(second, full.requested(), full.committed())
+            .unwrap();
+        assert_eq!(displayed.phase, WorkingPhase::Animated(1));
+
+        let stale = clock.deadline(MotionPreference::Full, displayed).unwrap();
+        clock.synchronize(turn, false).unwrap();
+        clock.synchronize(turn, true).unwrap();
+        tokio::time::advance(Duration::from_millis(125)).await;
+        assert_eq!(
+            clock.advance(stale, full.requested(), full.committed()),
+            None
+        );
+
+        tokio::time::advance(Duration::from_millis(575)).await;
+        assert_eq!(
+            clock
+                .presentation(MotionPreference::Full, WorkingPhase::Static)
+                .age,
+            WorkingAge::OneSecond { seconds: 1 }
+        );
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            clock
+                .presentation(MotionPreference::Full, WorkingPhase::Static)
+                .age,
+            WorkingAge::Long { seconds: 5 }
+        );
+
+        let mut reduced_clock = MotionClock::new(turn);
+        let reduced = MotionState::new(MotionPreference::Reduced);
+        let mut reduced_displayed = WorkingPresentation::STATIC;
+        reduced_clock.synchronize(turn, true).unwrap();
+        assert_eq!(
+            reduced_clock.presentation(MotionPreference::Reduced, WorkingPhase::Static),
+            WorkingPresentation::STATIC
+        );
+        let one_second = reduced_clock
+            .deadline(MotionPreference::Reduced, reduced_displayed)
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        reduced_displayed = reduced_clock
+            .advance(one_second, reduced.requested(), reduced.committed())
+            .unwrap();
+        assert_eq!(reduced_displayed.age, WorkingAge::OneSecond { seconds: 1 });
+        let five_seconds = reduced_clock
+            .deadline(MotionPreference::Reduced, reduced_displayed)
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(4)).await;
+        reduced_displayed = reduced_clock
+            .advance(five_seconds, reduced.requested(), reduced.committed())
+            .unwrap();
+        assert_eq!(
+            reduced_displayed,
+            WorkingPresentation {
+                phase: WorkingPhase::Static,
+                age: WorkingAge::Long { seconds: 5 },
+            }
+        );
+        assert_eq!(
+            reduced_clock.deadline(MotionPreference::Reduced, reduced_displayed),
+            None
+        );
+        reduced_clock.synchronize(turn, false).unwrap();
+        assert_eq!(
+            reduced_clock.deadline(MotionPreference::Reduced, reduced_displayed),
+            None
+        );
+
+        let mut coalesced = MotionClock::new(turn);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        coalesced.synchronize(turn, true).unwrap();
+        let overdue = coalesced
+            .deadline(MotionPreference::Reduced, WorkingPresentation::STATIC)
+            .unwrap();
+        assert_eq!(overdue.deadline, Instant::now());
+        assert_eq!(
+            coalesced
+                .advance(overdue, reduced.requested(), reduced.committed())
+                .unwrap()
+                .age,
+            WorkingAge::Long { seconds: 5 }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_eligibility_generation_never_replays_a_completed_phase() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        let motion = MotionState::default();
+        let mut displayed = WorkingPresentation::STATIC;
+        synchronize_motion_clock(
+            &mut clock,
+            turn,
+            true,
+            MotionPreference::Full,
+            &mut displayed,
+        )
+        .unwrap();
+
+        tokio::time::advance(Duration::from_millis(300)).await;
+        let tick = clock.deadline(MotionPreference::Full, displayed).unwrap();
+        displayed = clock
+            .advance(tick, motion.requested(), motion.committed())
+            .unwrap();
+        assert_eq!(displayed.phase, WorkingPhase::Animated(0));
+
+        // A notice, approval, detail view, or preference transition disarms
+        // the clock. Returning to Focus starts a fresh 300 ms generation and
+        // must not expose the completed Animated(0) credential meanwhile.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        synchronize_motion_clock(
+            &mut clock,
+            turn,
+            false,
+            MotionPreference::Full,
+            &mut displayed,
+        )
+        .unwrap();
+        assert_eq!(displayed.phase, WorkingPhase::Static);
+        assert_eq!(displayed.age, WorkingAge::Long { seconds: 5 });
+        synchronize_motion_clock(
+            &mut clock,
+            turn,
+            true,
+            MotionPreference::Full,
+            &mut displayed,
+        )
+        .unwrap();
+        assert_eq!(displayed.phase, WorkingPhase::Static);
+        assert_eq!(displayed.age, WorkingAge::Long { seconds: 5 });
+        assert_eq!(
+            clock
+                .deadline(MotionPreference::Full, displayed)
+                .unwrap()
+                .deadline,
+            Instant::now() + Duration::from_millis(300)
+        );
+    }
+
+    #[test]
+    fn every_non_working_surface_disarms_the_motion_clock() {
+        let eligible = MotionEligibility {
+            enhanced: true,
+            turn_open: true,
+            approval_inactive: true,
+            no_question: true,
+            focus: true,
+            no_notice: true,
+            queue_empty: true,
+            file_hidden: true,
+            palette_hidden: true,
+            motion_committed: true,
+        };
+        assert!(eligible.is_eligible());
+
+        let excluded = [
+            MotionEligibility {
+                enhanced: false,
+                ..eligible
+            },
+            MotionEligibility {
+                turn_open: false,
+                ..eligible
+            },
+            MotionEligibility {
+                approval_inactive: false,
+                ..eligible
+            },
+            MotionEligibility {
+                no_question: false,
+                ..eligible
+            },
+            MotionEligibility {
+                focus: false,
+                ..eligible
+            },
+            MotionEligibility {
+                no_notice: false,
+                ..eligible
+            },
+            MotionEligibility {
+                queue_empty: false,
+                ..eligible
+            },
+            MotionEligibility {
+                file_hidden: false,
+                ..eligible
+            },
+            MotionEligibility {
+                palette_hidden: false,
+                ..eligible
+            },
+            MotionEligibility {
+                motion_committed: false,
+                ..eligible
+            },
+        ];
+        assert!(excluded.into_iter().all(|state| !state.is_eligible()));
+    }
+
+    #[test]
+    fn turn_end_disarms_motion_while_the_agent_future_is_still_pending() {
+        let turn = crate::session::TurnId::new(1).unwrap();
+        let mut clock = MotionClock::new(turn);
+        clock.synchronize(turn, true).unwrap();
+        assert!(
+            clock
+                .deadline(MotionPreference::Full, WorkingPresentation::STATIC)
+                .is_some()
+        );
+
+        // The UI can observe TurnEnd before the owning Agent future finishes
+        // cleanup. That settlement fact must permanently stop this turn's clock.
+        clock.synchronize(turn, false).unwrap();
+        assert_eq!(
+            clock.deadline(MotionPreference::Full, WorkingPresentation::STATIC),
+            None
+        );
     }
 
     #[test]
@@ -6165,6 +7428,7 @@ mod tests {
             interaction,
             size,
             FileSuggestionSnapshot::Hidden,
+            WorkingPresentation::PLAIN,
         )
         .unwrap();
         let mut screen = InlineScreen::default();
@@ -6186,6 +7450,7 @@ mod tests {
             surface: SurfaceCommit {
                 request: view.requested(),
                 theme: theme.requested(),
+                motion: MotionState::default().requested(),
                 offset: 0,
                 total_rows: 0,
                 page_rows: 0,
@@ -6215,6 +7480,7 @@ mod tests {
             interaction,
             compact_size,
             FileSuggestionSnapshot::Hidden,
+            WorkingPresentation::PLAIN,
         )
         .unwrap();
         let mut second_resize = screen
@@ -6266,11 +7532,17 @@ mod tests {
         let recovered_surface = SurfaceCommit {
             request: view.requested(),
             theme: theme.requested(),
+            motion: MotionState::default().requested(),
             offset: 0,
             total_rows: 0,
             page_rows: 0,
         };
-        commit_surface(&mut view, &mut theme, recovered_surface);
+        commit_surface(
+            &mut view,
+            &mut theme,
+            &mut MotionState::default(),
+            recovered_surface,
+        );
         assert_eq!(theme.committed().palette(), ThemePalette::Paper);
         assert!(!theme.is_transitioning());
     }
@@ -6365,6 +7637,97 @@ mod tests {
         assert!(pending.is_none());
         assert_eq!(after, AfterFrame::None);
         assert_eq!(receive.await.unwrap().outcome, ApprovalOutcome::AllowedOnce);
+    }
+
+    #[tokio::test]
+    async fn ready_approval_envelopes_outrank_a_writable_motion_frame() {
+        for prefer_input in [true, false] {
+            let (terminal_side, _peer) = UnixStream::pair().unwrap();
+            terminal_side.set_nonblocking(true).unwrap();
+            let input: OwnedFd = terminal_side.try_clone().unwrap().into();
+            let output: OwnedFd = terminal_side.into();
+            let terminal = AsyncTerminal::from_owned_fds_for_test(input, output);
+
+            let (sender, mut approvals) = tokio::sync::mpsc::channel(1);
+            let request = ApprovalRequest::new(
+                ApprovalRequestId::new("approval-motion-priority"),
+                "apply_patch".to_owned(),
+                CallId::new("call-motion-priority"),
+                &ApprovalPrompt::new(Some("change one file".to_owned()), "bounded preview")
+                    .unwrap(),
+            );
+            let (response, _receive) = oneshot::channel();
+            sender
+                .send(ApprovalEnvelope { request, response })
+                .await
+                .unwrap();
+
+            let mut session = Session::new("motion-priority").unwrap();
+            let mut events = session.attach_ui_observer().unwrap();
+            let mut scratch = [0_u8; super::TERMINAL_READ_BYTES];
+            let pending = PendingOutput::MotionDock {
+                interaction: DockInteraction::Running,
+                working: WorkingPresentation {
+                    phase: WorkingPhase::Animated(0),
+                    age: WorkingAge::Fresh,
+                },
+            };
+            let work = next_ui_work(
+                &terminal,
+                &mut approvals,
+                &mut events,
+                &mut scratch,
+                Some(&pending),
+                Some(Instant::now() + Duration::from_secs(5)),
+                None,
+                None,
+                None,
+                None,
+                false,
+                prefer_input,
+            )
+            .await;
+            assert!(matches!(work, UiWork::Envelope(Some(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_session_facts_outrank_a_writable_motion_frame() {
+        for prefer_input in [true, false] {
+            let (terminal_side, _peer) = UnixStream::pair().unwrap();
+            terminal_side.set_nonblocking(true).unwrap();
+            let input: OwnedFd = terminal_side.try_clone().unwrap().into();
+            let output: OwnedFd = terminal_side.into();
+            let terminal = AsyncTerminal::from_owned_fds_for_test(input, output);
+            let (_sender, mut approvals) = tokio::sync::mpsc::channel(1);
+            let mut session = Session::new("motion-event-priority").unwrap();
+            let mut events = session.attach_ui_observer().unwrap();
+            session.append(NewEvent::log(EventKind::EndSeed)).unwrap();
+            let mut scratch = [0_u8; super::TERMINAL_READ_BYTES];
+            let pending = PendingOutput::MotionDock {
+                interaction: DockInteraction::Running,
+                working: WorkingPresentation {
+                    phase: WorkingPhase::Animated(0),
+                    age: WorkingAge::Fresh,
+                },
+            };
+            let work = next_ui_work(
+                &terminal,
+                &mut approvals,
+                &mut events,
+                &mut scratch,
+                Some(&pending),
+                Some(Instant::now() + Duration::from_secs(5)),
+                None,
+                None,
+                None,
+                None,
+                false,
+                prefer_input,
+            )
+            .await;
+            assert!(matches!(work, UiWork::Event(Some(_))));
+        }
     }
 
     #[test]

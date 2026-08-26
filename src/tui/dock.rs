@@ -9,6 +9,7 @@ use super::{
     composer::Composer,
     file_suggestions::FileSuggestionSnapshot,
     input_memory::PromptQueue,
+    motion::{WorkingAge, WorkingPhase, WorkingPresentation},
     presentation::TextStyle,
     theme::ThemePalette,
     view::{DetailDocument, DetailTone},
@@ -47,6 +48,7 @@ pub(crate) struct DockModel<'a> {
     pub(crate) queue: &'a PromptQueue,
     pub(crate) notice: Option<&'a str>,
     pub(crate) file_suggestions: FileSuggestionSnapshot<'a>,
+    pub(crate) working: WorkingPresentation,
 }
 
 impl fmt::Debug for DockModel<'_> {
@@ -58,6 +60,7 @@ impl fmt::Debug for DockModel<'_> {
             .field("queued", &self.queue.len())
             .field("notice_bytes", &self.notice.map(str::len))
             .field("file_suggestions", &self.file_suggestions)
+            .field("working", &self.working)
             .finish()
     }
 }
@@ -297,15 +300,15 @@ impl DockFrame {
                 lines.push(line(DockRole::Queue, fit_ascii(&queue, width_usize)));
             } else {
                 let status = match model.interaction {
-                    DockInteraction::Idle => "Ready",
-                    DockInteraction::Running => "Working | type the next prompt while dsh runs",
-                    DockInteraction::CommandPalette { running: false, .. } => "Ready",
+                    DockInteraction::Idle => "Ready".to_owned(),
+                    DockInteraction::Running => working_status(model.working),
+                    DockInteraction::CommandPalette { running: false, .. } => "Ready".to_owned(),
                     DockInteraction::CommandPalette { running: true, .. } => {
-                        "Working | type the next prompt while dsh runs"
+                        working_status(model.working)
                     }
-                    DockInteraction::Approval(_) => "Approval required",
+                    DockInteraction::Approval(_) => "Approval required".to_owned(),
                 };
-                lines.push(line(DockRole::Queue, fit_ascii(status, width_usize)));
+                lines.push(line(DockRole::Queue, fit_ascii(&status, width_usize)));
             }
             lines.push(line(DockRole::Divider, "-".repeat(width_usize)));
             let composer_start = lines.len();
@@ -555,6 +558,44 @@ impl DockFrame {
     }
 }
 
+fn working_status(presentation: WorkingPresentation) -> String {
+    let prefix = match presentation.phase {
+        WorkingPhase::Plain => "",
+        WorkingPhase::Static => "● ",
+        WorkingPhase::Animated(_) => "●  ",
+    };
+    let phase = presentation.phase_glyph();
+    let label = if matches!(presentation.age, WorkingAge::Long { .. }) {
+        "Still working"
+    } else {
+        "Working"
+    };
+    let age = match (presentation.phase, presentation.age) {
+        (WorkingPhase::Static, WorkingAge::OneSecond { .. }) => Some("1s+".to_owned()),
+        (WorkingPhase::Static, WorkingAge::Long { .. }) => None,
+        (_, WorkingAge::Fresh) => None,
+        (_, WorkingAge::OneSecond { seconds } | WorkingAge::Long { seconds }) => {
+            Some(format!("{seconds}s"))
+        }
+    };
+    let mut status = String::new();
+    status.push_str(prefix);
+    if let Some(phase) = phase {
+        // Replace the reserved second cell without changing the stable semantic
+        // icon or the remaining text columns.
+        status.pop();
+        status.push(phase);
+        status.push(' ');
+    }
+    status.push_str(label);
+    if let Some(age) = age {
+        status.push_str(" · ");
+        status.push_str(&age);
+    }
+    status.push_str(" | type the next prompt while dsh runs");
+    status
+}
+
 fn push_absolute_frame_lines(
     output: &mut String,
     lines: &[DockLine],
@@ -697,7 +738,7 @@ fn push_command_lines(
         ));
         return Ok(());
     }
-    let width_cap = if columns < 60 { 3 } else { 7 };
+    let width_cap = if columns < 60 { 3 } else { 8 };
     let visible = count
         .min(width_cap)
         .min(usize::from(terminal_rows).saturating_sub(8));
@@ -1007,13 +1048,14 @@ fn byte_at_cell(text: &str, target: usize) -> Option<usize> {
 mod tests {
     use super::{
         DETAIL_WRAPPED_OMISSION, DockApprovalSelection, DockFrame, DockInteraction, DockModel,
-        DockRole, MAX_DETAIL_WRAPPED_ROWS,
+        DockRole, MAX_DETAIL_WRAPPED_ROWS, working_status,
     };
     use crate::tui::{
         command_palette::{CommandPaletteState, PaletteMove},
         composer::Composer,
         file_suggestions::FileSuggestionSnapshot,
         input_memory::PromptQueue,
+        motion::WorkingPresentation,
         presentation::TextStyle,
         theme::ThemePalette,
         view::{DetailDocument, DetailTone, ViewMode},
@@ -1041,6 +1083,36 @@ mod tests {
     }
 
     #[test]
+    fn working_motion_keeps_one_semantic_icon_and_reduced_milestones_are_static() {
+        let hint = " | type the next prompt while dsh runs";
+        assert_eq!(
+            working_status(WorkingPresentation::PLAIN),
+            format!("Working{hint}")
+        );
+        assert_eq!(
+            working_status(WorkingPresentation {
+                phase: crate::tui::motion::WorkingPhase::Animated(3),
+                age: crate::tui::motion::WorkingAge::OneSecond { seconds: 4 },
+            }),
+            format!("● \\ Working · 4s{hint}")
+        );
+        assert_eq!(
+            working_status(WorkingPresentation {
+                phase: crate::tui::motion::WorkingPhase::Static,
+                age: crate::tui::motion::WorkingAge::OneSecond { seconds: 1 },
+            }),
+            format!("● Working · 1s+{hint}")
+        );
+        assert_eq!(
+            working_status(WorkingPresentation {
+                phase: crate::tui::motion::WorkingPhase::Static,
+                age: crate::tui::motion::WorkingAge::Long { seconds: 5 },
+            }),
+            format!("● Still working{hint}")
+        );
+    }
+
+    #[test]
     fn responsive_frames_fit_44_80_and_112_columns() {
         for (rows, columns) in [(20, 44), (24, 80), (34, 112)] {
             let mut composer = Composer::default();
@@ -1055,6 +1127,7 @@ mod tests {
                     queue: &queue,
                     notice: None,
                     file_suggestions: FileSuggestionSnapshot::Hidden,
+                    working: WorkingPresentation::PLAIN,
                 },
                 rows,
                 columns,
@@ -1077,7 +1150,7 @@ mod tests {
         composer.insert_text("/").unwrap();
         let queue = PromptQueue::default();
         let mut palette = CommandPaletteState::default();
-        for _ in 0..5 {
+        for _ in 0..6 {
             assert!(palette.navigate(&composer, PaletteMove::Next));
         }
         let snapshot = palette.snapshot(&composer);
@@ -1087,18 +1160,18 @@ mod tests {
                 24,
                 80,
                 vec![
-                    "/help", "/inspect", "/review", "/focus", "/theme", "/exit", "/quit",
+                    "/help", "/inspect", "/review", "/focus", "/theme", "/motion", "/exit", "/quit",
                 ],
             ),
             (
                 15,
                 80,
                 vec![
-                    "/help", "/inspect", "/review", "/focus", "/theme", "/exit", "/quit",
+                    "/inspect", "/review", "/focus", "/theme", "/motion", "/exit", "/quit",
                 ],
             ),
-            (12, 80, vec!["/focus", "/theme", "/exit", "/quit"]),
-            (12, 44, vec!["/theme", "/exit", "/quit"]),
+            (12, 80, vec!["/theme", "/motion", "/exit", "/quit"]),
+            (12, 44, vec!["/motion", "/exit", "/quit"]),
         ] {
             let frame = DockFrame::layout(
                 DockModel {
@@ -1110,6 +1183,7 @@ mod tests {
                     queue: &queue,
                     notice: None,
                     file_suggestions: FileSuggestionSnapshot::Hidden,
+                    working: WorkingPresentation::PLAIN,
                 },
                 rows,
                 columns,
@@ -1147,6 +1221,7 @@ mod tests {
                 queue: &queue,
                 notice: None,
                 file_suggestions: FileSuggestionSnapshot::Hidden,
+                working: WorkingPresentation::PLAIN,
             },
             5,
             12,
@@ -1170,6 +1245,7 @@ mod tests {
                 queue: &queue,
                 notice: None,
                 file_suggestions: FileSuggestionSnapshot::Hidden,
+                working: WorkingPresentation::PLAIN,
             },
             5,
             12,
@@ -1202,6 +1278,7 @@ mod tests {
                     queue: &queue,
                     notice: None,
                     file_suggestions: snapshot,
+                    working: WorkingPresentation::PLAIN,
                 },
                 rows,
                 columns,
@@ -1231,6 +1308,7 @@ mod tests {
                 queue: &queue,
                 notice: None,
                 file_suggestions: snapshot,
+                working: WorkingPresentation::PLAIN,
             },
             5,
             12,
@@ -1254,6 +1332,7 @@ mod tests {
                     queue: &queue,
                     notice: None,
                     file_suggestions: snapshot,
+                    working: WorkingPresentation::PLAIN,
                 },
                 5,
                 12,
@@ -1280,6 +1359,7 @@ mod tests {
                     queue: &queue,
                     notice: None,
                     file_suggestions: FileSuggestionSnapshot::Hidden,
+                    working: WorkingPresentation::PLAIN,
                 },
                 6,
                 15,
@@ -1316,6 +1396,7 @@ mod tests {
                 queue: &queue,
                 notice: None,
                 file_suggestions: FileSuggestionSnapshot::Hidden,
+                working: WorkingPresentation::PLAIN,
             },
             5,
             12,
@@ -1338,6 +1419,7 @@ mod tests {
                     queue: &queue,
                     notice: None,
                     file_suggestions: FileSuggestionSnapshot::Hidden,
+                    working: WorkingPresentation::PLAIN,
                 },
                 5,
                 11,
@@ -1352,6 +1434,7 @@ mod tests {
                     queue: &queue,
                     notice: None,
                     file_suggestions: FileSuggestionSnapshot::Hidden,
+                    working: WorkingPresentation::PLAIN,
                 },
                 4,
                 12,
@@ -1372,6 +1455,7 @@ mod tests {
                     queue: &queue,
                     notice: None,
                     file_suggestions: FileSuggestionSnapshot::Hidden,
+                    working: WorkingPresentation::PLAIN,
                 },
                 rows,
                 columns,
@@ -1433,6 +1517,7 @@ mod tests {
                     queue: &queue,
                     notice: None,
                     file_suggestions: FileSuggestionSnapshot::Hidden,
+                    working: WorkingPresentation::PLAIN,
                 },
                 rows,
                 columns,
@@ -1476,6 +1561,7 @@ mod tests {
                 queue: &queue,
                 notice: None,
                 file_suggestions: FileSuggestionSnapshot::Hidden,
+                working: WorkingPresentation::PLAIN,
             },
             20,
             44,
@@ -1503,6 +1589,7 @@ mod tests {
             queue: &queue,
             notice: Some("SECRET_NOTICE"),
             file_suggestions: FileSuggestionSnapshot::Hidden,
+            working: WorkingPresentation::PLAIN,
         };
         let model_debug = format!("{model:?}");
         assert!(!model_debug.contains("SECRET_DRAFT"));

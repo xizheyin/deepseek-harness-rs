@@ -377,6 +377,7 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
     dsh.expect(b"/review");
     dsh.expect(b"/focus");
     dsh.expect(b"/theme");
+    dsh.expect(b"/motion");
     dsh.expect(b"/exit");
     dsh.expect(b"/quit");
     dsh.expect("Enter complete · Esc close".as_bytes());
@@ -632,6 +633,15 @@ fn linear_inspect_and_review_are_local_zero_escape_reports() {
     dsh.write(b"/theme PRIVATE_UNKNOWN_NAME\r");
     dsh.expect(b"[unknown theme; linear UI remains plain]");
     dsh.expect_occurrences(b"dsh > ", 6);
+    dsh.write(b"/motion reduced\r");
+    dsh.expect(b"[linear UI has no periodic animation]");
+    dsh.expect_occurrences(b"dsh > ", 7);
+    dsh.write(b"/motion PRIVATE_UNKNOWN_NAME\r");
+    dsh.expect(b"[unknown motion mode; linear UI has no periodic animation]");
+    dsh.expect_occurrences(b"dsh > ", 8);
+    dsh.write(b"/motions\r");
+    dsh.expect(b"[unknown motion mode; linear UI has no periodic animation]");
+    dsh.expect_occurrences(b"dsh > ", 9);
     let (status, transcript) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -639,6 +649,107 @@ fn linear_inspect_and_review_are_local_zero_escape_reports() {
     assert!(!transcript.contains(&0x1b));
     assert_eq!(requests.len(), 1);
     assert_eq!(last_user_content(&requests[0]), "build a linear review");
+}
+
+#[test]
+fn enhanced_working_spinner_switches_to_static_reduced_motion_without_model_input() {
+    let server = StalledSseServer::start(String::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    let turn = dsh.checkpoint();
+    dsh.write(b"keep this turn pending\r");
+    dsh.expect_after(turn, "● | Working".as_bytes());
+    dsh.expect_after(turn, "● / Working".as_bytes());
+    let animated_tail = dsh.snapshot()[turn..].to_vec();
+    let static_at = animated_tail
+        .windows("● Working".len())
+        .position(|window| window == "● Working".as_bytes())
+        .expect("the stable semantic icon should render before animation");
+    let phase_at = animated_tail
+        .windows("● | Working".len())
+        .position(|window| window == "● | Working".as_bytes())
+        .expect("the delayed first phase should render");
+    assert!(static_at < phase_at);
+
+    let changed = dsh.checkpoint();
+    dsh.write(b"/motion reduced\r");
+    dsh.expect_after(changed, "Motion changed · reduced".as_bytes());
+    let invalid = dsh.checkpoint();
+    dsh.write(b"/Motion reduced\r");
+    dsh.expect_after(invalid, b"Unknown motion mode");
+    let static_checkpoint = dsh.checkpoint();
+    dsh.write(b"x");
+    dsh.expect_after(static_checkpoint, "● Working".as_bytes());
+    let static_checkpoint = dsh.checkpoint();
+    std::thread::sleep(Duration::from_millis(500));
+    let static_tail = dsh.snapshot()[static_checkpoint..].to_vec();
+    for phase in ["● | Working", "● / Working", "● - Working", "● \\ Working"] {
+        assert!(
+            !static_tail
+                .windows(phase.len())
+                .any(|window| window == phase.as_bytes()),
+            "reduced motion must not emit periodic phase frames"
+        );
+    }
+
+    let cancelled = dsh.checkpoint();
+    dsh.write(&[0x03]);
+    dsh.expect(b"stopped; skipped");
+    dsh.expect_after(cancelled, b"Ready");
+    dsh.write(&[0x15]);
+    let (status, _) = dsh.exit_cleanly();
+    let (request, closed) = server.finish();
+
+    assert!(status.success());
+    assert!(closed);
+    assert_eq!(last_user_content(&request), "keep this turn pending");
+    assert!(!request.contains("/motion"));
+}
+
+#[test]
+fn reduced_motion_flag_is_static_in_enhanced_and_inert_in_zero_escape_linear_ui() {
+    let enhanced_server = StalledSseServer::start(String::new());
+    let enhanced_workspace = TestWorkspace::new();
+    let mut enhanced =
+        PtyHarness::spawn_reduced_motion(&enhanced_server.base_url, &enhanced_workspace.0, true);
+
+    enhanced.expect("❯".as_bytes());
+    let turn = enhanced.checkpoint();
+    enhanced.write(b"start reduced\r");
+    enhanced.expect_after(turn, "● Working".as_bytes());
+    std::thread::sleep(Duration::from_millis(500));
+    let tail = enhanced.snapshot()[turn..].to_vec();
+    for phase in ["● | Working", "● / Working", "● - Working", "● \\ Working"] {
+        assert!(
+            !tail
+                .windows(phase.len())
+                .any(|window| window == phase.as_bytes())
+        );
+    }
+    let cancelled = enhanced.checkpoint();
+    enhanced.write(&[0x03]);
+    enhanced.expect(b"stopped; skipped");
+    enhanced.expect_after(cancelled, b"Ready");
+    let (enhanced_status, _) = enhanced.exit_cleanly();
+    let (request, closed) = enhanced_server.finish();
+    assert!(enhanced_status.success());
+    assert!(closed);
+    assert_eq!(last_user_content(&request), "start reduced");
+
+    let linear_server = SequenceSseServer::start(Vec::new());
+    let linear_workspace = TestWorkspace::new();
+    let mut linear =
+        PtyHarness::spawn_reduced_motion(&linear_server.base_url, &linear_workspace.0, false);
+    linear.expect(b"dsh > ");
+    linear.write(b"/motion full\r");
+    linear.expect(b"[linear UI has no periodic animation]");
+    linear.expect_occurrences(b"dsh > ", 2);
+    let (linear_status, transcript) = linear.exit_cleanly();
+    assert!(linear_status.success());
+    assert!(!transcript.contains(&0x1b));
+    assert!(linear_server.finish().is_empty());
 }
 
 #[test]
@@ -2672,7 +2783,7 @@ fn interactive_resume_reuses_the_stored_context_and_reaches_a_new_prompt() {
 }
 
 #[test]
-fn enhanced_theme_is_process_local_and_resume_starts_from_adaptive() {
+fn enhanced_theme_and_motion_are_process_local_and_resume_starts_from_defaults() {
     let server = SequenceSseServer::start(vec![text_sse("theme persistence seed")]);
     let workspace = TestWorkspace::new();
     let caller_workspace = TestWorkspace::new();
@@ -2686,6 +2797,8 @@ fn enhanced_theme_is_process_local_and_resume_starts_from_adaptive() {
     first.expect("❯".as_bytes());
     first.write(b"/theme paper\r");
     first.expect("Theme changed · paper".as_bytes());
+    first.write(b"/motion reduced\r");
+    first.expect("Motion changed · reduced".as_bytes());
     first.write(b"persist one ordinary turn\r");
     first.expect(b"theme persistence seed");
     first.expect(b"Turn complete");
@@ -2706,6 +2819,16 @@ fn enhanced_theme_is_process_local_and_resume_starts_from_adaptive() {
             .windows(b"Theme changed".len())
             .any(|row| row == b"Theme changed")
     );
+    assert!(
+        !journal
+            .windows(b"/motion".len())
+            .any(|row| row == b"/motion")
+    );
+    assert!(
+        !journal
+            .windows(b"Motion changed".len())
+            .any(|row| row == b"Motion changed")
+    );
 
     let mut resumed = PtyHarness::spawn_resume_color_cargo(
         &server.base_url,
@@ -2718,6 +2841,9 @@ fn enhanced_theme_is_process_local_and_resume_starts_from_adaptive() {
     resumed.write(b"/theme\r");
     resumed.expect_after(shown, "Theme · adaptive".as_bytes());
     resumed.expect_after(shown, b"\x1b[1;33m");
+    let shown = resumed.checkpoint();
+    resumed.write(b"/motion\r");
+    resumed.expect_after(shown, "Motion · full".as_bytes());
     let (status, _) = resumed.exit_cleanly();
 
     assert!(status.success());

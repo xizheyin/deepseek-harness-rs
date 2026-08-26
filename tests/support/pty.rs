@@ -270,6 +270,12 @@ impl PtyHarness {
         )
     }
 
+    pub fn spawn_reduced_motion(base_url: &str, workspace: &Path, color: bool) -> Self {
+        let mut launch = PtyLaunch::cargo(color);
+        launch.extra_args.push("--reduced-motion".into());
+        Self::spawn_with_transcript_mode(base_url, workspace, false, None, None, None, launch)
+    }
+
     pub fn spawn_color_with_session_root_cargo(
         base_url: &str,
         workspace: &Path,

@@ -38,6 +38,7 @@ const HELP: &str = concat!(
     "  -w, --workspace <PATH>       Workspace (new: current; resume: optional identity check)\n",
     "      --plugin-config <PATH>   Enable explicitly configured local tool plugins\n",
     "      --tui <MODE>             Terminal UI: auto (default), enhanced, or linear\n",
+    "      --reduced-motion         Disable periodic enhanced-UI animation\n",
     "      --no-color               Disable color and force the linear terminal UI\n",
     "      --list-sessions          List persisted session headers\n",
     "      --resume <SESSION_ID>    Resume one persisted session\n",
@@ -102,6 +103,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         plugin_config,
         resume,
         no_color,
+        reduced_motion,
         tui,
     } = options;
     let plugin_config = plugin_config
@@ -276,6 +278,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
                 terminal,
                 &mut signals,
                 presentation,
+                reduced_motion,
             ))
             .map_err(EntryError::interactive),
         (surface, assembly) => {

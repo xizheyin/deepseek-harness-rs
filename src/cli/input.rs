@@ -1,4 +1,4 @@
-use crate::tui::theme::ThemeCommand;
+use crate::tui::{motion::MotionCommand, theme::ThemeCommand};
 
 pub(super) const MAX_INTERACTIVE_PROMPT_BYTES: usize = 1_000;
 pub(super) const MAX_APPROVAL_RECORD_BYTES: usize = 64;
@@ -94,6 +94,7 @@ pub(super) enum IdleInput {
     Inspect,
     Review,
     Theme(ThemeCommand),
+    Motion(MotionCommand),
     Exit,
     Submit(String),
 }
@@ -102,6 +103,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     let command = record.trim_matches(|character: char| character.is_ascii_whitespace());
     if let Some(theme) = ThemeCommand::parse(command) {
         return IdleInput::Theme(theme);
+    }
+    if let Some(motion) = MotionCommand::parse(command) {
+        return IdleInput::Motion(motion);
     }
     match command {
         "" => IdleInput::Redraw,
@@ -116,7 +120,10 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
 #[cfg(test)]
 mod tests {
     use super::{CanonicalRecordParser, IdleInput, InputRecordEvent, classify_idle_record};
-    use crate::tui::theme::{ThemeCommand, ThemePalette};
+    use crate::tui::{
+        motion::{MotionCommand, MotionPreference},
+        theme::{ThemeCommand, ThemePalette},
+    };
 
     fn feed(
         parser: &mut CanonicalRecordParser,
@@ -254,6 +261,22 @@ mod tests {
         assert_eq!(
             classify_idle_record(" /theme secret-name ", true),
             IdleInput::Theme(ThemeCommand::Invalid)
+        );
+        assert_eq!(
+            classify_idle_record(" /motion reduced ", true),
+            IdleInput::Motion(MotionCommand::Select(MotionPreference::Reduced))
+        );
+        assert_eq!(
+            classify_idle_record(" /motion secret-name ", true),
+            IdleInput::Motion(MotionCommand::Invalid)
+        );
+        assert_eq!(
+            classify_idle_record(" /Motion reduced ", true),
+            IdleInput::Motion(MotionCommand::Invalid)
+        );
+        assert_eq!(
+            classify_idle_record(" /motions ", true),
+            IdleInput::Motion(MotionCommand::Invalid)
         );
         assert_eq!(classify_idle_record(" /exit ", false), IdleInput::Exit);
         assert_eq!(classify_idle_record("\t/quit", true), IdleInput::Exit);

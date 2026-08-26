@@ -9,6 +9,7 @@ pub(crate) mod inline_screen;
 pub(crate) mod input_memory;
 pub(crate) mod key_decoder;
 pub(crate) mod markup;
+pub(crate) mod motion;
 pub(crate) mod presentation;
 pub(crate) mod projector;
 #[cfg(test)]

@@ -43,6 +43,7 @@ pub(super) struct CliOptions {
     pub(super) plugin_config: Option<String>,
     pub(super) resume: Option<SessionId>,
     pub(super) no_color: bool,
+    pub(super) reduced_motion: bool,
     pub(super) tui: TuiMode,
 }
 
@@ -106,6 +107,7 @@ pub(super) fn parse_args_os(
     let mut resume_seen = false;
     let mut tui_seen = false;
     let mut no_color_seen = false;
+    let mut reduced_motion_seen = false;
     let mut list_sessions_seen = false;
     let mut index = 0_usize;
     while index < arguments.len() {
@@ -120,6 +122,12 @@ pub(super) fn parse_args_os(
         if argument == "--no-color" {
             mark_once(&mut no_color_seen, "--no-color")?;
             options.no_color = true;
+            index += 1;
+            continue;
+        }
+        if argument == "--reduced-motion" {
+            mark_once(&mut reduced_motion_seen, "--reduced-motion")?;
+            options.reduced_motion = true;
             index += 1;
             continue;
         }
@@ -197,7 +205,13 @@ pub(super) fn parse_args_os(
         return Err(ParseError::PositionalArgument);
     }
     if list_sessions_seen {
-        if prompt_seen || model_seen || plugin_config_seen || resume_seen || tui_seen {
+        if prompt_seen
+            || model_seen
+            || plugin_config_seen
+            || resume_seen
+            || tui_seen
+            || reduced_motion_seen
+        {
             return Err(ParseError::InvalidListSessionsOptions);
         }
         return Ok(ParseAction::ListSessions(ListSessionsOptions {
@@ -351,6 +365,7 @@ mod tests {
             "/tmp/plugins.json",
             "--tui",
             "enhanced",
+            "--reduced-motion",
             "--no-color",
         ]))
         .unwrap();
@@ -360,6 +375,7 @@ mod tests {
             "--workspace=/tmp/work",
             "--plugin-config=/tmp/plugins.json",
             "--tui=enhanced",
+            "--reduced-motion",
             "--no-color",
         ]))
         .unwrap();
@@ -372,6 +388,7 @@ mod tests {
         assert_eq!(options.workspace.as_deref(), Some("/tmp/work"));
         assert_eq!(options.plugin_config.as_deref(), Some("/tmp/plugins.json"));
         assert_eq!(options.tui, TuiMode::Enhanced);
+        assert!(options.reduced_motion);
         assert!(options.no_color);
     }
 
@@ -406,6 +423,7 @@ mod tests {
                 "--resume=session-550e8400-e29b-41d4-a716-446655440001",
             ][..],
             &["--no-color", "--no-color"][..],
+            &["--reduced-motion", "--reduced-motion"][..],
             &["--tui", "auto", "--tui=linear"][..],
         ] {
             assert!(matches!(
@@ -552,6 +570,7 @@ mod tests {
         assert_eq!(options.plugin_config, None);
         assert_eq!(options.resume, None);
         assert!(!options.no_color);
+        assert!(!options.reduced_motion);
         assert_eq!(options.tui, TuiMode::Auto);
     }
 
@@ -574,6 +593,7 @@ mod tests {
             &["--list-sessions", "--model", "deepseek-chat"][..],
             &["--list-sessions", "--plugin-config", "/tmp/plugins.json"][..],
             &["--list-sessions", "--tui", "linear"][..],
+            &["--list-sessions", "--reduced-motion"][..],
             &[
                 "--list-sessions",
                 "--resume",
@@ -642,5 +662,20 @@ mod tests {
         ] {
             assert!(parse_args_os(os(&["--resume", invalid])).is_err());
         }
+    }
+
+    #[test]
+    fn reduced_motion_is_a_run_only_boolean_flag() {
+        let ParseAction::Run(options) =
+            parse_args_os(os(&["--reduced-motion", "--tui", "linear"])).unwrap()
+        else {
+            panic!("expected run options");
+        };
+        assert!(options.reduced_motion);
+        assert_eq!(options.tui, TuiMode::Linear);
+        assert!(matches!(
+            parse_args_os(os(&["--reduced-motion=full"])),
+            Err(ParseError::UnknownOption)
+        ));
     }
 }
