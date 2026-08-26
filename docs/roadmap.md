@@ -134,6 +134,15 @@ continue to ask, script mode continues to deny mutations, and the default
 remains `ask`. This checkpoint does not broaden the Phase 11 completion claim
 or add a sandbox.
 
+The next approval-friction checkpoint, requested on 2026-08-26, is also frozen
+in `docs/design/approval-modes.md` before implementation. A fully prepared
+built-in Shell approval gains one explicit `Allow exact Shell for this process`
+choice. The Agent may remember at most 64 sealed execution identities in RAM,
+and only after a clean command plus committed result; it never restores them
+from Session. `Allow once`, default Reject, script Deny, plugin Ask, all
+workdir/process/resource checks, and the no-sandbox warning remain unchanged.
+This is planned work inside Phase 11, not a completion claim.
+
 ## Still deferred
 
 - Web or desktop GUI

@@ -1358,6 +1358,19 @@ does not invent an upstream approval policy, auto-answer an asked question, or
 grant Shell/plugin authority. Exact scope and failure behavior are frozen in
 `docs/design/approval-modes.md`.
 
+The exact-Shell process-grant design additionally inspected
+`packages/acp/acp/src/index.ts` and `packages/acp/acp/tests/approval.spec.ts`.
+The ACP bridge advertises one-shot allow/reject options and rejects an unknown
+client response; it does not add a remembered exact-command outcome. Together
+with the user-approval sources above, this fixes the upstream fact that durable
+outcomes remain `allowed-once`, `rejected`, `cancelled`, or `unavailable`, and
+the separate session policy remains only `ask` or `never`. Rust's explicit
+process-local exact-Shell grant is therefore an intentional terminal-product
+difference. It leaves the durable outcome as the truthful first
+`allowed-once`, never restores authority from Session, and records no invented
+approval pair on a cache hit. The sealed identity, failure semantics, resource
+bound, and verification plan are frozen in `docs/design/approval-modes.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:
