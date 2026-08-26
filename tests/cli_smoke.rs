@@ -168,6 +168,45 @@ fn run(arguments: &[&str]) -> Output {
         .wait_with_output(Duration::from_secs(5))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum RedirectedTerminalStream {
+    Stdout,
+    Stderr,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_with_pty_and_one_redirected_output(
+    arguments: &[&str],
+    redirected: RedirectedTerminalStream,
+) -> (Output, Vec<u8>) {
+    let (mut master, slave) = pty_process::blocking::open().expect("test PTY should open");
+    let command = pty_process::blocking::Command::new(env!("CARGO_BIN_EXE_dsh")).args(arguments);
+    let command = match redirected {
+        RedirectedTerminalStream::Stdout => command.stdout(Stdio::piped()),
+        RedirectedTerminalStream::Stderr => command.stderr(Stdio::piped()),
+    };
+    let child = OwnedScriptChild::new(command.spawn(slave).expect("dsh should spawn on the PTY"));
+    // Read concurrently because Darwin may discard a closed slave's buffered
+    // diagnostic before a reader first observes the master.
+    let reader = thread::spawn(move || {
+        let mut transcript = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => transcript.extend_from_slice(&buffer[..read]),
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("PTY transcript should be readable: {error}"),
+            }
+        }
+        transcript
+    });
+    let output = child.wait_with_output(Duration::from_secs(5));
+    let transcript = reader.join().expect("PTY reader should join");
+    (output, transcript)
+}
+
 fn text_sse(text: &str) -> String {
     let text = serde_json::to_string(text).expect("test text should encode");
     format!(
@@ -2032,6 +2071,42 @@ fn explicit_approval_mode_rejects_piped_input_before_reading_it() {
         stderr(&output),
         "dsh: CLI_USAGE: --approval-mode is available only in interactive terminal mode\n"
     );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn explicit_approval_mode_rejects_each_redirected_output_before_loading_plugins() {
+    let workspace = script_workspace("approval-mode-partial-terminal");
+    let missing_config = workspace.join("must-not-be-read.json");
+    let missing_config = missing_config
+        .to_str()
+        .expect("test plugin config path should be Unicode");
+    let arguments = [
+        "--approval-mode",
+        "auto-edit",
+        "--plugin-config",
+        missing_config,
+    ];
+    let expected =
+        "dsh: CLI_USAGE: --approval-mode is available only in interactive terminal mode\n";
+
+    let (stdout_redirected, terminal_stderr) =
+        run_with_pty_and_one_redirected_output(&arguments, RedirectedTerminalStream::Stdout);
+    assert_eq!(stdout_redirected.status.code(), Some(2));
+    assert_eq!(stdout(&stdout_redirected), "");
+    assert_eq!(
+        String::from_utf8_lossy(&terminal_stderr).replace("\r\n", "\n"),
+        expected
+    );
+
+    let (stderr_redirected, terminal_stdout) =
+        run_with_pty_and_one_redirected_output(&arguments, RedirectedTerminalStream::Stderr);
+    assert_eq!(stderr_redirected.status.code(), Some(2));
+    assert_eq!(stderr(&stderr_redirected), expected);
+    assert!(terminal_stdout.is_empty());
+    assert!(!std::path::Path::new(missing_config).exists());
+
+    std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
 }
 
 #[test]

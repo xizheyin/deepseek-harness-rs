@@ -109,8 +109,15 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         approval_mode,
         approval_mode_explicit,
     } = options;
+    // Sample the complete launch surface before loading plugins or opening any
+    // other external state. An explicit approval mode is meaningful only when
+    // the same process will actually own an interactive terminal.
     let stdin_is_terminal = io::stdin().is_terminal();
-    if approval_mode_explicit && (prompt.is_some() || !stdin_is_terminal) {
+    let stdout_is_terminal = io::stdout().is_terminal();
+    let stderr_is_terminal = io::stderr().is_terminal();
+    if approval_mode_explicit
+        && (prompt.is_some() || !stdin_is_terminal || !stdout_is_terminal || !stderr_is_terminal)
+    {
         return Err(EntryError::usage(
             ParseError::ApprovalModeRequiresInteractive,
         ));
@@ -147,7 +154,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             .map_err(EntryError::input)?;
         LaunchSurface::Script(prompt)
     } else {
-        if !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+        if !stdout_is_terminal || !stderr_is_terminal {
             return Err(EntryError::partial_terminal());
         }
         let open = OpenTerminal::open_and_validate().map_err(EntryError::terminal)?;
