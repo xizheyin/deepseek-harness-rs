@@ -14,8 +14,9 @@ and a generator-provenanced semantic preview for real built-in `apply_patch`
 approvals. Bounded current-turn Inspect and one-summary Review are also
 production reachable in the primary-screen ledger. Six closed semantic themes,
 bounded source-preserving tables, and a closed seven-command completion palette
-transactionally share that ledger. It is still partial because file
-suggestions, reduced motion, the Session picker, installed Phase 11 acceptance,
+transactionally share that ledger. Bounded workspace-file suggestions now share
+the same transactional Dock and insert only literal relative paths. It is still
+partial because reduced motion, the Session picker, installed Phase 11 acceptance,
 real screenshots, real-emulator evidence, and same-candidate dual-platform CI
 are not complete.
 
@@ -38,8 +39,8 @@ The implementation work is divided into these checkpoints:
 3. truth-safe semantic tool cards and the joined turn receipt;
 4. bounded assistant markup and semantic canonical-patch approval preview;
 5. bounded Focus/Inspect/Review, context estimates, and compaction facts;
-6. themes (green), tables (green), commands (green), then file suggestions,
-   reduced motion, and Session picker;
+6. themes (green), tables (green), commands (green), file suggestions (green),
+   then reduced motion and Session picker;
 7. installed-binary PTY journey, real screenshots, clean-target repository
    gates, independent review, and macOS/Ubuntu CI.
 
@@ -544,6 +545,67 @@ safety, queue/Session, approval, terminal, or test-evidence problem. This is a
 green product checkpoint, not Phase 11 completion. File suggestions, Reduced
 Motion, the Session picker, installed Phase 11 acceptance, screenshots,
 real-emulator capture, and same-candidate macOS/Ubuntu CI remain pending.
+
+## Bounded workspace-file suggestion slice — 2026-08-26
+
+Implementation commit
+`5b9a0b3a2fa8ef62061029a202da04c8746dcfc0` makes the enhanced Focus `@`
+picker production reachable. It derives a whitespace-bounded token from the
+current Composer revision, scans relative paths through the same retained
+`WorkspaceAuthority` used by the built-in tools, skips symlinks and a closed
+set of generated/version-control directories, and never returns an absolute
+host path. Linear mode owns no suggestion controller and performs no scan.
+
+The scanner is iterative and capability-relative. It accepts exactly 10,000
+directory entries, 8 MiB of validated displayed path text, and depth 64. A
+real 10,000-entry/8-MiB tree proves the combined exact boundary and a one-byte
+rename proves fail-closed overflow; another gated test replaces an enumerated
+directory with a symlink before open and proves the retained `O_NOFOLLOW`
+walk does not cross it. Per-directory ordering uses cancellable in-place
+heapsort rather than retaining one descriptor per sibling.
+
+Filtering is deterministic: exact, path prefix, component prefix, substring,
+then the three non-exact ASCII-folded classes. A checked 64-MiB inspection
+budget covers validation, FNV hashing, collision equality, matching and output
+copy. Long loops interleave cancellation with at most 4-KiB real work blocks.
+The best 256 score/index records use a custom max-heap; a full-sort oracle
+matches its output and observes at most the designed 17 integer comparisons per
+path. Candidate copies accept 256 KiB exactly. Completion performs one
+revision/span-checked Composer edit to literal `@relative/path ` text and does
+not read, hash, attach, log, or send the selected file.
+
+Requested, staged, and presented credentials remain distinct. A screen may
+act only on its fully committed owned roster. Partial/poisoned/resize writes,
+approval takeover, and stale decoder epochs invalidate input authority. File
+rows are staged before the render snapshot, so a recoverable allocation failure
+renders and commits the same non-actionable `Unavailable` state. Controller
+failpoints prove ranking-commit, roster-copy, running-scan, and running-filter
+capacity failures preserve the ordinary Session and join the cancelled work.
+Two panic owners cancel Agent/tool and suggestion work; the active owner uses
+an allocation-free terminal restorer before concurrently draining both futures,
+and the outer owner covers idle/helper panics before common shutdown.
+
+Local validation used Rust 1.85.0 on Darwin 27.0.0 arm64 with fake models,
+loopback HTTP, temporary workspaces, and obvious fake credentials. No real API
+key, public network request, or model billing was used. The final same-tree
+`./scripts/verify.sh` passed formatting, all-target/all-feature checks and
+builds, 731 library tests plus 346 other tests (1,077 total), zero
+failed/ignored, Clippy with warnings denied, and both whitespace gates. The
+81-test real-binary PTY target contains 79 product journeys plus two harness
+regressions. Five file-specific journeys cover idle completion and rescan,
+local scan failure, active-turn queue fencing, approval stale-input takeover,
+and literal zero-dynamic-menu linear fallback.
+
+Three independent read-only reviews found no P0/P1 production defect after
+capacity, credential, panic-owner, cancellation-budget, symlink-race, and heap
+findings were fixed. This is a green product checkpoint, not complete
+file-suggestion acceptance or Phase 11 completion. Still-open test evidence is
+a forced gated trusted-UI panic ordering regression, direct wide-fanout file-
+descriptor peak measurement, deterministic coverage for every fallible
+allocation site and forced FNV collisions, and the remaining paste/detail/
+transaction permutations in the frozen acceptance list. Reduced Motion, the
+Session picker, installed Phase 11 acceptance, screenshots, real-emulator
+capture, and same-candidate macOS/Ubuntu CI also remain pending.
 
 ## Evidence pending
 

@@ -1012,7 +1012,7 @@ the current decoder read batch, so they never fall through to Composer history
 or queue recall and a following Enter byte in the same terminal read cannot
 pick or submit. A timed standalone Esc dismisses the current revision and
 cancels unfinished scanning or filtering without editing the draft. Rejected
-input or paste dismisses both dynamic menus at the current revision and retains
+input or a rejected paste dismisses both dynamic menus at the current revision and retains
 the existing local error. Paste only changes the draft; the existing paste fence completes
 before any suggestion can be picked or submitted.
 

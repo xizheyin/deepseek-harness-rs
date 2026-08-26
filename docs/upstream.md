@@ -1285,7 +1285,11 @@ resume history, or infer full diffs/commands from prose. These terminal-specific
 behaviors keep `docs/compatibility.md` `partial`. The first closed command
 palette is now production reachable for exactly `/help`, `/inspect`, `/review`,
 `/focus`, `/theme`, `/exit`, and `/quit`; it completes local input only and does
-not add a Session or Provider fact. File suggestions, reduced motion, and the
+not add a Session or Provider fact. The enhanced Focus path now also derives
+bounded workspace-file suggestions from the retained workspace capability and
+inserts only literal `@relative/path ` text. It performs no implicit read,
+attachment, Session event, or Provider request; approval and detail views own
+input priority, and linear mode performs no scan. Reduced motion and the
 Session picker remain unfinished. The command palette, table subset, and six
 closed semantic themes are Rust terminal-only presentation choices: they change
 no Session or upstream Agent fact, accept no user-defined escape strings, and
@@ -1309,12 +1313,14 @@ trigger rather than inferring its behavior from the current terminal product:
   it lists running child agents and inserts literal `@label ` text.
 
 That upstream `@` source is not a file catalogue and the fixed repository still
-has no built-in human TUI. Rust's planned `@relative/path ` insertion is
+has no built-in human TUI. Rust's implemented `@relative/path ` insertion is
 therefore an intentional terminal difference. It borrows the upstream
 cancellable-request/generation and literal-insertion shape, while every
 resource ceiling, the workspace capability, traversal exclusions, ranking,
 limits, Dock geometry, and
-no-implicit-read rule are Rust-owned and must be proven by the Phase 11 tests.
+no-implicit-read rule are Rust-owned. Production and PTY tests now cover the
+core scanner, ranking, completion, failure, stale-input, approval, and linear
+paths; the final Phase 11 acceptance matrix remains broader than this slice.
 
 The complete state, layout, safety, resource, and test design was frozen in
 `docs/design/tui-v2.md` before the production slices began.
