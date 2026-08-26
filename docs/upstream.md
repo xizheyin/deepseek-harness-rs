@@ -1334,8 +1334,29 @@ closed `/motion {full,reduced}` commands, the one-cell phase table, the 300-ms
 delay, 8-FPS ceiling, process-local reset, and screen-transaction rules. These
 choices may change only terminal presentation. They cannot change Agent timing,
 Provider/Session facts, approval priority, cancellation, tool side effects, or
-the zero-ESC linear fallback. Production implementation and tests remain
-pending at this design checkpoint.
+the zero-ESC linear fallback. Production implementation and its partial Phase
+11 evidence are recorded in `docs/validation/phase-11.md`.
+
+The interactive auto-edit design rechecked the fixed approval and tool-policy
+seams rather than treating terminal convenience as permission:
+
+- `packages/core/tools/src/index.ts` and `tests/tools.spec.ts` keep the closed
+  `allow` / `deny` / `ask` pre-tool decision, resolve `ask` only through the
+  approval service, and fail closed when that service or an answer is absent;
+- `packages/interaction/user-approval/src/{index,types,invariant}.ts` and
+  `tests/{approval,invariant}.spec.ts` keep one-shot `allowed-once`, `rejected`,
+  `cancelled`, and `unavailable` outcomes with a paired audit record. Their
+  separate session policy is only `ask` or `never`; it is not an auto-allow
+  switch;
+- the Phase 5 filesystem research already records that ordinary upstream
+  workspace writes can receive a pre-tool `allow`, while Rust deliberately
+  owns a stricter single-file `apply_patch` preparation and publication path.
+
+The planned `--approval-mode auto-edit` is therefore a Rust CLI policy choice:
+it maps only the already prepared built-in patch action to `Allow`. It does not
+invent an upstream approval policy, auto-answer an asked question, or grant
+Shell/plugin authority. Exact scope and failure behavior are frozen in
+`docs/design/approval-modes.md`.
 
 ## Local research copy
 
