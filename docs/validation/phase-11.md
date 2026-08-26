@@ -12,11 +12,12 @@ terminal profiles; the strict Phase 9 linear path remains the fallback. Phase
 11 now also has bounded assistant-only Markdown/code/fenced-diff presentation
 and a generator-provenanced semantic preview for real built-in `apply_patch`
 approvals. Bounded current-turn Inspect and one-summary Review are also
-production reachable in the primary-screen ledger. Six closed semantic themes
-and bounded source-preserving tables transactionally share that ledger. It is
-still partial because commands/suggestions, reduced motion, the Session picker,
-installed Phase 11 acceptance, real screenshots, real-emulator evidence, and
-same-candidate dual-platform CI are not complete.
+production reachable in the primary-screen ledger. Six closed semantic themes,
+bounded source-preserving tables, and a closed seven-command completion palette
+transactionally share that ledger. It is still partial because file
+suggestions, reduced motion, the Session picker, installed Phase 11 acceptance,
+real screenshots, real-emulator evidence, and same-candidate dual-platform CI
+are not complete.
 
 ## Frozen boundary
 
@@ -37,8 +38,8 @@ The implementation work is divided into these checkpoints:
 3. truth-safe semantic tool cards and the joined turn receipt;
 4. bounded assistant markup and semantic canonical-patch approval preview;
 5. bounded Focus/Inspect/Review, context estimates, and compaction facts;
-6. themes (green), tables (green), then commands, suggestions, and Session
-   picker;
+6. themes (green), tables (green), commands (green), then file suggestions,
+   reduced motion, and Session picker;
 7. installed-binary PTY journey, real screenshots, clean-target repository
    gates, independent review, and macOS/Ubuntu CI.
 
@@ -491,6 +492,57 @@ fragmentation, resource-accounting, terminal, or test-evidence problem after
 the identified physical-line and retained-budget issues were fixed. This is a
 green product checkpoint, not Phase 11 completion. Commands/file suggestions,
 Reduced Motion, Session picker, installed Phase 11 acceptance, screenshots,
+real-emulator capture, and same-candidate macOS/Ubuntu CI remain pending.
+
+## Closed local-command palette slice — 2026-08-26
+
+Implementation commit
+`6611d4bf1bfc48fc23605d054032e11aa1631e16` makes a bounded completion
+palette production reachable in enhanced Focus. Its compile-time catalogue is
+exactly `/help`, `/inspect`, `/review`, `/focus`, `/theme`, `/exit`, and
+`/quit`, in that stable order with product-owned ASCII descriptions. The
+entire single-line draft must start with `/` and keep its cursor at byte end;
+filtering is case-sensitive, an unknown prefix remains an ordinary prompt, and
+neither model, Session, workspace, nor configuration text can add an entry.
+
+One driver-owned state keeps only a selected command identity and an optional
+dismissed Composer revision. Dock receives an immutable snapshot. Up, Down,
+Tab, and BackTab clamp and end the current decoder read even at an edge or with
+no matches. Enter on a prefix performs one whole-draft undoable completion and
+also ends that read; only later fresh Enter input can execute the exact local
+command. Paste edits only and retains its existing input fence. The command
+classifier runs before the next-turn FIFO in idle and active states, while an
+automatic reserved queue front remains a prompt and is never reinterpreted as
+a command.
+
+Approval questions own both ordinary input and pending Composer-Esc expiry
+from the moment the joined question exists, including preview writing and the
+quiet arming interval. The default remains Reject, stale palette input cannot
+change the draft or exit, and rejection restores the same draft and selection.
+Inspect and Review suppress the palette without copying its mutable state.
+Zero-byte and partial Dock transactions, poisoned-screen recovery, and resize
+rederive the current snapshot while preserving idle/running identity. The
+12x5 rescue Dock keeps one transcript row, the selected command or fixed
+no-match row, Composer, and the compact `Enter · Esc` hint. Linear mode keeps
+whole-line commands and emits no dynamic palette or ESC bytes.
+
+Local validation used Rust 1.85.0 on Darwin arm64 with fake models, loopback
+HTTP, temporary workspaces, and obvious fake credentials. No real API key,
+public network request, or model billing was used. The final same-tree
+`./scripts/verify.sh` passed: formatting, all-target checks, 703 library tests
+plus 341 other tests (1,044 total), zero failed/ignored, Clippy with warnings
+denied, and whitespace checks. The 76-test real-binary PTY target contains 74
+product journeys plus 2 harness regressions. Focused evidence covers all four
+navigation keys and same-read fences, case-sensitive/no-match filtering,
+completion undo/history isolation, 44/80/112 and 12x5 layout, zero/partial
+screen recovery, idle and running local commands, exact full-request Session
+isolation, unknown prompt truth, queued-exit cleanup, approval stale-input
+takeover, and linear zero-ESC fallback.
+
+Three independent read-only reviews found no remaining P0/P1/P2 algorithm,
+safety, queue/Session, approval, terminal, or test-evidence problem. This is a
+green product checkpoint, not Phase 11 completion. File suggestions, Reduced
+Motion, the Session picker, installed Phase 11 acceptance, screenshots,
 real-emulator capture, and same-candidate macOS/Ubuntu CI remain pending.
 
 ## Evidence pending

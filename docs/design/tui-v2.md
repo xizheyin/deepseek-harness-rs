@@ -8,10 +8,10 @@ now add the owned composer, inline dock, one final truth-safe card per settled
 tool, one joined turn receipt, bounded assistant-only presentation, and a
 generator-provenanced semantic preview for real `apply_patch` approvals. A
 bounded current-turn Inspect and one-summary Review now use the same primary-
-screen ledger. Six closed semantic palettes and bounded source-preserving
-tables now use the same transactional screen ownership. Commands/suggestions,
-Session picker, installed screenshots, and the real-emulator matrix remain
-incomplete.
+screen ledger. Six closed semantic palettes, bounded source-preserving tables,
+and a closed seven-command completion palette now use the same transactional
+screen ownership. File suggestions, reduced motion, the Session picker,
+installed screenshots, and the real-emulator matrix remain incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
 interactive presentation and input ownership.
@@ -1015,10 +1015,10 @@ remain in force.
    compaction chronology, one joined summary Review, and transactional primary-
    screen Inspect/Review panels with local commands and approval takeover.
 8. **Remaining product checkpoint (partial)**: the six closed, transactional
-   semantic themes and bounded source-preserving tables are green. Commands/
-   suggestions and Session picker remain. Each sub-slice stays independently
-   green and pushed; this line does not claim that the remaining items are
-   implemented.
+   semantic themes, bounded source-preserving tables, and closed seven-command
+   palette are green. File suggestions, reduced motion, and the Session picker
+   remain. Each sub-slice stays independently green and pushed; this line does
+   not claim that the remaining items are implemented.
 9. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
    review, non-force push, dual-platform CI, and a separate completion-status

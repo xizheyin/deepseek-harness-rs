@@ -1282,12 +1282,15 @@ metadata, while one exactly joined Review reuses the Focus receipt and retains
 only trusted action summaries. It does not replay the Session, expose raw tool
 payloads or literal call/approval/compaction correlation IDs, reconstruct pre-
 resume history, or infer full diffs/commands from prose. These terminal-specific
-behaviors keep `docs/compatibility.md` `partial`. Commands/suggestions and the
-Session picker remain unfinished. The table subset and six closed semantic
-themes are Rust terminal-only presentation choices: they change no Session or
-upstream Agent fact, accept no user-defined escape strings, and reset to
-Adaptive in a new process. Installed Phase 11 evidence, screenshots, and the
-real-emulator/platform matrix must exist before any broader
+behaviors keep `docs/compatibility.md` `partial`. The first closed command
+palette is now production reachable for exactly `/help`, `/inspect`, `/review`,
+`/focus`, `/theme`, `/exit`, and `/quit`; it completes local input only and does
+not add a Session or Provider fact. File suggestions, reduced motion, and the
+Session picker remain unfinished. The command palette, table subset, and six
+closed semantic themes are Rust terminal-only presentation choices: they change
+no Session or upstream Agent fact, accept no user-defined escape strings, and
+themes reset to Adaptive in a new process. Installed Phase 11 evidence,
+screenshots, and the real-emulator/platform matrix must exist before any broader
 `intentional-difference` completion claim.
 
 The complete state, layout, safety, resource, and test design was frozen in
