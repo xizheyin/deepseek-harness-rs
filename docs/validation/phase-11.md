@@ -15,7 +15,9 @@ approvals. Bounded current-turn Inspect and one-summary Review are also
 production reachable in the primary-screen ledger. Six closed semantic themes,
 bounded source-preserving tables, a closed eight-command completion palette,
 bounded workspace-file suggestions, and process-local Reduced Motion now
-transactionally share that ledger. It is still partial because the Session picker, installed Phase 11 acceptance,
+transactionally share that ledger. An explicit process-local `auto-edit` mode
+now removes repeated built-in patch prompts without granting Shell or plugin
+authority. It is still partial because the Session picker, installed Phase 11 acceptance,
 real screenshots, real-emulator evidence, and same-candidate dual-platform CI
 are not complete.
 
@@ -683,6 +685,68 @@ misreported as completed coverage.
 This is a green product checkpoint, not Phase 11 completion. The Session
 picker, installed Phase 11 acceptance, screenshots, real-emulator capture, and
 same-candidate macOS/Ubuntu CI remain pending.
+
+## Explicit auto-edit approval slice — 2026-08-26
+
+Design commit `597d374ecfb8fc11b615f4800b866eefc1a5086f` freezes the
+boundary in `docs/design/approval-modes.md`; implementation commit
+`4901411e79e61397312a6cd711b8f49bbbf7bacc` and early-admission correction
+`b13d91e3bb5a013610c11b5582329a1038356303` make it production reachable.
+Exact, case-sensitive `--approval-mode ask|auto-edit` forms are accepted only
+when stdin, stdout, and stderr all select the interactive terminal surface.
+`ask` remains the default. An explicitly supplied mode with `--prompt`, piped
+input, or either redirected output fails as CLI usage before plugin loading,
+workspace/session preparation, credentials, or network work;
+`--list-sessions` rejects it.
+
+Assembly maps only `auto-edit`'s built-in file policy to `Allow`. Shell and
+configured plugin policies remain `Ask`, and all script policies remain
+`Deny`. The terminal approval provider stays installed because those other
+actions can still ask. The mode is absent from Session, workspace state,
+environment configuration, and Provider requests. A new process, including
+resume, therefore returns to `ask` unless the flag is supplied again.
+
+The real enhanced-PTY patch journey prepares and commits one canonical update
+without opening an approval selector, then reaches the correlated result and
+finishes the turn. Its journal contains no `approval/asked` or
+`approval/decided`, because no question occurred. A second process resumes the
+same Session without the flag, receives another patch, displays the default
+Reject selector, and leaves the file unchanged after rejection. Separate real
+PTY journeys prove that foreground Shell and a configured subprocess plugin
+still wait for terminal approval in `auto-edit` mode. CLI smoke tests prove
+explicit prompt and piped-input rejection, the advertised help text, and
+stdin-PTY processes with separately redirected stdout and stderr. Both partial-
+terminal cases name an absent plugin configuration and prove the approval-mode
+error wins before that file is opened.
+
+The mode changes no patch argument, path-capability, symlink/hardlink,
+preparation, conflict, resource, cancellation, timeout, intent-before-side-
+effect, result, or recovery code. The existing default-enabled FileChangePolicy
+`Allow` suites cover malformed/outside paths, links, publication races,
+cancellation, resource bounds, and committed-result truth. Users must still
+understand that an explicitly authorized patch can create or substantially
+rewrite one regular file inside the workspace.
+
+Local validation used Rust 1.85.0 on Darwin arm64 with fake models, loopback
+HTTP, temporary workspaces, and obvious fake credentials. `./scripts/verify.sh`
+passed: formatting, all-target checks, 757 library tests plus 353 other tests
+(1,110 total), zero failed/ignored, Clippy with warnings denied, and whitespace
+checks. No real API key, public network request, or model billing was used. The
+two implementation commits were pushed non-forced to `origin/main`.
+
+Three independent read-only reviews audited policy isolation, process-local
+lifetime, Session ordering, patch safety, early admission, and the real
+terminal matrix. The first reviews found that partial-terminal processes could
+read plugin configuration before rejecting an explicit mode; `b13d91e` fixed
+that ordering and added both redirected-output regressions. Final algorithm
+and safety reviews reported P0/P1/P2 = 0. The final test review reported
+P0/P1 = 0 and only the mechanical P2 updates to this SHA, matrix, count, and
+review record; this paragraph closes those documentation items. No production,
+safety, or test-matrix defect remains from the review.
+
+This is a green, explicit opt-in approval-usability checkpoint, not permission
+to auto-run arbitrary commands and not Phase 11 completion. The Session picker
+and the previously listed terminal/release evidence remain pending.
 
 ## Evidence pending
 

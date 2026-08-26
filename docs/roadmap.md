@@ -126,13 +126,13 @@ transaction without changing Session or Provider facts. The Session picker, scre
 evidence, and final same-candidate platform validation still prevent Phase 11
 completion.
 
-The user also requested less approval friction on 2026-08-26. The next bounded
-checkpoint is frozen in `docs/design/approval-modes.md`: an explicit,
-process-local interactive `auto-edit` mode may allow only the already prepared
-and workspace-confined built-in patch action. Shell and plugin actions continue
-to ask, script mode continues to deny mutations, and the default remains
-`ask`. This checkpoint does not broaden the Phase 11 completion claim or add a
-sandbox.
+The user also requested less approval friction on 2026-08-26. The resulting
+green checkpoint is frozen in `docs/design/approval-modes.md`: explicit,
+process-local interactive `--approval-mode auto-edit` allows only the already
+prepared and workspace-confined built-in patch action. Shell and plugin actions
+continue to ask, script mode continues to deny mutations, and the default
+remains `ask`. This checkpoint does not broaden the Phase 11 completion claim
+or add a sandbox.
 
 ## Still deferred
 

@@ -1352,10 +1352,10 @@ seams rather than treating terminal convenience as permission:
   workspace writes can receive a pre-tool `allow`, while Rust deliberately
   owns a stricter single-file `apply_patch` preparation and publication path.
 
-The planned `--approval-mode auto-edit` is therefore a Rust CLI policy choice:
-it maps only the already prepared built-in patch action to `Allow`. It does not
-invent an upstream approval policy, auto-answer an asked question, or grant
-Shell/plugin authority. Exact scope and failure behavior are frozen in
+The implemented `--approval-mode auto-edit` is therefore a Rust CLI policy
+choice: it maps only the already prepared built-in patch action to `Allow`. It
+does not invent an upstream approval policy, auto-answer an asked question, or
+grant Shell/plugin authority. Exact scope and failure behavior are frozen in
 `docs/design/approval-modes.md`.
 
 ## Local research copy
