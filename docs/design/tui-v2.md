@@ -9,8 +9,8 @@ tool, one joined turn receipt, bounded assistant-only presentation, and a
 generator-provenanced semantic preview for real `apply_patch` approvals. A
 bounded current-turn Inspect and one-summary Review now use the same primary-
 screen ledger. Six closed semantic palettes, bounded source-preserving tables,
-a closed seven-command completion palette, and bounded file suggestions now
-use the same transactional screen ownership. Reduced motion, the Session picker,
+a closed eight-command completion palette, bounded file suggestions, and Reduced
+Motion now use the same transactional screen ownership. The Session picker,
 installed screenshots, and the real-emulator matrix remain incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
@@ -1508,9 +1508,9 @@ remain in force.
    compaction chronology, one joined summary Review, and transactional primary-
    screen Inspect/Review panels with local commands and approval takeover.
 8. **Remaining product checkpoint (partial)**: the six closed, transactional
-   semantic themes, bounded source-preserving tables, closed seven-command
-   palette, and file suggestions are green. Reduced motion and the Session
-   picker remain. Each sub-slice stays independently green and pushed; this line does
+   semantic themes, bounded source-preserving tables, closed eight-command
+   palette, file suggestions, and Reduced Motion are green. The Session
+   picker remains. Each sub-slice stays independently green and pushed; this line does
    not claim that the remaining items are implemented.
 9. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent

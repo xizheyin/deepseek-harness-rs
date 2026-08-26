@@ -13,10 +13,9 @@ terminal profiles; the strict Phase 9 linear path remains the fallback. Phase
 and a generator-provenanced semantic preview for real built-in `apply_patch`
 approvals. Bounded current-turn Inspect and one-summary Review are also
 production reachable in the primary-screen ledger. Six closed semantic themes,
-bounded source-preserving tables, and a closed seven-command completion palette
-transactionally share that ledger. Bounded workspace-file suggestions now share
-the same transactional Dock and insert only literal relative paths. It is still
-partial because reduced motion, the Session picker, installed Phase 11 acceptance,
+bounded source-preserving tables, a closed eight-command completion palette,
+bounded workspace-file suggestions, and process-local Reduced Motion now
+transactionally share that ledger. It is still partial because the Session picker, installed Phase 11 acceptance,
 real screenshots, real-emulator evidence, and same-candidate dual-platform CI
 are not complete.
 
@@ -40,7 +39,7 @@ The implementation work is divided into these checkpoints:
 4. bounded assistant markup and semantic canonical-patch approval preview;
 5. bounded Focus/Inspect/Review, context estimates, and compaction facts;
 6. themes (green), tables (green), commands (green), file suggestions (green),
-   then reduced motion and Session picker;
+   Reduced Motion (green), then Session picker;
 7. installed-binary PTY journey, real screenshots, clean-target repository
    gates, independent review, and macOS/Ubuntu CI.
 
@@ -603,9 +602,87 @@ file-suggestion acceptance or Phase 11 completion. Still-open test evidence is
 a forced gated trusted-UI panic ordering regression, direct wide-fanout file-
 descriptor peak measurement, deterministic coverage for every fallible
 allocation site and forced FNV collisions, and the remaining paste/detail/
-transaction permutations in the frozen acceptance list. Reduced Motion, the
-Session picker, installed Phase 11 acceptance, screenshots, real-emulator
+transaction permutations in the frozen acceptance list. The Session picker,
+installed Phase 11 acceptance, screenshots, real-emulator
 capture, and same-candidate macOS/Ubuntu CI also remain pending.
+
+## Reduced Motion slice — 2026-08-26
+
+Implementation commit `7a1a81855cfcbc2e4d88a100ec5c53f2709d48d5` and
+transactional correctness follow-up
+`58abae7e997b40d0023acd4151c89b131c5b4d8a` make the frozen motion boundary
+production reachable. `--reduced-motion` selects the static enhanced mode at
+process start; exact local `/motion`, `/motion full`, and `/motion reduced`
+commands query or change it in idle and active turns. The command palette now
+contains exactly eight compile-time entries with `/motion` immediately after
+`/theme`. Linear and script modes accept the startup flag without creating an
+animation owner; linear commands report the inactive behavior with zero ESC
+bytes. `--list-sessions` rejects the unrelated flag.
+
+`MotionState` is owned beside Theme and keeps requested and screen-committed
+revisions. A local change gains input authority only after the Dock transaction
+commits; same-read input is fenced while the revisions differ. The preference
+is deliberately absent from Session, Provider, workspace configuration, and
+resume state. A second process therefore starts in `full` unless its own flag
+requests reduced mode.
+
+One active-turn `MotionClock` owns `(turn, generation, started_at,
+eligible_since)` and an optional deadline; it starts no task. The ordinary
+enhanced Focus `Working` row alone is eligible. Full motion delays its first
+phase for 300 ms, then advances the separate ASCII `| / - \\` cell every 125
+ms without catch-up. It adds whole seconds after one second and says `Still
+working` after five. Reduced mode keeps the semantic `●` icon static and wakes
+only for the `1s+` and `Still working` text milestones. Notices, menus, file
+status, queued prompts, approval, Inspect, Review, idle, and settled turns own
+no periodic motion deadline.
+
+Motion-only Dock transactions remain preemptible while bytes are pending.
+Zero-byte preemption discards the frame without committing its revision. A
+partial write poisons the coordinate ledger, performs the fixed visual reset,
+fences the same ordinary input read, processes the higher-priority Session/final
+fact, approval, file settlement, signal, or turn completion, and only then
+reattaches one authoritative Dock before accepting more input. Resize abandons
+rather than replays the old phase. Existing non-motion writes retain their
+original output deadline and serialization.
+
+Paused-time tests freeze the exact 300-ms/125-ms/one-second/five-second
+boundaries, all four ASCII phases, no catch-up, eligibility generations, stale
+generation rejection, pre-deadline rejection, turn settlement, elapsed-age
+retention across generation changes, and reduced-mode absence of periodic
+deadlines. Transaction tests cover zero/partial abort, poison, resize discard,
+and requested/committed input fencing. CLI tests cover the flag, duplicate,
+list rejection, closed parsing, local notices, eight-entry palette, and linear
+classification. Three real-binary motion journeys cover default animation and
+active switching, startup reduced mode plus linear zero-ESC fallback, local
+Session/Provider isolation, and default reset on resume. The complete current
+PTY target remains green with 81 product journeys plus two harness regressions.
+
+Dedicated motion PTY combinations for approval/detail/file/notice/queue
+suppression, the four frozen resize sizes, hostile paste/approval bytes,
+suspend/resume preference retention, reduced streaming, post-cleanup silence,
+and a real-driver partial-write recovery trace remain Phase 11 acceptance debt.
+The pure eligibility and priority tests cover the production decisions, but do
+not claim those terminal combinations have all been exercised yet.
+
+Local validation used Rust 1.85.0 on Darwin arm64 with fake models, loopback
+HTTP, temporary workspaces, and obvious fake credentials. No real API key,
+public network request, or model billing was used. `./scripts/verify.sh` passed:
+formatting, all-target checks, 754 library tests plus 348 other tests (1,102
+total), zero failed/ignored, Clippy with warnings denied, and whitespace checks.
+Both implementation commits were pushed non-forced to `origin/main`.
+
+Three independent read-only reviews repeatedly audited animation scheduling,
+screen-transaction ownership, fact/input/approval priority, preference
+transitions, hidden elapsed age, partial/resize recovery, TurnEnd, and Interrupt
+cleanup. The final algorithm and safety reviews reported P0/P1/P2 = 0. The test
+review reported production P0/P1 = 0 and only the mechanical evidence update
+for the final SHA and test count; this record closes that item. The dedicated
+motion PTY acceptance debt listed above remains explicit rather than being
+misreported as completed coverage.
+
+This is a green product checkpoint, not Phase 11 completion. The Session
+picker, installed Phase 11 acceptance, screenshots, real-emulator capture, and
+same-candidate macOS/Ubuntu CI remain pending.
 
 ## Evidence pending
 

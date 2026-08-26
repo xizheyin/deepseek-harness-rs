@@ -1284,13 +1284,14 @@ payloads or literal call/approval/compaction correlation IDs, reconstruct pre-
 resume history, or infer full diffs/commands from prose. These terminal-specific
 behaviors keep `docs/compatibility.md` `partial`. The first closed command
 palette is now production reachable for exactly `/help`, `/inspect`, `/review`,
-`/focus`, `/theme`, `/exit`, and `/quit`; it completes local input only and does
+`/focus`, `/theme`, `/motion`, `/exit`, and `/quit`; it completes local input only and does
 not add a Session or Provider fact. The enhanced Focus path now also derives
 bounded workspace-file suggestions from the retained workspace capability and
 inserts only literal `@relative/path ` text. It performs no implicit read,
 attachment, Session event, or Provider request; approval and detail views own
-input priority, and linear mode performs no scan. Reduced motion and the
-Session picker remain unfinished. The command palette, table subset, and six
+input priority, and linear mode performs no scan. Reduced Motion is now a
+process-local presentation path with no Session/Provider fact; the Session
+picker remains unfinished. The command palette, table subset, and six
 closed semantic themes are Rust terminal-only presentation choices: they change
 no Session or upstream Agent fact, accept no user-defined escape strings, and
 themes reset to Adaptive in a new process. Installed Phase 11 evidence,

@@ -112,7 +112,7 @@ tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
 The current green checkpoints implement bounded assistant-message markup,
 source-preserving 2–8-column pipe tables, six closed process-local semantic
-themes with transactional redraw, a closed seven-command completion palette, a
+themes with transactional redraw, a closed eight-command completion palette, a
 generator-provenanced semantic card for the real single-file `apply_patch`
 approval preview, bounded workspace-file suggestions, and bounded primary-screen Inspect/Review panels. Inspect
 shows only current-turn committed metadata and retained reasoning; Review keeps
@@ -120,8 +120,9 @@ one exactly joined summary and does not invent full historical diffs or command
 records. The exact canonical approval source is still shown before the existing
 default-Reject selector, while lookalike generic text remains opaque. File
 suggestions insert only bounded relative-path literals from the retained
-workspace capability and never read content. The Reduced Motion command/flag,
-transaction, clock, and acceptance design is frozen; its implementation, the Session picker, screenshots, real-emulator
+workspace capability and never read content. Reduced Motion now provides a
+process-local flag/command, bounded turn-owned clock, and preemptible screen
+transaction without changing Session or Provider facts. The Session picker, screenshots, real-emulator
 evidence, and final same-candidate platform validation still prevent Phase 11
 completion.
 

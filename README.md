@@ -45,7 +45,8 @@ dsh --workspace .
 默认 `--tui auto` 会在有颜色、`xterm*`、非 tmux/Screen/Zellij 且初始窗口至少
 44×12 时启用增强界面。看到 `❯` 后直接输入任务并按回车；其他环境会保守使用
 零 ESC 的 `dsh >` 线性界面。可用 `--tui enhanced` 或 `--tui linear` 明确选择；
-`--no-color`、`NO_COLOR` 和 `TERM=dumb` 会强制线性界面。例如：
+`--reduced-motion` 会关闭增强界面的周期动画；`--no-color`、`NO_COLOR` 和
+`TERM=dumb` 会强制线性界面。例如：
 
 ```text
 请先了解这个项目，再告诉我最值得修复的三个问题。
@@ -62,7 +63,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 代码理解 | 工作区内的 `list`、`glob`、`grep` 和 `read`，输出和扫描范围均有上限 |
 | 文件修改 | 严格的单文件 `apply_patch`，执行前展示实际 diff，并检查路径、符号链接和并发修改 |
 | 命令执行 | 经审批的前台 `bash`，限制输出和运行时间，并在正常可观察路径下终止、回收同进程组工作 |
-| 交互控制 | 实验性 Unicode 多行 Composer、忙时下一回合队列、动态 Dock、安全粘贴、6 套内置语义主题、源文本保持的有限表格、每个工具生命周期至多一张最终卡、回合收据、只读 Inspect/Review、审批、Ctrl+C 取消，以及严格线性后备 |
+| 交互控制 | 实验性 Unicode 多行 Composer、忙时下一回合队列、动态 Dock、安全粘贴、6 套内置语义主题、可关闭的工作状态动画、源文本保持的有限表格、每个工具生命周期至多一张最终卡、回合收据、只读 Inspect/Review、审批、Ctrl+C 取消，以及严格线性后备 |
 | 脚本模式 | `--prompt` 或管道输入；不会停下来等待审批，并安全拒绝写文件或 Shell 请求 |
 | 长会话 | 有上限的本地 JSONL、会话列表与恢复，以及一次有界的自动上下文摘要 |
 | 本地工具插件（实验性） | 显式配置受信任的子进程工具；协议、队列、输出、超时和清理都有上限，交互调用仍需审批 |
@@ -85,6 +86,7 @@ dsh --workspace .
 | `/inspect`、`/review` | 增强界面本地切换只读详情；线性界面输出零 ESC 报告；不会发送给模型或加入队列 |
 | `/focus` | 仅增强界面：从详情返回默认 Focus |
 | `/theme [NAME]` | 查询或选择 `adaptive`、`midnight`、`paper`、`color-blind`、`high-contrast`、`mono`；线性界面始终保持纯文本 |
+| `/motion [full|reduced]` | 查询或切换本进程的增强界面动画；线性界面没有周期动画 |
 | <kbd>Enter</kbd> | 空闲时发送；当前回合运行时加入下一回合 FIFO |
 | <kbd>Ctrl</kbd> + <kbd>J</kbd> | 在增强 Composer 中插入换行 |
 | 方向键、Home/End、Backspace/Delete | 按 Unicode 字素编辑；上下方向在边界浏览本进程已提交历史 |
@@ -125,11 +127,17 @@ Focus。首版不会从普通文字猜完整 diff、命令明细或执行时长�
 已有的 12×5 rescue Dock 中继续工作。
 
 在增强 Focus 中，当整条单行草稿以 `/` 开头且光标位于末尾时，Dock 会显示封闭的
-本地命令面板：`/help`、`/inspect`、`/review`、`/focus`、`/theme`、`/exit` 和
-`/quit`。方向键或 Tab/Shift+Tab 只移动选择，Enter 先补全；必须再按一次新的 Enter
+本地命令面板：`/help`、`/inspect`、`/review`、`/focus`、`/theme`、`/motion`、
+`/exit` 和 `/quit`。方向键或 Tab/Shift+Tab 只移动选择，Enter 先补全；必须再按一次新的 Enter
 才会执行。Esc 关闭面板但保留草稿，未知 `/...` 仍可作为普通提示词发送。模型运行时
 这些完整命令也只在本地处理，不进入下一回合队列或 Session；审批出现后则由默认
 Reject 的审批界面取得绝对优先权。线性后备继续使用整行命令，不显示动态面板。
+
+增强 Focus 的普通 `Working` 行在 300 毫秒后才开始最多每秒 8 次的 ASCII 相位动画，
+一秒后显示整秒等待时间，五秒后改为 `Still working`；`Ctrl+C stop` 提示始终立即可见。
+`--reduced-motion` 或 `/motion reduced` 会保留静态 `● Working` 和必要的文字里程碑，
+但不再周期重绘。这个选择只属于当前进程，不写入 Session；新进程（包括恢复会话）
+会重新使用默认 `full`，除非再次传入启动参数。
 
 在增强 Focus 中输入空白边界后的 `@` 会打开工作区文件建议。列表只扫描当前工作区内的
 普通文件，跳过符号链接、版本库、`target`、`node_modules` 等封闭目录；选择后只插入
