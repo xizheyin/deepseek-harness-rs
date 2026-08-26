@@ -1325,6 +1325,17 @@ paths; the final Phase 11 acceptance matrix remains broader than this slice.
 The complete state, layout, safety, resource, and test design was frozen in
 `docs/design/tui-v2.md` before the production slices began.
 
+The Reduced Motion checkpoint does not claim a new upstream semantic oracle.
+The fixed Harness has no built-in terminal spinner, local motion preference,
+or terminal command surface; its ACP/Web facts only determine when activity is
+truthfully pending or settled. Rust therefore owns `--reduced-motion`, the
+closed `/motion {full,reduced}` commands, the one-cell phase table, the 300-ms
+delay, 8-FPS ceiling, process-local reset, and screen-transaction rules. These
+choices may change only terminal presentation. They cannot change Agent timing,
+Provider/Session facts, approval priority, cancellation, tool side effects, or
+the zero-ESC linear fallback. Production implementation and tests remain
+pending at this design checkpoint.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

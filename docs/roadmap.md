@@ -120,7 +120,8 @@ one exactly joined summary and does not invent full historical diffs or command
 records. The exact canonical approval source is still shown before the existing
 default-Reject selector, while lookalike generic text remains opaque. File
 suggestions insert only bounded relative-path literals from the retained
-workspace capability and never read content. Reduced motion, the Session picker, screenshots, real-emulator
+workspace capability and never read content. The Reduced Motion command/flag,
+transaction, clock, and acceptance design is frozen; its implementation, the Session picker, screenshots, real-emulator
 evidence, and final same-candidate platform validation still prevent Phase 11
 completion.
 

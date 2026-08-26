@@ -9,8 +9,8 @@ tool, one joined turn receipt, bounded assistant-only presentation, and a
 generator-provenanced semantic preview for real `apply_patch` approvals. A
 bounded current-turn Inspect and one-summary Review now use the same primary-
 screen ledger. Six closed semantic palettes, bounded source-preserving tables,
-and a closed seven-command completion palette now use the same transactional
-screen ownership. File suggestions, reduced motion, the Session picker,
+a closed seven-command completion palette, and bounded file suggestions now
+use the same transactional screen ownership. Reduced motion, the Session picker,
 installed screenshots, and the real-emulator matrix remain incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
@@ -173,8 +173,7 @@ Built-in palettes are Adaptive, Midnight, Paper, Color-blind, High Contrast,
 and Mono.
 Adaptive uses the terminal's ordinary ANSI palette so it remains usable on
 unknown light/dark backgrounds. Themes are semantic token maps, never embedded
-escape strings in business events. Reduced Motion is a later product slice;
-when implemented it will disable spinner animation and use text changes only.
+escape strings in business events.
 
 The first theme checkpoint keeps that surface deliberately closed. Exact local
 commands `/theme adaptive`, `/theme midnight`, `/theme paper`,
@@ -197,6 +196,79 @@ takeover, and terminal failure keep the existing poison/recovery and
 default-Reject rules. Linear mode recognizes the same exact commands locally
 but reports that it is always plain, stores no inactive palette choice, and
 emits zero ESC bytes.
+
+### Motion preference
+
+Reduced Motion is a process-local presentation preference, not a Session,
+Provider, workspace, or persisted configuration fact. `--reduced-motion`
+starts the enhanced UI in reduced mode. Exact local commands are `/motion`,
+`/motion full`, and `/motion reduced`; the first reports the current preference
+and finite two-value list, while the latter two request a change. Unknown names,
+extra arguments, mixed case, `/motions`, and a repeated flag are local usage
+errors and never become prompts or next-turn queue entries. Each process without
+the flag starts in `full`, including a new process that resumes an existing
+Session. The same process retains the preference across turns, cancellation,
+approval, and suspend/resume. Script mode accepts the startup accessibility
+flag but has no animation. `--list-sessions` rejects it as unrelated. Linear
+mode recognizes the commands, reports that it has no periodic animation, stores
+no inactive enhanced preference, and emits zero ESC bytes.
+
+The command palette adds `/motion` immediately after `/theme`, making eight
+compile-time entries. `MotionState`, owned beside `ThemeState`, keeps separate
+requested and screen-committed revisions. A complete Dock transaction commits
+the request; zero-byte abort keeps the old committed preference, while partial,
+poisoned, or resized output follows the existing recovery path and redraws the
+latest request before input resumes. Old transactions cannot commit over a
+newer request. The preference never changes palette, text meaning, approval
+selection, Composer content, queue state, or a committed transcript line.
+
+The full enhanced Focus surface animates only when the row that will actually
+render is the ordinary top-level `Working` status: no command palette, file
+menu, notice, queued-status row, approval, Inspect, or Review may be visible.
+It keeps the stable semantic `●` icon and adds a separate one-cell ASCII phase
+column cycling `| / - \`. It waits 300 ms before the first phase and advances
+every 125 ms, for at most 8 total timed redraws/second. After one second it adds
+whole elapsed seconds; after five seconds the status says `Still working`.
+The ordinary hint continues to show `Ctrl+C stop` immediately and motion never
+delays or removes it. Reduced mode keeps static `● Working`, performs no phase
+ticks, and makes at most two timed text-only updates (`1s+` and `Still working`)
+at the one- and five-second thresholds. Workspace-file loading keeps its
+existing static text and `Esc` close hint; it does not create an independent
+animation clock or claim file content is being read. Idle, Ready, Empty,
+Unavailable, and every excluded surface have no periodic motion wake. Stream
+chunks, scan settlement, approval, resize, and final facts remain visible
+because they are factual changes, not animation. The terminal emulator's own
+cursor blink is outside dsh ownership and is not claimed as controlled.
+
+No timer task is spawned. The turn driver owns exactly one clock identity
+`(turn, activity_generation, started_at, eligible_since)` and one optional
+deadline. Elapsed milestones use `started_at`; the 300-ms phase delay uses the
+latest `eligible_since`. Hiding the status disarms all wakeups, and showing it
+again creates a new eligibility generation rather than catching up missed
+ticks. Every tick rechecks turn, generation, requested/committed preference,
+and visible eligibility before staging.
+
+The existing biased turn loop samples the optional deadline after signal,
+input, approval, Session/final-fact, and file-settlement work. A tick while a
+non-motion screen transaction is pending only coalesces to one later Dock
+redraw. A staged motion-only Dock transaction remains preemptible: the loop
+continues polling high-priority input and committed facts. If preemption occurs
+before any motion byte is written, it aborts the motion transaction cleanly. If
+any byte was written, it aborts into the existing poisoned-screen recovery,
+fences ordinary input, processes the authoritative fact, and redraws that fact
+before accepting input again. Approval then follows the unchanged Focus →
+preview → input flush → 100-ms arming → default-Reject sequence. No abandoned
+or completed motion phase is replayed. Motion never queues frames, starts a
+second writer, delays cancellation, or resets the absolute output deadline.
+Leaving eligible Focus, approval takeover, suspend, exit, and turn settlement
+disarm the deadline. Switching to reduced removes the periodic deadline
+immediately; switching back to full enables it only after the request commits
+to the Dock and starts a new 300-ms eligibility delay.
+
+Motion timing is independent of the 35-ms Escape decoder wait, 100-ms paste and
+approval fences, 250-ms poison reset, five-second output deadline, Agent/tool/
+Provider timeouts, and process observation clocks. Reduced mode changes none of
+those safety or protocol deadlines.
 
 ## Responsive layouts
 
@@ -728,11 +800,10 @@ reduced motion, help, status, sessions, exit, and quit are local commands.
 Commands that would change Agent or Session semantics must follow the ordinary
 audited boundary rather than being hidden UI actions.
 
-The first command-palette checkpoint is narrower than that future combined
-surface. It contains exactly the seven local commands that already exist in
-production: `/help`, `/inspect`, `/review`, `/focus`, `/theme`, `/exit`, and
-`/quit`. Theme names remain arguments to `/theme`; future commands such as
-status, sessions, Reduced Motion, or file suggestions must not appear before
+The motion checkpoint expands the command palette to exactly eight local
+commands: `/help`, `/inspect`, `/review`, `/focus`, `/theme`, `/motion`,
+`/exit`, and `/quit`. Theme and motion names remain arguments to their commands;
+future commands such as status or sessions must not appear before
 their own production path exists. The closed entry table owns a short ASCII
 description for each command, and neither model, Session, workspace, nor
 configuration text can add an entry. This listed order is also the stable menu
@@ -749,7 +820,7 @@ Enhanced Focus derives palette visibility only when the **entire** draft is a
 single line whose first byte is `/` and whose cursor is at the draft's byte end.
 Leading whitespace, a slash after other text, any LF, or a cursor inside the
 draft hides it. Filtering is case-sensitive ASCII prefix matching against the
-seven closed spellings. Selection stays by command identity while the prefix,
+eight closed spellings. Selection stays by command identity while the prefix,
 width, or height changes only while that identity remains in the current match
 set. If an edit removes it, selection moves to the first match in closed-table
 order; no matches means no selectable identity. Up/Down move within matches,
@@ -780,20 +851,21 @@ InputMemory history/reverse-search navigation, and leaves queue/history
 contents unchanged.
 Approval focus suppresses the palette, and Inspect/Review keep their existing
 input rules. During a running turn, completing `/inspect`, `/review`, `/focus`,
-or `/theme` still cannot queue it; the fresh submitted command follows the
-existing exact local-command path. All seven exact commands are classified
+`/theme`, or `/motion` still cannot queue it; the fresh submitted command follows
+the existing exact local-command path. All eight exact commands are classified
 before `PromptQueue` in both idle and running states and never enter the FIFO or
 Session. `/help` stays local; view/theme commands keep their current local
-actions; `/exit` and `/quit` use the existing owned shutdown path, including
-turn cancellation, required cleanup, Session settlement, terminal restoration,
-and no automatic admission of queued prompts. They therefore cannot be
-triggered by an arrow and Enter arriving in one terminal read.
+actions; motion follows the same local isolation. `/exit` and `/quit` use the
+existing owned shutdown path, including turn cancellation, required cleanup,
+Session settlement, terminal restoration, and no automatic admission of queued
+prompts. They therefore cannot be triggered by an arrow and Enter arriving in
+one terminal read.
 
 In a non-compact Dock, visible menu rows are
 `min(matches-or-empty-row, width_cap, rows - 8)`, where `width_cap` is three
-below 60 columns and seven otherwise; the subtraction preserves the ordinary
+below 60 columns and eight otherwise; the subtraction preserves the ordinary
 status/divider/four Composer/hint rows plus at least one transcript row. Thus
-80/112-column layouts with at least 15 rows may show all seven, while the 44×12
+80/112-column layouts with at least 16 rows may show all eight, while the 44×12
 threshold shows at most three selected-centered rows. In every compact layout
 the selected command (or fixed empty row) replaces the ordinary status row, so
 the Composer and compact `Enter · Esc` hint remain visible with one transcript
@@ -1108,8 +1180,8 @@ canonical input, numbered or lettered decisions, and append-only status lines;
 there is no cursor animation or dock rewrite. Every enhanced interaction has a
 plain semantic path, though mouse and cursor-rich editing are accelerators, not
 requirements. Mono and High Contrast never use color as the only distinction.
-The later Reduced Motion slice will remove spinner frames. An optional
-product-owned bell or title
+Reduced Motion removes spinner frames while retaining factual text updates. An
+optional product-owned bell or title
 notice may fire only when approval is ready or a long turn completes; model
 text never controls it and the default is off.
 
@@ -1180,7 +1252,7 @@ text never controls it and the default is off.
 | screen transaction | 2 MiB |
 | retained split grapheme | 1 KiB |
 | visible suggestion rows | 12 |
-| command palette entries | 7 compile-time entries; at most 3 visible at 44×12 and 1 at 12×5 |
+| command palette entries | 8 compile-time entries; at most 3 visible at 44×12 and 1 at 12×5 |
 | file suggestion query | 1,024 UTF-8 bytes |
 | file suggestion scan/filter | 10,000 directory entries, 8 MiB cumulative validated path text, and 64 MiB matching inspections; one owned cooperatively cancellable blocking job |
 | file suggestion candidate roster | 256 paths and 256 KiB path text per copy; at most requested + staged + presented |
@@ -1270,7 +1342,7 @@ remain in force.
 9. `./scripts/verify.sh`, Phase 9/10 acceptance, the new Phase 11 acceptance,
    `git diff --check`, independent safety/UX review, and macOS/Ubuntu CI all
    pass with zero ignored tests.
-10. Command-palette reducer tests cover all seven closed entries/order/default,
+10. Command-palette reducer tests cover all eight closed entries/order/default,
     exact whole-draft/cursor visibility, case-sensitive prefix filtering,
     stale-selection fallback, no-match, Esc dismissal, and all four
     Up/Down/Tab/BackTab clamp plus read-fence transitions. Completion tests
@@ -1283,7 +1355,7 @@ remain in force.
     one read only navigates, a later fresh Enter completes a prefix, and another
     fresh Enter executes it; an already exact command after same-read navigation
     also waits for a fresh Enter. Paste plus same-read CR cannot execute. All
-    seven exact commands remain queue/Session-isolated during a running turn,
+    eight exact commands remain queue/Session-isolated during a running turn,
     and an unknown slash draft remains the only ordinary queued prompt. A real
     `apply_patch` approval arriving over an open palette suppresses it, discards
     stale palette input, keeps Reject selected and the file unchanged, then
@@ -1391,6 +1463,24 @@ remain in force.
     default test stays offline through temporary workspaces, controlled
     enumerators, allocation failpoints/charged test types, in-memory Session
     facts, and a loopback fake Provider.
+12. Motion tests cover the eight-entry command order and completion fences;
+    exact Show/full/reduced/invalid parsing; flag, duplicate, and list-session
+    admission; requested/committed revision races; the 300-ms delay, four fixed
+    ASCII phases, 125-ms interval, and one-/five-second thresholds under paused time.
+    Reduced, idle, file-status, notice, approval, Inspect, and Review states
+    prove zero periodic ticks. Active input, signals, approvals, Provider/
+    Session events, file settlement, and final facts outrank a simultaneous
+    tick. A high-priority fact or input preempts a zero-byte motion transaction;
+    partial motion output poisons and recovers before the fact redraw, while the
+    same-read ordinary input is fenced. Other pending, poison, and resize output
+    only coalesces; no old preference or phase gains input authority. Idle and
+    active commands prove zero UserMessage, Provider request, queue, workspace
+    scan, or JSONL fact. Paste and approval bytes cannot switch the preference.
+    Real PTY journeys cover full phase changes, reduced static output while
+    streaming continues, detail/approval suppression, 112/80/44/12x5 resize,
+    suspend/resume retention, new-process resume reset, startup flag behavior,
+    and linear zero-ESC/zero-ticker output. Cleanup proves there is no background
+    timer or post-exit frame.
 
 ## Implementation checkpoints
 
@@ -1418,9 +1508,9 @@ remain in force.
    compaction chronology, one joined summary Review, and transactional primary-
    screen Inspect/Review panels with local commands and approval takeover.
 8. **Remaining product checkpoint (partial)**: the six closed, transactional
-   semantic themes, bounded source-preserving tables, and closed seven-command
-   palette are green. File suggestions, reduced motion, and the Session picker
-   remain. Each sub-slice stays independently green and pushed; this line does
+   semantic themes, bounded source-preserving tables, closed seven-command
+   palette, and file suggestions are green. Reduced motion and the Session
+   picker remain. Each sub-slice stays independently green and pushed; this line does
    not claim that the remaining items are implemented.
 9. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
