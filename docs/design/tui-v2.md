@@ -809,6 +809,298 @@ wide no-match row uses `No matching local command`. Compact no-match uses the
 separate product-owned `! No match` spelling and no `>` selection marker, so it
 fits the 11-cell rescue width without pretending the empty row is actionable.
 
+The next suggestions checkpoint adds one product-owned `@` source for regular
+workspace files. This is an intentional terminal feature, not a claim that the
+fixed upstream has file mentions. The fixed upstream Web client supplies a
+useful interaction baseline in
+`packages/client/ui-input-trigger/src/{types,core/detect,client/controller}.ts`:
+it detects whitespace-bounded `/`/`@` tokens, stamps the draft revision into a
+pick span, supplies a cancellable request, and ignores stale generations.
+Its shipped `@` provider in `packages/client/ui-subagent/src/client/index.ts`
+lists running child agents and inserts literal `@label ` text; it does not list
+files or read file content. Rust adopts the cancellable request, generation,
+literal-insertion, and compare-at-swap ideas while deliberately
+using one closed workspace-file source instead of the upstream dynamic browser
+registry, reference codec, or subagent meaning.
+
+The enhanced driver owns one `FileSuggestionController` beside `InputMemory`
+and `CommandPaletteState`. CLI assembly gives it a clone of the same retained
+`WorkspaceAuthority` capability used by local tools; no path is reopened from
+ambient process state. The controller owns the current token hit, monotonic
+activation, blocking-job, and menu revisions, an optional selected relative
+path, an optional dismissed Composer revision, one optional bounded catalogue,
+and at most one owned blocking job plus its cancellation token.
+
+The pure TUI state never traverses the filesystem. Dock borrows an immutable
+requested snapshot containing only status, relative paths, the selected index,
+and a bounded menu revision. The controller separately owns the presented
+`Absent | Valid | Invalidated` state for suggestion surfaces. No absolute
+workspace root, file bytes, modification
+time, Session object, model object, Provider credential, or approval capability
+crosses this seam.
+
+`Debug` is manually redacted for the controller, lifecycle states, token hit,
+blocking-job result, requested/staged/presented snapshot, and presentation
+credential. It may expose only closed state names, activation/job/menu
+revisions, counts, byte lengths, capped/handle/capability booleans, and selected
+index presence. It never formats query text, relative or absolute paths,
+catalogue entries, selected path text, raw I/O errors, or terminal controls.
+
+An active file token is derived from Composer whenever all of these rules hold;
+it is visible and input-actionable only in enhanced Focus:
+
+- the cursor is at the byte end of a non-whitespace token, so completion never
+  leaves an unseen suffix behind;
+- scanning backward from the cursor reaches an `@` before any Unicode
+  whitespace; an `@` that fails the boundary rule is ordinary token text and
+  scanning continues left, so `@foo@bar` uses the first `@`;
+- the character before `@`, if any, is Unicode whitespace or is neither a
+  Unicode alphanumeric character nor `_`; this keeps `user@host` inert while
+  allowing `(@src` and `see @src`;
+- the query after `@` is at most 1,024 UTF-8 bytes and contains no control
+  character.
+
+The hit records `{start, end, content_revision}` on UTF-8 boundaries. An `@`
+token may appear at the start of a draft or inline after ordinary prompt text,
+including on a later line. `/` inside the file query is ordinary path text. If
+an `@` hit is active, its menu has input priority over the whole-draft command
+palette; otherwise the existing `/` behavior is unchanged. Moving the cursor
+inside a token, typing whitespace, submitting, clearing the draft, or a
+revision-scoped Esc dismissal closes the active token. Inspect/Review instead
+suppresses its presentation and input without closing the token or changing its
+activation, so bounded work may settle while the detail surface is visible. A
+later content edit clears the dismissal and recomputes the hit. Linear
+presentation treats every `@` as ordinary prompt text and performs no workspace
+scan.
+
+The controller lifecycle is explicit: `Dormant`, `Scanning`, `Filtering`,
+`Cancelling`, `Ready`, or `Failed`. `Scanning` owns the activation and job revision,
+cancellation token, and one `spawn_blocking` filesystem join handle.
+`Filtering` moves the retained `Vec<String>` catalogue into one cancellable
+blocking ranking job for the latest query; its join result returns both the
+unchanged catalogue and the ranked roster. Cancellation or a checked filtering
+failure also returns catalogue ownership, so the latest pending query can retry
+without a second filesystem scan; a join panic loses it and degrades to
+unavailable. `Cancelling` keeps the same single
+handle, its work kind, and at most one latest pending hit; a filtering handle
+still owns the catalogue until it joins. Thus
+the controller owns at most one blocking job of either kind. Closing the token
+or approval takeover cancels and hides immediately; it never awaits cleanup on
+the input or approval path.
+Reopening while `Cancelling` only replaces the bounded pending hit. The event
+loop polls the old join handle alongside terminal, Session, and signal work,
+recovers every returned owner, and only then may start pending work. If a
+cancelled filter and pending hit have the same activation, query supersession
+discards only the stale roster and reuses the returned catalogue. If the token
+closed, approval suppressed it, or the pending hit has a new activation, the
+returned catalogue is discarded and reopening performs a fresh scan. A join
+handle is never overwritten or dropped to detach work. `Ready` owns one
+catalogue plus the ranked requested snapshot for the current hit, while
+`Failed` owns only the redacted local status.
+
+Query edits during `Scanning` update the latest query without restarting the
+filesystem walk; the scan's settled catalogue is filtered only for that latest
+query. Query edits during `Filtering` cancel the ranking job and replace the
+pending query; a new filter starts only after the old handle joins. Query edits
+during `Ready` retain the catalogue and enter `Filtering`. Filesystem scanning
+therefore occurs once per active token, while every potentially adversarial
+ranking pass remains off the UI worker and cancellable.
+
+The first active token starts one lazy catalogue scan and shows `Scanning
+workspace...`. The complete scan runs on Tokio's blocking pool, not on an async
+or UI worker. It uses an iterative depth-first walk with at most 64 descendant
+levels and at most root-plus-64 directory handles. Every descendant directory
+is opened component by component relative to the retained capability with
+`O_NOFOLLOW`; a directory-to-symlink replacement therefore fails the whole
+catalogue without returning a partial result. The worker checks cancellation
+before each open, directory batch, and entry, closes frames as it leaves them,
+and never uses recursive Rust calls or retains one descriptor per wide child.
+An individual kernel directory call cannot be forcibly cancelled and may still
+delay task settlement; this design makes no hard-timeout claim for stuck kernel
+I/O.
+
+The scan accepts only UTF-8 regular-file paths without control characters and
+never follows a symlink. The closed skipped-directory set is `.git`, `.svn`,
+`.hg`, `.bzr`, `.jj`, `.sl`, `target`, `node_modules`, `.venv`, `venv`,
+`.cache`, `.next`, `__pycache__`, `build`, and `dist`. Every other directory,
+including other dot directories, is eligible. Exact component equality applies;
+names such as `builder` are not skipped.
+
+Every directory entry observed before file-kind or skip decisions counts toward
+the 10,000-entry ceiling, including directories, symlinks, and special files.
+After 10,000 admitted entries the worker performs one non-retaining probe: EOF
+accepts the catalogue, while a 10,001st item fails it. The 8-MiB counter is the
+checked sum of each validated relative display path exactly once, including
+skipped and non-file entries; exactly 8 MiB is accepted and byte +1 fails.
+Catalogue strings, DFS frames, and directory batches move those charged paths.
+Vector capacities, the at-most-10,000 fixed rank records, the selected path,
+and three at-most-256-KiB requested/staged/presented roster copies are
+independently bounded. Candidate copies use `String::try_reserve` and preserve
+the exact source text. Every explicit collection growth uses checked arithmetic
+and `try_reserve`; its capacity failure becomes the same redacted unavailable
+state. As elsewhere in this Rust binary, unrecoverable global allocator
+exhaustion may abort the process and is not misrepresented as a catchable
+result.
+
+Closing and later opening a new token starts a fresh activation and scan so
+files created during the process can appear. A late scan result is accepted
+only for the same still-active activation, including while a detail view
+suppresses it, and is then filtered for the latest hit. A late filter result
+also requires its exact job revision, query, Composer revision, and span.
+Anything else is discarded without changing requested or presented state.
+Normal, signal, terminal-error, and approval-exit paths call the controller's
+async shutdown. Enhanced shutdown first cancels and restores/detaches the exact
+terminal mode and screen, then awaits the owned blocking join before process
+exit; stuck kernel I/O may delay process exit but cannot leave the user's
+terminal in cbreak. Controller replacement uses the same async settle-before-
+replace path. No production path relies on `Drop` to join asynchronously.
+
+The controller is constructed outside the enhanced driver's future-level panic
+boundary together with an outer current-turn cancellation registry; the inner
+UI future only borrows them. A trusted UI-helper panic is caught there and its
+payload is never persisted. This catch does not suppress Rust's process-global
+panic hook, which may already have written a diagnostic as recorded in
+`docs/compatibility.md`.
+
+The outer owner synchronously triggers both current Agent/tool cancellation and
+the scan/filter token before waiting for either side, then immediately
+restores/detaches the terminal. It concurrently drains the existing owned
+Agent/tool cleanup and the suggestion join; Session closes only after Agent
+facts settle. A stuck directory syscall may delay final process exit, but it
+cannot delay the tool-cancellation signal or terminal restoration. Unwinding
+therefore cannot drop-detach the blocking job before cleanup regains ownership.
+
+Filtering is deterministic and does not perform fuzzy inference. The scanner
+sorts each directory's admitted entries by raw UTF-8 name bytes before its
+depth-first step and assigns each file a stable catalogue ordinal. An empty
+query matches every catalogued path in that deterministic order. A non-empty
+query ranks in this order: exact path, case-sensitive path prefix,
+case-sensitive path-component prefix, case-sensitive substring, then the same
+three non-exact classes using ASCII-only case folding. Non-ASCII text is
+therefore case-sensitive. Within a
+class, an earlier match byte wins, then fewer UTF-8 bytes, then catalogue
+ordinal. Duplicate display paths are removed before the bounded roster copies.
+The blocking filter preprocesses at most two 1,024-byte KMP failure tables and
+uses linear byte scans for case-sensitive and ASCII-folded substring matching;
+prefix and component-prefix checks inspect each path byte only a fixed number
+of times. It maintains the best 256 score/index records in a bounded binary
+heap instead of sorting or comparing path text. At most eight integer-score
+comparisons insert into a non-full heap; a full custom max-heap uses one root
+comparison plus at most eight two-comparison sift-down levels, for at most 17
+integer comparisons per catalogued path. The complete refinement has an
+explicit 64-MiB byte-inspection ceiling, checks cancellation for every path and
+each 4-KiB inner-loop block, uses checked counters, and never runs on the
+terminal event-loop worker. Exactly 256 paths and exactly 256 KiB of path text
+are accepted. A 257th ranked path or the first ranked path byte that would
+exceed 256 KiB is omitted with every later match and labels the retained
+deterministic prefix `showing top matches`; this candidate cap is not a scan
+failure. A path is completion-eligible only when
+`draft_bytes - span_bytes + 1 + path_bytes + 1 <= 64 KiB`, accounting for `@`
+and the trailing space; other paths are excluded before ranking. A zero-match
+result shows `No matching workspace file`. Neither status row is actionable.
+Filesystem or explicit collection-capacity failure uses the same unavailable
+row with no host path or operating-system error detail and does not end the
+terminal Session. A query of
+exactly 1,024 bytes is active; one of 1,025 bytes hides the menu and performs no
+scan rather than retaining or displaying an oversized query.
+
+Selection is kept by exact relative-path identity across query refinement and
+resize while that path still matches; otherwise it falls back to the first
+ranked path. Up/Down and Tab/BackTab clamp rather than wrap. Those four keys are
+menu keys even during loading, no-match, or unavailable states and always end
+the current decoder read batch, so they never fall through to Composer history
+or queue recall and a following Enter byte in the same terminal read cannot
+pick or submit. A timed standalone Esc dismisses the current revision and
+cancels unfinished scanning or filtering without editing the draft. Rejected
+input or paste dismisses both dynamic menus at the current revision and retains
+the existing local error. Paste only changes the draft; the existing paste fence completes
+before any suggestion can be picked or submitted.
+
+Requested state is not authority to act. Presented state is one of `Absent`,
+`Valid(RankedSnapshot)`, or `Invalidated`. Every staged Focus Dock carries a
+bounded presentation credential containing its activation, menu revision,
+Composer revision and span, status, an owned bounded candidate
+roster, and its optional selected index; the selected path is
+`roster[selected]`, never a fourth text copy. The staged roster is a fallible
+bounded text copy, not a self-reference into a catalogue that a filtering job
+may own. Only complete success of that exact Dock transaction atomically
+installs `Valid`; a successful hidden/detail surface installs `Absent`. A
+non-resize abort before writing any byte retains the preceding fully committed
+state because the terminal did not change.
+
+Any partial write, physical resize, or poisoned screen sets `Invalidated`
+before terminal reads resume. While invalidated, the decoder epoch is reset and
+all input bytes are discarded behind a fresh-read fence; Enter cannot submit
+and file navigation cannot move or pick. Signal and cleanup polling continue.
+Only a full recovery transaction may replace it with `Valid` or `Absent`.
+Candidate work may therefore become Ready while the terminal still displays
+`Scanning workspace...`, but those requested paths are not actionable yet.
+
+Outside `Invalidated`, the input reducer reads only the presented state, never
+the newer requested selection. The branches are closed: `Absent` or a Valid
+loading/empty/unavailable snapshot has no actionable row, so Enter follows the
+ordinary submit/queue rule and file navigation is a fenced no-op; a Valid real
+row whose activation, Composer revision, and span match picks/navigates exactly
+the displayed roster; a Valid real row with a stale hit consumes Enter and
+navigation as fenced no-ops without submitting. Same-read fencing remains in
+force. A newly requested result or selection can replace this authority only
+after the corresponding redraw commits, so no arrow or Enter can operate on an
+unseen file.
+
+Enter with a real selection performs a compare-at-swap check: the current
+Composer revision and exact `@query` span must still equal the hit that produced
+the menu. On success it atomically replaces only that span with
+`@relative/path ` as one undoable edit, leaves all surrounding prompt text
+byte-for-byte unchanged, moves the cursor after the trailing ASCII space,
+detaches history/reverse-search navigation, and ends the read batch. Spaces in
+a selected path are inserted literally; the trailing delimiter closes the
+menu. Picking never submits, queues, opens, reads, hashes, or attaches the file.
+Only a fresh later Enter sends or queues the ordinary prompt, and the model sees
+the same literal text the user sees. Every Enter attempt made while a real file
+selection is visible ends the current decoder read batch even when the
+compare-at-swap, Composer-capacity, or allocation check fails. If the draft
+revision, token span, activation, or presented menu revision changes, the compare-at-swap
+fails and the pick is a local no-op followed by resynchronization. The file may
+be renamed or removed after catalogue creation; because picking deliberately performs no
+filesystem revalidation, an otherwise current selection still inserts its
+literal relative path; a later explicit file tool revalidates existence under
+its ordinary policy. Enter with no real selection keeps the ordinary
+submit/queue behavior.
+
+Approval remains the strongest input owner from committed question through
+preview, arming, rendering, and acceptance. Takeover cancels unfinished file
+scanning or filtering, invalidates any Ready catalogue or Failed status,
+suppresses the menu, and resets the enhanced decoder epoch. It retains only the draft and selected
+path identity, never stale candidate rows, and cannot turn stale arrows or
+Enter into a file pick or an approval. In the exact
+`Cancelling { pending: Some(_) } + ApprovalQuestion` transition, pending becomes
+`None` and the controller is marked suppressed. If the old join settles while
+the question exists, it becomes suppressed `Dormant` and cannot spawn. After
+approval settles, the controller derives a new hit from the then-current
+Composer rather than reviving pending data, and the still-active token always
+starts a fresh activation; once that catalogue settles, the
+retained selected path is restored only if it still ranks. Inspect/Review, by
+contrast, suppress the menu without changing the draft or selection; a
+settled bounded catalogue may be reused when Focus returns. During a running
+turn the same feature edits only the next-turn draft. A catalogue result that
+arrives while transcript output is partially written requests a coalesced Dock
+redraw after that transaction; it never aborts, duplicates, or reorders the
+committed transcript. Resize changes only the selected-centered window.
+
+The non-compact file window shows at most
+`min(matches-or-status-row, 12, rows - 8)` rows, preserving the ordinary
+status/divider/four Composer/hint rows and one transcript row. The selected
+index uses the same centered-window formula as commands. Compact rescue shows
+only the selected `@path` or one fixed loading/empty/unavailable row in the
+status position, plus the Composer and `Enter · Esc` hint. Path text is passed
+through the visible-control renderer and truncated only for display; the
+underlying completion string is unchanged. All Dock and screen-transaction
+limits remain authoritative. A capped non-compact result reuses the existing
+status row as `Workspace files · showing top matches` (prefixed by `Working ·`
+during a turn), so it consumes no candidate or transcript row. The 12×5 compact
+rescue deliberately omits this advisory label and keeps the exact selected row,
+Composer, and `Enter · Esc` hint; resizing back to non-compact reveals it.
+
 ## Plain and accessible rendering
 
 Plain output contains zero ESC bytes and complete textual labels. It uses
@@ -889,7 +1181,9 @@ text never controls it and the default is off.
 | retained split grapheme | 1 KiB |
 | visible suggestion rows | 12 |
 | command palette entries | 7 compile-time entries; at most 3 visible at 44×12 and 1 at 12×5 |
-| file suggestion candidates | 256 |
+| file suggestion query | 1,024 UTF-8 bytes |
+| file suggestion scan/filter | 10,000 directory entries, 8 MiB cumulative validated path text, and 64 MiB matching inspections; one owned cooperatively cancellable blocking job |
+| file suggestion candidate roster | 256 paths and 256 KiB path text per copy; at most requested + staged + presented |
 | dynamic dock | 24 rows |
 | composer visible height | 8 rows |
 | ordinary refresh | 30 FPS |
@@ -920,10 +1214,17 @@ remain in force.
 | Situation | Required UI behavior |
 | --- | --- |
 | invalid UTF-8 key bytes | visible local input error; draft and Session unchanged |
-| incomplete/unknown CSI | dismiss command palette at the current Composer revision with draft unchanged; cancel approval or insert visible text elsewhere as specified; never Allow |
+| incomplete/unknown CSI | dismiss command and file menus at the current Composer revision with draft unchanged; cancel approval or insert visible text elsewhere as specified; never Allow |
 | command prefix has no match | fixed local empty-state row; draft remains submittable as an ordinary prompt |
 | resize/partial write while command palette is open | preserve draft and selected command identity through the existing screen transaction; no command action |
 | approval arrives while command palette is open | suppress palette, commit approval takeover, and retain default Reject; draft remains unchanged |
+| file suggestion scan is pending | fixed loading row; draft stays editable; no implicit submit or file read |
+| file suggestion scan/filter is cancelled or settles late | join owned work and discard a mismatched activation or job revision; no stale Dock mutation |
+| file suggestion scan fails or exceeds a bound | fixed unavailable row without absolute path or OS error detail; ordinary prompt submission remains available |
+| file query has no match | fixed non-actionable empty row; ordinary prompt submission remains available |
+| draft or token span changes before pick | Composer revision/span compare fails locally; resynchronize without editing or reading a file |
+| catalogued file changes or disappears before an otherwise current pick | insert the same literal relative path; never imply that it still exists and perform no filesystem revalidation |
+| approval arrives while file suggestions are open | cancel unfinished scan, suppress menu, reset stale input, and retain default Reject |
 | oversized prompt/paste/queue | reject locally without losing the previous draft |
 | resize during stream | reflow dock; no repeated transcript or cursor loss |
 | resize during approval | preserve Reject/selection; no decision |
@@ -938,7 +1239,7 @@ remain in force.
 | Provider/tool error | one actionable error component plus raw code in Inspect |
 | outcome unknown | prominent unresolved result; never render success or replay |
 | Session/compaction error | explain what remains safe and whether continuation is possible |
-| panic in trusted UI helper | catch at owned boundary where possible, restore terminal, never persist panic payload |
+| panic in trusted UI helper | outer owner signals Agent/tool and suggestion cancellation, restores terminal, concurrently joins both cleanup paths, then closes Session; panic payload is not persisted, while the global hook limitation remains |
 
 ## Acceptance tests
 
@@ -988,6 +1289,108 @@ remain in force.
     stale palette input, keeps Reject selected and the file unchanged, then
     restores the exact draft after rejection. A linear partial prefix emits no
     dynamic palette and remains zero-ESC.
+11. File-suggestion pure tests cover Unicode-safe trigger boundaries,
+    `user@host`, invalid-nearer-`@` scan-through, inline/multiline hits,
+    cursor-at-token-end, control queries, `@` priority over a whole-draft `/`
+    menu, every cursor/whitespace/submit/clear close condition, separate
+    Inspect/Review suppression, Rejected/PasteRejected error preservation,
+    stale activation/job/menu revision rejection, failure/empty/loading states, deterministic ranking
+    and identity retention, all four navigation clamps, revision-scoped
+    dismissal, and exact span compare-at-swap. Manual Debug tests place
+    `SECRET`, ESC, bidi, hostile relative paths, raw I/O detail, and an absolute
+    root sentinel in every controller/job/snapshot state; formatted output
+    contains only revisions, counts, lengths, and closed booleans. Boundary tests accept a
+    1,024-byte query and suppress a 1,025-byte query with zero scan; accept
+    10,000 scanned entries and 8 MiB of scan paths, while +1 yields unavailable
+    with no partial catalogue; accept 256 candidates and 256 KiB, while
+    candidate +1 or byte +1 stops at the labeled deterministic prefix; and
+    accept a completion whose exact whole-draft replacement is 64 KiB and
+    exclude 64 KiB + 1. Checked arithmetic and fixed rank-record capacity use a
+    deterministic allocation failpoint for every `try_reserve` failure; charged
+    path and roster counters prove the catalogue plus three bounded text-copy
+    owners match the declared model. A separate process-abort test is neither
+    required nor falsely presented as recovery from global allocator OOM. The
+    combined worst-case temporary-memory model has an exact test.
+
+    Workspace tests cover the shared retained authority, regular files, every
+    skipped directory plus an included dot directory, symlink/non-UTF-8/control
+    denial, and absence of file content or absolute-root output. A gated
+    directory-to-symlink replacement never crosses the link and returns no
+    partial catalogue. Depth 64 is accepted, depth 65 fails, and a wide fanout
+    proves the descriptor count stays at root-plus-64 rather than one per child.
+    Controlled scan tests separately close the token, expire Esc, start
+    approval, shut down, and replace the controller. Close and approval cancel
+    without awaiting the gated worker; a reopen stores only the latest pending
+    hit, and the next scan starts only after the old join settles. Shutdown
+    restores the exact terminal before waiting for that join. A late mismatched
+    activation or job revision cannot change state or Dock. A forced trusted UI panic gates both
+    an active tool and suggestion worker: both cancellation tokens are observed
+    before either gate is released, the terminal restores before either join,
+    Agent/tool and suggestion cleanup drain concurrently, Session closes last,
+    and the payload never enters Session. The test makes no false assertion that
+    `catch_unwind` silences the process-global panic hook. An exhaustive reducer permutation covers
+    `Cancelling(pending) → ApprovalQuestion → old join → approval settle`: the
+    pending hit is cleared, no work starts under approval, and only a newly
+    derived Composer hit may restart. Filtering-query supersession returns the
+    same catalogue from the cancelled job, runs only the latest query, and does
+    not increment the filesystem-scan counter. By contrast,
+    `Filtering(activation A) → close → reopen(activation B)` joins and discards
+    A's catalogue, then increments the scan counter exactly once for B. An adversarial 8-MiB repeated-prefix
+    catalogue plus 1,024-byte near-match query stays within the 64-MiB matching
+    counter and 17-integer-comparison-per-path heap bound while input, signal,
+    and approval polling remain responsive.
+    Loading, no-match, and unavailable
+    states each consume all four navigation keys and fence same-read CR without
+    history or submission; one fresh CR alone takes the ordinary submit path.
+
+    Composer/InputMemory tests prove one undoable token replacement,
+    surrounding-text preservation, cursor/trailing-space behavior, history
+    detachment, unchanged queue/history, stale draft/span rejection, and literal
+    insertion after the catalogued file is renamed or removed. A stale visible
+    selection followed by `CR CR` in one read fences after the failed first CAS,
+    so the second CR cannot pick or submit. When an old Ready roster remains
+    presented while a changed query is Filtering, its owned neighbor list is
+    never replaced by requested data; because the hit is stale, arrows and Enter
+    are fenced no-ops until the new roster commits. Dock/InlineScreen tests cover the
+    exact `min(matches-or-status, 12, rows - 8)` counts at `112×34` (12),
+    `80×24` (12), and `44×12` (4), selected-centered windows, the exact
+    `12×5` one selected/status row plus Composer and `Enter · Esc` rows,
+    non-compact capped status with no extra row, compact cap-label omission,
+    visible-control safety, unchanged completion bytes after display truncation,
+    and `112×34→44×12→12×5→80×24` selection/path identity. A gated scan
+    settles during both zero-byte and partial transcript writes: requested
+    candidates cannot answer Enter or arrows before their presentation
+    credential commits; the still-presented loading state alone governs input.
+    Arrow is a fenced no-op and Enter takes only the ordinary loading-state
+    submit/queue path with the literal draft, never a hidden pick. The flow
+    causes no transcript abort, duplication, or reordering. A non-resize
+    zero-byte abort retains the old complete credential; partial, poison, and
+    resize paths enter `Invalidated`. Injected CR/arrows during that recovery
+    gap are discarded and cannot submit, move, or pick before the full recovery
+    commit. The flow then coalesces to one later Dock redraw/credential commit.
+
+    Real PTY journeys cover idle and running inline completion, same-read
+    arrow/Enter fencing, paste fencing, spaces in paths, rescan after a newly
+    created file, scan failure, and approval takeover with exact draft/selection
+    restoration, default Reject, unchanged file, and joined scan cancellation.
+    Stale file-menu Down/Enter bytes are injected before the approval preview
+    and arming fence; they neither pick a path, move to Allow, nor decide, and
+    only a fresh Reject is accepted. Ready/Failed data is invalidated and the
+    post-settlement scan counter increases by exactly one rather than reusing an
+    old catalogue.
+    Inspect and Review separately suppress suggestions without draft/selection
+    mutation; a scan settling in either detail view does not draw there, and
+    returning to Focus reuses that catalogue without another scan. Picking at
+    idle leaves queue length, Session UserMessage count, Provider request count,
+    and content-read probes at zero; fresh Enter produces exactly one literal
+    UserMessage and one request. Picking during a turn still changes none of
+    those counts and does not queue; fresh Enter adds exactly one next-turn
+    item, whose later admission makes the second request contain the exact
+    visible literal text. Linear mode records zero suggestion scans, sends the
+    ordinary literal `@` prompt once, and emits zero dynamic ESC output. Every
+    default test stays offline through temporary workspaces, controlled
+    enumerators, allocation failpoints/charged test types, in-memory Session
+    facts, and a loopback fake Provider.
 
 ## Implementation checkpoints
 

@@ -119,7 +119,8 @@ shows only current-turn committed metadata and retained reasoning; Review keeps
 one exactly joined summary and does not invent full historical diffs or command
 records. The exact canonical approval source is still shown before the existing
 default-Reject selector, while lookalike generic text remains opaque. File
-suggestions, reduced motion, the Session picker, screenshots, real-emulator
+suggestions (the bounded workspace-file design is now frozen, implementation
+pending), reduced motion, the Session picker, screenshots, real-emulator
 evidence, and final same-candidate platform validation still prevent Phase 11
 completion.
 

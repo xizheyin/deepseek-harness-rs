@@ -1293,6 +1293,29 @@ themes reset to Adaptive in a new process. Installed Phase 11 evidence,
 screenshots, and the real-emulator/platform matrix must exist before any broader
 `intentional-difference` completion claim.
 
+The file-suggestion design also inspected the fixed upstream browser input
+trigger rather than inferring its behavior from the current terminal product:
+
+- `packages/client/ui-input-trigger/src/types.ts` defines the `/`/`@` source,
+  cancellable candidate request, revision-stamped token span, and literal-text
+  pick contracts;
+- `packages/client/ui-input-trigger/src/core/detect.ts` and
+  `tests/core-detect.client.spec.ts` fix whitespace-bounded trigger detection,
+  word/URL guards, inline positions, caret spans, and guard tiers;
+- `packages/client/ui-input-trigger/src/client/controller.ts` plus the
+  query-supersession, stale-generation, dismissal, arbitration, and pick tests
+  in `tests/service.client.spec.ts` fix abort and compare-at-swap ownership;
+- `packages/client/ui-subagent/src/client/index.ts` is the shipped `@` source:
+  it lists running child agents and inserts literal `@label ` text.
+
+That upstream `@` source is not a file catalogue and the fixed repository still
+has no built-in human TUI. Rust's planned `@relative/path ` insertion is
+therefore an intentional terminal difference. It borrows the upstream
+cancellable-request/generation and literal-insertion shape, while every
+resource ceiling, the workspace capability, traversal exclusions, ranking,
+limits, Dock geometry, and
+no-implicit-read rule are Rust-owned and must be proven by the Phase 11 tests.
+
 The complete state, layout, safety, resource, and test design was frozen in
 `docs/design/tui-v2.md` before the production slices began.
 
