@@ -1,9 +1,17 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    entropy::EntropySource,
     model::CallId,
     session::{ApprovalOutcome, ApprovalRequestId},
 };
@@ -11,6 +19,127 @@ use crate::{
 pub const MAX_APPROVAL_PREVIEW_BYTES: usize = 64 * 1024;
 pub const MAX_APPROVAL_REASON_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_APPROVAL_PATCH_PATH_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_EXACT_SHELL_IDENTITY_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_EXACT_SHELL_GRANTS: usize = 64;
+
+/// Transient, sealed execution facts used only to derive a process-local key.
+#[derive(Eq, PartialEq)]
+pub(crate) struct ExactShellGrantIdentity {
+    encoded: Vec<u8>,
+}
+
+impl ExactShellGrantIdentity {
+    pub(crate) fn new(encoded: Vec<u8>) -> Option<Self> {
+        if encoded.is_empty() || encoded.len() > MAX_EXACT_SHELL_IDENTITY_BYTES {
+            return None;
+        }
+        Some(Self { encoded })
+    }
+
+    fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+}
+
+impl std::fmt::Debug for ExactShellGrantIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactShellGrantIdentity")
+            .field("encoded_bytes", &self.encoded.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ExactShellGrantDigest([u8; 32]);
+
+impl std::fmt::Debug for ExactShellGrantDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ExactShellGrantDigest(<redacted>)")
+    }
+}
+
+pub(crate) struct ExactShellGrantStore {
+    key: Option<aws_lc_rs::hmac::Key>,
+    grants: Vec<ExactShellGrantDigest>,
+}
+
+impl std::fmt::Debug for ExactShellGrantStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExactShellGrantStore")
+            .field("enabled", &self.key.is_some())
+            .field("grants", &self.grants.len())
+            .field("capacity", &MAX_EXACT_SHELL_GRANTS)
+            .finish()
+    }
+}
+
+impl ExactShellGrantStore {
+    pub(crate) fn new() -> Self {
+        Self::with_entropy(EntropySource::system())
+    }
+
+    fn with_entropy(entropy: EntropySource) -> Self {
+        let mut grants = Vec::new();
+        if grants.try_reserve_exact(MAX_EXACT_SHELL_GRANTS).is_err() {
+            return Self { key: None, grants };
+        }
+        let mut key_bytes = [0_u8; 32];
+        let key = if entropy.fill(&mut key_bytes).is_ok() {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, &key_bytes)
+            }))
+            .ok()
+        } else {
+            None
+        };
+        key_bytes.fill(0);
+        Self { key, grants }
+    }
+
+    #[cfg(test)]
+    fn with_entropy_for_test(entropy: EntropySource) -> Self {
+        Self::with_entropy(entropy)
+    }
+
+    pub(crate) fn digest(
+        &self,
+        identity: &ExactShellGrantIdentity,
+    ) -> Option<ExactShellGrantDigest> {
+        let key = self.key.as_ref()?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut bytes = [0_u8; 32];
+            aws_lc_rs::hmac::sign_to_buffer(key, identity.encoded(), &mut bytes).ok()?;
+            Some(ExactShellGrantDigest(bytes))
+        }))
+        .ok()
+        .flatten()
+    }
+
+    pub(crate) fn can_insert(&self) -> bool {
+        self.key.is_some() && self.grants.len() < MAX_EXACT_SHELL_GRANTS
+    }
+
+    pub(crate) fn take(&mut self, digest: ExactShellGrantDigest) -> bool {
+        let Some(index) = self.grants.iter().position(|grant| *grant == digest) else {
+            return false;
+        };
+        self.grants.swap_remove(index);
+        true
+    }
+
+    pub(crate) fn insert(&mut self, digest: ExactShellGrantDigest) -> bool {
+        if self.grants.contains(&digest) {
+            return true;
+        }
+        if !self.can_insert() {
+            return false;
+        }
+        self.grants.push(digest);
+        true
+    }
+}
 
 /// Closed operation facts produced by the built-in patch preparation path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,6 +427,7 @@ pub struct ApprovalRequest {
     reason: Option<String>,
     preview: Arc<str>,
     preview_kind: ApprovalPreviewKind,
+    exact_shell_scope: Option<ApprovalScopeReceipt>,
 }
 
 impl std::fmt::Debug for ApprovalRequest {
@@ -311,6 +441,10 @@ impl std::fmt::Debug for ApprovalRequest {
             .field("reason_bytes", &self.reason.as_ref().map_or(0, String::len))
             .field("preview_bytes", &self.preview.len())
             .field("preview_kind", &self.preview_kind)
+            .field(
+                "exact_shell_scope_available",
+                &self.exact_shell_scope.is_some(),
+            )
             .finish()
     }
 }
@@ -329,7 +463,29 @@ impl ApprovalRequest {
             reason: prompt.reason.clone(),
             preview: Arc::clone(&prompt.preview),
             preview_kind: prompt.preview_kind.clone(),
+            exact_shell_scope: None,
         }
+    }
+
+    pub(crate) fn new_with_exact_shell_scope(
+        id: ApprovalRequestId,
+        tool_name: String,
+        call_id: CallId,
+        prompt: &ApprovalPrompt,
+    ) -> (Self, ApprovalScopeReceipt) {
+        let receipt = ApprovalScopeReceipt::new();
+        (
+            Self {
+                id,
+                tool_name,
+                call_id,
+                reason: prompt.reason.clone(),
+                preview: Arc::clone(&prompt.preview),
+                preview_kind: prompt.preview_kind.clone(),
+                exact_shell_scope: Some(receipt.clone()),
+            },
+            receipt,
+        )
     }
 
     #[must_use]
@@ -366,7 +522,61 @@ impl ApprovalRequest {
     pub(crate) fn preview_arc(&self) -> Arc<str> {
         Arc::clone(&self.preview)
     }
+
+    #[must_use]
+    pub(crate) fn exact_shell_scope_available(&self) -> bool {
+        self.exact_shell_scope.is_some()
+    }
+
+    pub(crate) fn mark_exact_shell_scope_requested(&self) -> bool {
+        let Some(receipt) = &self.exact_shell_scope else {
+            return false;
+        };
+        receipt.mark_requested();
+        true
+    }
 }
+
+/// Process-local handoff from the crate-owned terminal provider to the Agent.
+/// It is intentionally absent from the durable approval outcome.
+#[derive(Clone)]
+pub(crate) struct ApprovalScopeReceipt {
+    requested: Arc<AtomicBool>,
+}
+
+impl ApprovalScopeReceipt {
+    fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn mark_requested(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub(crate) fn was_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for ApprovalScopeReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApprovalScopeReceipt")
+            .field("requested", &self.was_requested())
+            .finish()
+    }
+}
+
+impl PartialEq for ApprovalScopeReceipt {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.requested, &other.requested)
+    }
+}
+
+impl Eq for ApprovalScopeReceipt {}
 
 /// Future returned by one approval provider.
 pub type ApprovalFuture<'a> =
@@ -415,11 +625,16 @@ impl ApprovalProvider for NoApprovalProvider {
 mod tests {
     use std::sync::Arc;
 
-    use crate::{model::CallId, session::ApprovalRequestId};
+    use crate::{
+        entropy::{EntropyError, EntropySource},
+        model::CallId,
+        session::ApprovalRequestId,
+    };
 
     use super::{
         ApprovalDiffRowKind, ApprovalPatchOperation, ApprovalPreviewKind, ApprovalPrompt,
-        ApprovalPromptError, ApprovalRequest, MAX_APPROVAL_PATCH_PATH_BYTES,
+        ApprovalPromptError, ApprovalRequest, ExactShellGrantIdentity, ExactShellGrantStore,
+        MAX_APPROVAL_PATCH_PATH_BYTES, MAX_EXACT_SHELL_GRANTS,
     };
 
     const DIFF: &str =
@@ -572,5 +787,66 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn exact_shell_grants_are_bounded_consumed_and_redacted() {
+        let mut store = ExactShellGrantStore::new();
+        let first = ExactShellGrantIdentity::new(b"first-secret-command".to_vec()).unwrap();
+        let first_digest = store.digest(&first).unwrap();
+        assert!(store.insert(first_digest));
+        assert!(store.take(first_digest));
+        assert!(!store.take(first_digest));
+
+        for index in 0..MAX_EXACT_SHELL_GRANTS {
+            let identity = ExactShellGrantIdentity::new(index.to_be_bytes().to_vec()).unwrap();
+            let digest = store.digest(&identity).unwrap();
+            assert!(store.insert(digest));
+        }
+        assert!(!store.can_insert());
+        let extra = ExactShellGrantIdentity::new(b"extra".to_vec()).unwrap();
+        assert!(!store.insert(store.digest(&extra).unwrap()));
+
+        let debug = format!("{store:?} {first:?} {first_digest:?}");
+        assert!(!debug.contains("first-secret-command"));
+        assert!(!debug.contains("extra"));
+        assert!(debug.contains("grants: 64"));
+    }
+
+    #[test]
+    fn exact_shell_scope_is_explicit_and_not_a_durable_outcome() {
+        let prompt = ApprovalPrompt::new(None, "shell preview").unwrap();
+        let (request, receipt) = ApprovalRequest::new_with_exact_shell_scope(
+            ApprovalRequestId::new("approval-shell"),
+            "bash".to_owned(),
+            CallId::new("call-shell"),
+            &prompt,
+        );
+        assert!(request.exact_shell_scope_available());
+        assert!(!receipt.was_requested());
+        assert!(request.mark_exact_shell_scope_requested());
+        assert!(receipt.was_requested());
+
+        let ordinary = ApprovalRequest::new(
+            ApprovalRequestId::new("approval-file"),
+            "apply_patch".to_owned(),
+            CallId::new("call-file"),
+            &prompt,
+        );
+        assert!(!ordinary.exact_shell_scope_available());
+        assert!(!ordinary.mark_exact_shell_scope_requested());
+    }
+
+    #[test]
+    fn exact_shell_entropy_failure_disables_grants() {
+        fn failing_entropy(_bytes: &mut [u8]) -> Result<(), EntropyError> {
+            Err(EntropyError)
+        }
+        let disabled =
+            ExactShellGrantStore::with_entropy_for_test(EntropySource::injected(failing_entropy));
+        let identity = ExactShellGrantIdentity::new(b"must-not-hash".to_vec()).unwrap();
+        assert!(!disabled.can_insert());
+        assert_eq!(disabled.digest(&identity), None);
+        assert!(!format!("{disabled:?}").contains("must-not-hash"));
     }
 }

@@ -63,6 +63,10 @@ impl ApprovalQuestion<'_> {
     pub(super) fn challenge(&self) -> uuid::Uuid {
         self.active.challenge
     }
+
+    pub(super) fn exact_shell_scope_available(&self) -> bool {
+        self.active.envelope.request.exact_shell_scope_available()
+    }
 }
 
 pub(super) struct ApprovalJoin {
@@ -190,9 +194,27 @@ impl ApprovalJoin {
         let response = ApprovalResponse {
             id: ApprovalRequestId::new(id.clone()),
             outcome,
+            remember_exact_shell: false,
         };
         // A cancellation can close the receiver immediately before this send.
         // The durable approval/decided event remains the authority either way.
+        let _ = active.envelope.response.send(response);
+        self.awaiting_decision = Some(id);
+        Ok(())
+    }
+
+    pub(super) fn answer_exact_shell_for_process(&mut self) -> Result<(), ApprovalJoinError> {
+        let active = self.active.take().ok_or(ApprovalJoinError)?;
+        if !active.envelope.request.exact_shell_scope_available() {
+            drop(active);
+            return Err(ApprovalJoinError);
+        }
+        let id = active.asked.id;
+        let response = ApprovalResponse {
+            id: ApprovalRequestId::new(id.clone()),
+            outcome: ApprovalOutcome::AllowedOnce,
+            remember_exact_shell: true,
+        };
         let _ = active.envelope.response.send(response);
         self.awaiting_decision = Some(id);
         Ok(())
@@ -308,6 +330,7 @@ impl ApprovalJoin {
                 let _ = envelope.response.send(ApprovalResponse {
                     id: ApprovalRequestId::new(id.clone()),
                     outcome: ApprovalOutcome::Unavailable,
+                    remember_exact_shell: false,
                 });
                 self.awaiting_decision = Some(id);
             }
@@ -417,6 +440,7 @@ mod tests {
             ApprovalResponse {
                 id: ApprovalRequestId::new("approval-1"),
                 outcome: ApprovalOutcome::AllowedOnce,
+                remember_exact_shell: false,
             }
         );
 

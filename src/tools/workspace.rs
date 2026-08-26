@@ -194,6 +194,8 @@ pub(crate) struct PreparedWorkspaceMutation {
 #[cfg(unix)]
 pub(crate) struct PreparedShellWorkdir {
     root: Arc<Dir>,
+    root_dev: u64,
+    root_ino: u64,
     directory: Dir,
     relative: PathBuf,
     display: String,
@@ -217,6 +219,16 @@ impl std::fmt::Debug for PreparedShellWorkdir {
 impl PreparedShellWorkdir {
     pub(crate) fn display(&self) -> &str {
         &self.display
+    }
+
+    pub(crate) fn exact_shell_identity_fields(&self) -> (&str, u64, u64, u64, u64) {
+        (
+            &self.display,
+            self.root_dev,
+            self.root_ino,
+            self.dev,
+            self.ino,
+        )
     }
 
     /// Reopen and compare the approved directory immediately before spawn.
@@ -886,6 +898,8 @@ impl Workspace {
         }
         Ok(PreparedShellWorkdir {
             root: Arc::clone(self.authority.root()),
+            root_dev: self.authority.identity().device(),
+            root_ino: self.authority.identity().inode(),
             directory,
             relative: path.relative,
             display: path.display,

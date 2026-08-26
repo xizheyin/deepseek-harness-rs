@@ -19,6 +19,7 @@ const APPROVAL_ENTROPY_BYTES: usize = MAX_APPROVAL_CHALLENGES * UUID_BYTES;
 pub(super) struct ApprovalResponse {
     pub(super) id: ApprovalRequestId,
     pub(super) outcome: ApprovalOutcome,
+    pub(super) remember_exact_shell: bool,
 }
 
 #[derive(Debug)]
@@ -55,6 +56,7 @@ impl ApprovalProvider for TerminalApprovalProvider {
                 return Ok(ApprovalOutcome::Cancelled);
             }
             let expected_id = request.id().clone();
+            let scope_request = request.clone();
             let (response, receive_response) = oneshot::channel();
             if sender
                 .try_send(ApprovalEnvelope { request, response })
@@ -66,7 +68,15 @@ impl ApprovalProvider for TerminalApprovalProvider {
                 biased;
                 _ = cancellation.cancelled() => Ok(ApprovalOutcome::Cancelled),
                 response = receive_response => match response {
-                    Ok(response) if response.id == expected_id => Ok(response.outcome),
+                    Ok(response) if response.id == expected_id => {
+                        if response.remember_exact_shell
+                            && (response.outcome != ApprovalOutcome::AllowedOnce
+                                || !scope_request.mark_exact_shell_scope_requested())
+                        {
+                            return Ok(ApprovalOutcome::Unavailable);
+                        }
+                        Ok(response.outcome)
+                    }
                     Ok(_) | Err(_) => Ok(ApprovalOutcome::Unavailable),
                 },
             }
@@ -246,9 +256,52 @@ mod tests {
             .send(ApprovalResponse {
                 id: ApprovalRequestId::new("approval-1"),
                 outcome: ApprovalOutcome::AllowedOnce,
+                remember_exact_shell: false,
             })
             .unwrap();
         assert_eq!(future.await.unwrap(), ApprovalOutcome::AllowedOnce);
+    }
+
+    #[tokio::test]
+    async fn exact_shell_scope_requires_the_explicit_valid_response_bit() {
+        let (provider, mut receiver) = TerminalApprovalProvider::new();
+        let (shell_request, receipt) = ApprovalRequest::new_with_exact_shell_scope(
+            ApprovalRequestId::new("approval-shell"),
+            "bash".to_owned(),
+            "call-shell".into(),
+            &ApprovalPrompt::new(Some("run a command".to_owned()), "bounded preview").unwrap(),
+        );
+        let future = provider.request(shell_request, CancellationToken::new());
+        tokio::pin!(future);
+        assert!(poll!(&mut future).is_pending());
+        receiver
+            .try_recv()
+            .unwrap()
+            .response
+            .send(ApprovalResponse {
+                id: ApprovalRequestId::new("approval-shell"),
+                outcome: ApprovalOutcome::AllowedOnce,
+                remember_exact_shell: true,
+            })
+            .unwrap();
+        assert_eq!(future.await.unwrap(), ApprovalOutcome::AllowedOnce);
+        assert!(receipt.was_requested());
+
+        let (provider, mut receiver) = TerminalApprovalProvider::new();
+        let future = provider.request(request("ordinary"), CancellationToken::new());
+        tokio::pin!(future);
+        assert!(poll!(&mut future).is_pending());
+        receiver
+            .try_recv()
+            .unwrap()
+            .response
+            .send(ApprovalResponse {
+                id: ApprovalRequestId::new("ordinary"),
+                outcome: ApprovalOutcome::AllowedOnce,
+                remember_exact_shell: true,
+            })
+            .unwrap();
+        assert_eq!(future.await.unwrap(), ApprovalOutcome::Unavailable);
     }
 
     #[tokio::test]
@@ -276,6 +329,7 @@ mod tests {
             .send(ApprovalResponse {
                 id: ApprovalRequestId::new("wrong"),
                 outcome: ApprovalOutcome::AllowedOnce,
+                remember_exact_shell: false,
             })
             .unwrap();
         assert_eq!(first.await.unwrap(), ApprovalOutcome::Unavailable);
@@ -309,6 +363,7 @@ mod tests {
             .send(ApprovalResponse {
                 id: ApprovalRequestId::new("race"),
                 outcome: ApprovalOutcome::AllowedOnce,
+                remember_exact_shell: false,
             })
             .unwrap();
         cancellation.cancel();

@@ -1617,7 +1617,10 @@ async fn render_enhanced_dock(
             file_suggestions.invalidate_presentation();
         }
         let show_file_suggestions = view.requested().mode() == ViewMode::Focus
-            && !matches!(model.interaction, DockInteraction::Approval(_));
+            && !matches!(
+                model.interaction,
+                DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+            );
         let staged = file_suggestions
             .stage_presentation(show_file_suggestions)
             .map_err(|_| InteractiveError::Agent)?;
@@ -1707,7 +1710,10 @@ async fn render_active_dock(
             dock.command_palette.snapshot(input.composer())
         };
         let show_file_suggestions = dock.view.requested().mode() == ViewMode::Focus
-            && !matches!(interaction, DockInteraction::Approval(_));
+            && !matches!(
+                interaction,
+                DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+            );
         let staged = dock
             .file_suggestions
             .stage_presentation(show_file_suggestions)
@@ -1833,7 +1839,10 @@ fn command_palette_interaction(
         interaction => interaction,
     };
     if view == ViewMode::Focus
-        && !matches!(interaction, DockInteraction::Approval(_))
+        && !matches!(
+            interaction,
+            DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+        )
         && command_palette.is_visible()
     {
         DockInteraction::CommandPalette {
@@ -2849,6 +2858,7 @@ enum ApprovalUiUpdate {
     None,
     Redraw(String),
     Decide(ApprovalOutcome),
+    RememberExactShell,
     Eof,
     Invalid,
 }
@@ -2907,6 +2917,7 @@ impl<'a> ApprovalUiState<'a> {
         terminal: &'a AsyncTerminal,
         color: bool,
         enhanced: bool,
+        allow_exact_shell: bool,
     ) -> Result<String, InteractiveError> {
         if !matches!(self, Self::Arming { .. }) {
             return Err(InteractiveError::Agent);
@@ -2924,7 +2935,8 @@ impl<'a> ApprovalUiState<'a> {
         } else {
             ApprovalInputProfile::LinearRecord
         };
-        let selector = ApprovalSelector::new(profile).map_err(|_| InteractiveError::Agent)?;
+        let selector = ApprovalSelector::new_for_request(profile, allow_exact_shell)
+            .map_err(|_| InteractiveError::Agent)?;
         let output = if enhanced {
             String::new()
         } else {
@@ -3015,6 +3027,12 @@ impl<'a> ApprovalUiState<'a> {
                 }
                 Ok(ApprovalUiUpdate::Decide(outcome))
             }
+            SelectorUpdate::RememberExactShell => {
+                if let Some(mode) = mode {
+                    mode.restore()?;
+                }
+                Ok(ApprovalUiUpdate::RememberExactShell)
+            }
             SelectorUpdate::Eof => {
                 if let Some(mode) = mode {
                     mode.restore()?;
@@ -3058,9 +3076,10 @@ impl<'a> ApprovalUiState<'a> {
                 };
                 Ok(ApprovalUiUpdate::None)
             }
-            SelectorUpdate::Redraw | SelectorUpdate::Eof | SelectorUpdate::Invalid => {
-                Err(InteractiveError::Agent)
-            }
+            SelectorUpdate::Redraw
+            | SelectorUpdate::RememberExactShell
+            | SelectorUpdate::Eof
+            | SelectorUpdate::Invalid => Err(InteractiveError::Agent),
         }
     }
 
@@ -3074,34 +3093,28 @@ impl<'a> ApprovalUiState<'a> {
         }
     }
 
-    fn dock_selection(&self) -> Result<DockApprovalSelection, InteractiveError> {
-        let selector = match self {
-            Self::Rendering { selector, .. } | Self::Accepting { selector, .. } => selector,
-            Self::Inactive | Self::Arming { .. } => return Err(InteractiveError::Agent),
-        };
-        Ok(match selector.selected() {
-            super::approval_selector::ApprovalSelection::AllowOnce => {
-                DockApprovalSelection::AllowOnce
-            }
-            super::approval_selector::ApprovalSelection::Reject => DockApprovalSelection::Reject,
-            super::approval_selector::ApprovalSelection::Cancel => DockApprovalSelection::Cancel,
-        })
-    }
-
     fn dock_interaction(&self) -> DockInteraction {
         match self {
             Self::Rendering { selector, .. } | Self::Accepting { selector, .. } => {
-                DockInteraction::Approval(match selector.selected() {
+                let selected = match selector.selected() {
                     super::approval_selector::ApprovalSelection::AllowOnce => {
                         DockApprovalSelection::AllowOnce
                     }
                     super::approval_selector::ApprovalSelection::Reject => {
                         DockApprovalSelection::Reject
                     }
+                    super::approval_selector::ApprovalSelection::AllowExactShellForProcess => {
+                        DockApprovalSelection::AllowExactShellForProcess
+                    }
                     super::approval_selector::ApprovalSelection::Cancel => {
                         DockApprovalSelection::Cancel
                     }
-                })
+                };
+                if selector.allows_exact_shell() {
+                    DockInteraction::ExactShellApproval(selected)
+                } else {
+                    DockInteraction::Approval(selected)
+                }
             }
             Self::Inactive | Self::Arming { .. } => DockInteraction::Running,
         }
@@ -3747,8 +3760,18 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             }
                         }
                         UiWork::ApprovalArmed => {
+                            let Some(question) = active.joins.question() else {
+                                approval_ui.observe_unaccepted_input();
+                                continue;
+                            };
+                            let allow_exact_shell = question.exact_shell_scope_available();
                             let prepared = approval_ui
-                                .begin_rendering(active.terminal, active.color, active.enhanced)
+                                .begin_rendering(
+                                    active.terminal,
+                                    active.color,
+                                    active.enhanced,
+                                    allow_exact_shell,
+                                )
                                 .and_then(|output| {
                                     enqueue_approval_selector_surface(
                                         output,
@@ -4345,8 +4368,18 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             discard_pending(&mut pending, active.presenter);
                         }
                         UiWork::ApprovalArmed => {
+                            let Some(question) = active.joins.question() else {
+                                approval_ui.observe_unaccepted_input();
+                                continue;
+                            };
+                            let allow_exact_shell = question.exact_shell_scope_available();
                             let prepared = approval_ui
-                                .begin_rendering(active.terminal, active.color, active.enhanced)
+                                .begin_rendering(
+                                    active.terminal,
+                                    active.color,
+                                    active.enhanced,
+                                    allow_exact_shell,
+                                )
                                 .and_then(|output| {
                                     enqueue_approval_selector_surface(
                                         output,
@@ -5043,6 +5076,10 @@ fn apply_approval_update(
             joins.answer(outcome)?;
             parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
         }
+        ApprovalUiUpdate::RememberExactShell => {
+            joins.answer_exact_shell_for_process()?;
+            parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+        }
         ApprovalUiUpdate::Eof => return Ok(true),
         ApprovalUiUpdate::Invalid => {
             let frame = approval_frame(joins, true)?;
@@ -5151,7 +5188,7 @@ fn enqueue_approval_selector_surface(
 ) -> Result<(), InteractiveError> {
     if enhanced {
         enqueue_enhanced_dock(
-            DockInteraction::Approval(approval_ui.dock_selection()?),
+            approval_ui.dock_interaction(),
             after,
             pending,
             deadline,
@@ -5190,6 +5227,10 @@ fn dispatch_approval_update(
         )?,
         ApprovalUiUpdate::Decide(outcome) => {
             joins.answer(outcome)?;
+            parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+        }
+        ApprovalUiUpdate::RememberExactShell => {
+            joins.answer_exact_shell_for_process()?;
             parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
         }
         ApprovalUiUpdate::Eof => return Ok(true),
@@ -5329,7 +5370,10 @@ fn complete_ready_frame(
             return Err(InteractiveError::TerminalUnsupported);
         }
         let show_file_suggestions = dock.view.requested().mode() == ViewMode::Focus
-            && !matches!(interaction, DockInteraction::Approval(_));
+            && !matches!(
+                interaction,
+                DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+            );
         let staged_file_suggestions = dock
             .file_suggestions
             .stage_presentation(show_file_suggestions)
@@ -5871,7 +5915,10 @@ async fn write_enhanced_terminal_frame(
             continue;
         }
         let show_file_suggestions = dock.view.committed().mode() == ViewMode::Focus
-            && !matches!(model.interaction, DockInteraction::Approval(_));
+            && !matches!(
+                model.interaction,
+                DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+            );
         let staged_file_suggestions = dock
             .file_suggestions
             .stage_presentation(show_file_suggestions)

@@ -16,6 +16,7 @@ pub(super) const ESCAPE_SEQUENCE_WAIT: Duration = Duration::from_millis(35);
 pub(super) enum ApprovalSelection {
     AllowOnce,
     Reject,
+    AllowExactShellForProcess,
     Cancel,
 }
 
@@ -26,27 +27,32 @@ pub(super) enum ApprovalInputProfile {
 }
 
 impl ApprovalSelection {
-    const fn previous(self) -> Self {
-        match self {
-            Self::AllowOnce => Self::Cancel,
-            Self::Reject => Self::AllowOnce,
-            Self::Cancel => Self::Reject,
+    const fn previous(self, allow_exact_shell: bool) -> Self {
+        match (self, allow_exact_shell) {
+            (Self::AllowOnce, _) => Self::Cancel,
+            (Self::Reject, _) => Self::AllowOnce,
+            (Self::AllowExactShellForProcess, true) => Self::Reject,
+            (Self::Cancel, true) => Self::AllowExactShellForProcess,
+            (Self::AllowExactShellForProcess | Self::Cancel, false) => Self::Reject,
         }
     }
 
-    const fn next(self) -> Self {
-        match self {
-            Self::AllowOnce => Self::Reject,
-            Self::Reject => Self::Cancel,
-            Self::Cancel => Self::AllowOnce,
+    const fn next(self, allow_exact_shell: bool) -> Self {
+        match (self, allow_exact_shell) {
+            (Self::AllowOnce, _) => Self::Reject,
+            (Self::Reject, true) => Self::AllowExactShellForProcess,
+            (Self::AllowExactShellForProcess, true) => Self::Cancel,
+            (Self::Reject | Self::AllowExactShellForProcess, false) => Self::Cancel,
+            (Self::Cancel, _) => Self::AllowOnce,
         }
     }
 
-    const fn outcome(self) -> ApprovalOutcome {
+    const fn outcome(self) -> Option<ApprovalOutcome> {
         match self {
-            Self::AllowOnce => ApprovalOutcome::AllowedOnce,
-            Self::Reject => ApprovalOutcome::Rejected,
-            Self::Cancel => ApprovalOutcome::Cancelled,
+            Self::AllowOnce => Some(ApprovalOutcome::AllowedOnce),
+            Self::Reject => Some(ApprovalOutcome::Rejected),
+            Self::AllowExactShellForProcess => None,
+            Self::Cancel => Some(ApprovalOutcome::Cancelled),
         }
     }
 }
@@ -56,6 +62,7 @@ pub(super) enum SelectorUpdate {
     None,
     Redraw,
     Decide(ApprovalOutcome),
+    RememberExactShell,
     Eof,
     Invalid,
 }
@@ -66,6 +73,7 @@ pub(super) struct SelectorRenderError;
 pub(super) struct ApprovalSelector {
     selected: ApprovalSelection,
     profile: ApprovalInputProfile,
+    allow_exact_shell: bool,
     record: [u8; MAX_APPROVAL_RECORD_BYTES],
     record_len: usize,
     decoder: KeyDecoder,
@@ -76,13 +84,22 @@ pub(super) struct ApprovalSelector {
 }
 
 impl ApprovalSelector {
+    #[cfg(test)]
     pub(super) fn new(profile: ApprovalInputProfile) -> Result<Self, InputError> {
+        Self::new_for_request(profile, false)
+    }
+
+    pub(super) fn new_for_request(
+        profile: ApprovalInputProfile,
+        allow_exact_shell: bool,
+    ) -> Result<Self, InputError> {
         let mut decoder = KeyDecoder::default();
         decoder.reset_epoch()?;
         Ok(Self {
             // Enter must be safe even if a stale byte crosses the input fence.
             selected: ApprovalSelection::Reject,
             profile,
+            allow_exact_shell,
             record: [0; MAX_APPROVAL_RECORD_BYTES],
             record_len: 0,
             decoder,
@@ -97,6 +114,10 @@ impl ApprovalSelector {
         self.selected
     }
 
+    pub(super) const fn allows_exact_shell(&self) -> bool {
+        self.allow_exact_shell
+    }
+
     pub(super) fn render(
         &self,
         color: bool,
@@ -108,7 +129,8 @@ impl ApprovalSelector {
             .try_reserve_exact(512)
             .map_err(|_| SelectorRenderError)?;
         if color && redraw {
-            output.push_str("\x1b[5A");
+            let rows = if self.allow_exact_shell { 6 } else { 5 };
+            write!(&mut output, "\x1b[{rows}A").map_err(|_| SelectorRenderError)?;
         }
 
         let title = if color {
@@ -117,11 +139,19 @@ impl ApprovalSelector {
             "[approval required]"
         };
         push_selector_line(&mut output, color && redraw, title)?;
-        for (choice, label) in [
+        let choices = [
             (ApprovalSelection::AllowOnce, "Allow once"),
             (ApprovalSelection::Reject, "Reject"),
+            (
+                ApprovalSelection::AllowExactShellForProcess,
+                "Allow exact Shell for this process",
+            ),
             (ApprovalSelection::Cancel, "Cancel"),
-        ] {
+        ];
+        for (choice, label) in choices {
+            if choice == ApprovalSelection::AllowExactShellForProcess && !self.allow_exact_shell {
+                continue;
+            }
             let selected = self.selected == choice;
             if color && redraw {
                 output.push_str("\r\x1b[2K");
@@ -185,6 +215,7 @@ impl ApprovalSelector {
                 SelectorUpdate::None => {}
                 SelectorUpdate::Redraw => redraw = true,
                 decision @ (SelectorUpdate::Decide(_)
+                | SelectorUpdate::RememberExactShell
                 | SelectorUpdate::Eof
                 | SelectorUpdate::Invalid) => {
                     final_update = Some(decision);
@@ -217,35 +248,35 @@ impl ApprovalSelector {
             InputEvent::Key(Key::Tab)
                 if self.profile == ApprovalInputProfile::LinearRecord && self.record_len == 0 =>
             {
-                self.select(self.selected.next());
+                self.select(self.selected.next(self.allow_exact_shell));
                 SelectorUpdate::Redraw
             }
             InputEvent::Key(Key::Up | Key::Left) if self.record_len == 0 => {
-                self.select(self.selected.previous());
+                self.select(self.selected.previous(self.allow_exact_shell));
                 SelectorUpdate::Redraw
             }
             InputEvent::Key(Key::Down | Key::Right) if self.record_len == 0 => {
-                self.select(self.selected.next());
+                self.select(self.selected.next(self.allow_exact_shell));
                 SelectorUpdate::Redraw
             }
             InputEvent::Key(Key::BackTab)
                 if self.profile == ApprovalInputProfile::LinearRecord && self.record_len == 0 =>
             {
-                self.select(self.selected.previous());
+                self.select(self.selected.previous(self.allow_exact_shell));
                 SelectorUpdate::Redraw
             }
             InputEvent::Key(Key::Char('h' | 'k')) if self.record_len == 0 => {
                 if self.profile == ApprovalInputProfile::EnhancedDirectional {
                     return SelectorUpdate::Invalid;
                 }
-                self.select(self.selected.previous());
+                self.select(self.selected.previous(self.allow_exact_shell));
                 SelectorUpdate::Redraw
             }
             InputEvent::Key(Key::Char('j' | 'l')) if self.record_len == 0 => {
                 if self.profile == ApprovalInputProfile::EnhancedDirectional {
                     return SelectorUpdate::Invalid;
                 }
-                self.select(self.selected.next());
+                self.select(self.selected.next(self.allow_exact_shell));
                 SelectorUpdate::Redraw
             }
             InputEvent::Key(Key::Backspace) if self.record_len != 0 => {
@@ -308,8 +339,11 @@ impl ApprovalSelector {
 
     fn select(&mut self, selected: ApprovalSelection) {
         self.selected = selected;
-        self.allow_focus_serial =
-            (selected == ApprovalSelection::AllowOnce).then_some(self.feed_serial);
+        self.allow_focus_serial = matches!(
+            selected,
+            ApprovalSelection::AllowOnce | ApprovalSelection::AllowExactShellForProcess
+        )
+        .then_some(self.feed_serial);
     }
 
     fn update_shortcut_selection(&mut self) -> SelectorUpdate {
@@ -331,8 +365,11 @@ impl ApprovalSelector {
 
     fn confirm(&mut self, challenge: uuid::Uuid) -> SelectorUpdate {
         if self.record_len == 0 {
-            if self.profile == ApprovalInputProfile::EnhancedDirectional
-                && self.selected == ApprovalSelection::AllowOnce
+            let requires_fresh_input = self.selected
+                == ApprovalSelection::AllowExactShellForProcess
+                || (self.profile == ApprovalInputProfile::EnhancedDirectional
+                    && self.selected == ApprovalSelection::AllowOnce);
+            if requires_fresh_input
                 && self
                     .allow_focus_serial
                     .is_none_or(|serial| serial >= self.feed_serial)
@@ -340,7 +377,10 @@ impl ApprovalSelector {
                 self.select(ApprovalSelection::Reject);
                 return SelectorUpdate::Invalid;
             }
-            return SelectorUpdate::Decide(self.selected.outcome());
+            return self
+                .selected
+                .outcome()
+                .map_or(SelectorUpdate::RememberExactShell, SelectorUpdate::Decide);
         }
         let record = std::str::from_utf8(&self.record[..self.record_len]);
         self.record_len = 0;
@@ -376,6 +416,63 @@ mod tests {
 
     fn linear_selector() -> ApprovalSelector {
         ApprovalSelector::new(ApprovalInputProfile::LinearRecord).unwrap()
+    }
+
+    #[test]
+    fn exact_shell_process_choice_is_explicit_request_scoped_and_fresh() {
+        let mut ordinary = linear_selector();
+        assert_eq!(
+            ordinary.feed(b"\x1b[B", challenge()),
+            SelectorUpdate::Redraw
+        );
+        assert_eq!(ordinary.selected(), ApprovalSelection::Cancel);
+
+        let mut selector =
+            ApprovalSelector::new_for_request(ApprovalInputProfile::EnhancedDirectional, true)
+                .unwrap();
+        assert_eq!(selector.selected(), ApprovalSelection::Reject);
+        assert_eq!(
+            selector.feed(b"\x1b[B\r", challenge()),
+            SelectorUpdate::Invalid
+        );
+        assert_eq!(selector.selected(), ApprovalSelection::Reject);
+
+        let mut selector =
+            ApprovalSelector::new_for_request(ApprovalInputProfile::EnhancedDirectional, true)
+                .unwrap();
+        assert_eq!(
+            selector.feed(b"\x1b[B", challenge()),
+            SelectorUpdate::Redraw
+        );
+        assert_eq!(
+            selector.selected(),
+            ApprovalSelection::AllowExactShellForProcess
+        );
+        assert_eq!(
+            selector.feed(b"\r", challenge()),
+            SelectorUpdate::RememberExactShell
+        );
+
+        let mut linear =
+            ApprovalSelector::new_for_request(ApprovalInputProfile::LinearRecord, true).unwrap();
+        assert_eq!(
+            linear.feed(b"\x1b[B\r", challenge()),
+            SelectorUpdate::Invalid
+        );
+        assert_eq!(linear.selected(), ApprovalSelection::Reject);
+    }
+
+    #[test]
+    fn exact_shell_process_render_has_a_dynamic_redraw_height() {
+        let selector =
+            ApprovalSelector::new_for_request(ApprovalInputProfile::LinearRecord, true).unwrap();
+        let plain = selector.render(false, false, false).unwrap();
+        assert!(plain.contains("Allow exact Shell for this process"));
+        let styled = selector.render(true, false, true).unwrap();
+        assert!(styled.starts_with("\x1b[6A"));
+
+        let ordinary = linear_selector().render(false, false, false).unwrap();
+        assert!(!ordinary.contains("exact Shell"));
     }
 
     #[test]

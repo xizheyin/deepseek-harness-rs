@@ -16,15 +16,15 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     AgentIdKind, AgentLimits, AgentLoop, AgentLoopConfig, AgentLoopError, AgentRuntime,
-    ApprovalFuture, ApprovalPrompt, ApprovalProvider, ApprovalRequest, FileChangePolicy,
-    MutationDeclineReason, NoApprovalProvider, PluginPolicy, PreparedToolMutation, ShellPolicy,
-    ToolCommitOutcome, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult,
-    ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture, TurnProposal,
-    action_policy,
+    ApprovalFuture, ApprovalPrompt, ApprovalProvider, ApprovalRequest, ExactShellGrantIdentity,
+    FileChangePolicy, MutationDeclineReason, NoApprovalProvider, PluginPolicy,
+    PreparedToolMutation, ShellPolicy, ToolCommitOutcome, ToolExecutionFuture,
+    ToolExecutionRequest, ToolExecutionResult, ToolExecutor, ToolExecutorError, ToolPreparation,
+    ToolPreparationFuture, TurnProposal, action_policy,
     tool::{
         ActionContract, ActionDeclineReason, PreparedToolAction, PreparedToolActionSetup,
-        ToolActionControl, ToolActionOutcome, ToolActionSetupOutcome, ToolActionTurnStop,
-        ToolClaimProfile,
+        ToolActionControl, ToolActionDeclineFn, ToolActionOutcome, ToolActionRunFn,
+        ToolActionSetupOutcome, ToolActionTurnStop, ToolClaimProfile,
     },
 };
 use crate::{
@@ -489,6 +489,7 @@ enum ActionScript {
     ActionNotStarted,
     Infrastructure,
     StartedAndQuiescent,
+    StartedNonzero,
     StartedAfterClockRejection(ArmedClock),
     StartedAfterTwoClockRejections(ArmedClock),
     StartedOwnershipLost,
@@ -583,6 +584,7 @@ impl BlockingGate {
 struct ScriptedActions {
     scripts: Mutex<VecDeque<ActionScript>>,
     run_count: Arc<AtomicUsize>,
+    exact_identity: bool,
 }
 
 struct ScriptedMutations {
@@ -675,6 +677,7 @@ impl ScriptedActions {
             Arc::new(Self {
                 scripts: Mutex::new(VecDeque::from([script])),
                 run_count: run_count.clone(),
+                exact_identity: false,
             }),
             run_count,
         )
@@ -686,6 +689,19 @@ impl ScriptedActions {
             Arc::new(Self {
                 scripts: Mutex::new(scripts.into()),
                 run_count: run_count.clone(),
+                exact_identity: false,
+            }),
+            run_count,
+        )
+    }
+
+    fn exact_many(scripts: Vec<ActionScript>) -> (Arc<Self>, Arc<AtomicUsize>) {
+        let run_count = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                scripts: Mutex::new(scripts.into()),
+                run_count: run_count.clone(),
+                exact_identity: true,
             }),
             run_count,
         )
@@ -695,6 +711,29 @@ impl ScriptedActions {
 #[derive(Default)]
 struct CountingAllowApproval {
     requests: AtomicUsize,
+}
+
+#[derive(Default)]
+struct RememberingApproval {
+    requests: AtomicUsize,
+}
+
+impl ApprovalProvider for RememberingApproval {
+    fn request(
+        &self,
+        request: ApprovalRequest,
+        _cancellation: CancellationToken,
+    ) -> ApprovalFuture<'_> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        let marked = request.mark_exact_shell_scope_requested();
+        Box::pin(async move {
+            if marked {
+                Ok(ApprovalOutcome::AllowedOnce)
+            } else {
+                Ok(ApprovalOutcome::Unavailable)
+            }
+        })
+    }
 }
 
 impl ApprovalProvider for CountingAllowApproval {
@@ -779,6 +818,7 @@ impl ToolExecutor for ScriptedActions {
         let setup_dispatch = request.dispatch_binding().clone();
         let action_dispatch = setup_dispatch.clone();
         let run_count = self.run_count.clone();
+        let exact_identity = self.exact_identity;
         Box::pin(async move {
             let setup = PreparedToolActionSetup::new(
                 setup_dispatch,
@@ -804,20 +844,36 @@ impl ToolExecutor for ScriptedActions {
                             } else {
                                 NORMAL_RESULT_BOUND
                             };
-                        let action = PreparedToolAction::new(
-                            action_dispatch,
-                            ApprovalPrompt::new(
-                                Some("run one foreground command".to_owned()),
-                                "bash: fixture",
-                            )
-                            .unwrap(),
-                            maximum_result_event_bytes,
-                            Box::new(|reason| Ok(declined_result(reason))),
-                            Box::new(move |control| {
-                                run_count.fetch_add(1, Ordering::SeqCst);
-                                run_action_script(script, control)
-                            }),
+                        let prompt = ApprovalPrompt::new(
+                            Some("run one foreground command".to_owned()),
+                            "bash: fixture",
                         )
+                        .unwrap();
+                        let decline: ToolActionDeclineFn =
+                            Box::new(|reason| Ok(declined_result(reason)));
+                        let run: ToolActionRunFn = Box::new(move |control| {
+                            run_count.fetch_add(1, Ordering::SeqCst);
+                            run_action_script(script, control)
+                        });
+                        let action = if exact_identity {
+                            PreparedToolAction::new_exact_shell(
+                                action_dispatch,
+                                prompt,
+                                ExactShellGrantIdentity::new(b"fixture-exact-shell-v1".to_vec())
+                                    .unwrap(),
+                                maximum_result_event_bytes,
+                                decline,
+                                run,
+                            )
+                        } else {
+                            PreparedToolAction::new(
+                                action_dispatch,
+                                prompt,
+                                maximum_result_event_bytes,
+                                decline,
+                                run,
+                            )
+                        }
                         .unwrap();
                         ToolActionSetupOutcome::Ready(action)
                     })
@@ -846,6 +902,10 @@ fn run_action_script(
             ActionScript::StartedAndQuiescent => ToolActionOutcome::StartedAndQuiescent {
                 turn_stop: ToolActionTurnStop::None,
                 result: started_result("small started result"),
+            },
+            ActionScript::StartedNonzero => ToolActionOutcome::StartedAndQuiescent {
+                turn_stop: ToolActionTurnStop::None,
+                result: started_nonzero_result(),
             },
             ActionScript::StartedAfterClockRejection(clock) => {
                 clock.fail_after(0, None);
@@ -949,6 +1009,12 @@ fn not_started_result(code: &'static str) -> ToolExecutionResult {
 
 fn started_result(text: &str) -> ToolExecutionResult {
     shell_result(text, None, started_meta(false))
+}
+
+fn started_nonzero_result() -> ToolExecutionResult {
+    let mut meta = started_meta(false);
+    meta["exitCode"] = json!(7);
+    shell_result("command exited 7", Some("SHELL_EXIT_NONZERO"), meta)
 }
 
 fn started_abort_result(stop: ToolActionTurnStop) -> ToolExecutionResult {
@@ -1098,12 +1164,16 @@ fn user() -> Message {
 }
 
 fn tool_response() -> Vec<StreamChunk> {
+    tool_response_with_id("call-1")
+}
+
+fn tool_response_with_id(call_id: &str) -> Vec<StreamChunk> {
     vec![
         StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
         StreamChunk::block_end(
             0,
             ContentBlock::tool_call(
-                "call-1",
+                call_id,
                 "bash",
                 r#"{"command":"printf fixture","description":"fixture"}"#,
             )
@@ -1140,6 +1210,454 @@ fn two_tool_response() -> Vec<StreamChunk> {
         .unwrap(),
         StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
     ]
+}
+
+fn duplicate_tool_response() -> Vec<StreamChunk> {
+    vec![
+        StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
+        StreamChunk::block_end(
+            0,
+            ContentBlock::tool_call(
+                "call-1",
+                "bash",
+                r#"{"command":"printf same","description":"first display"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        StreamChunk::block_start(1, ContentBlockType::ToolCall).unwrap(),
+        StreamChunk::block_end(
+            1,
+            ContentBlock::tool_call(
+                "call-2",
+                "bash",
+                r#"{"command":"printf same","description":"different display"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+    ]
+}
+
+fn triple_duplicate_tool_response() -> Vec<StreamChunk> {
+    let mut chunks = Vec::new();
+    for index in 0..3 {
+        chunks.push(StreamChunk::block_start(index, ContentBlockType::ToolCall).unwrap());
+        chunks.push(
+            StreamChunk::block_end(
+                index,
+                ContentBlock::tool_call(
+                    format!("call-{index}"),
+                    "bash",
+                    format!(r#"{{"command":"printf same","description":"display {index}"}}"#),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    chunks.push(StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap());
+    chunks
+}
+
+#[tokio::test]
+async fn exact_shell_process_grant_skips_only_the_repeated_question_after_result_commit() {
+    let session =
+        Session::with_clock("exact-shell-grant", IncrementingClock(Mutex::new(1_000))).unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        duplicate_tool_response(),
+        text_response(),
+    ]));
+    let approvals = Arc::new(RememberingApproval::default());
+    let (tools, run_count) = ScriptedActions::exact_many(vec![
+        ActionScript::StartedAndQuiescent,
+        ActionScript::StartedAndQuiescent,
+    ]);
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(approvals.clone())
+        .with_shell_policy(ShellPolicy::Ask);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+    assert_eq!(run_count.load(Ordering::SeqCst), 2);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 1);
+
+    let event_types = agent
+        .session()
+        .events()
+        .iter()
+        .map(|event| event.kind().event_type())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| **event_type == "approval/asked")
+            .count(),
+        1
+    );
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| **event_type == "approval/decided")
+            .count(),
+        1
+    );
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| **event_type == "tool/result")
+            .count(),
+        2
+    );
+    let tool_audit_order = event_types
+        .iter()
+        .copied()
+        .filter(|event_type| event_type.starts_with("tool/") || event_type.starts_with("approval/"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_audit_order,
+        [
+            "tool/call",
+            "approval/asked",
+            "approval/decided",
+            "tool/result",
+            "tool/call",
+            "tool/result",
+        ]
+    );
+    let asked = agent
+        .session()
+        .events()
+        .iter()
+        .find_map(|event| match event.kind() {
+            EventKind::ApprovalAsked { asked } => Some(asked),
+            _ => None,
+        })
+        .unwrap();
+    let decided = agent
+        .session()
+        .events()
+        .iter()
+        .find_map(|event| match event.kind() {
+            EventKind::ApprovalDecided { decided } => Some(decided),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(asked.call_id().map(|call| call.as_str()), Some("call-1"));
+    assert_eq!(asked.id(), decided.id());
+    assert_eq!(decided.outcome(), ApprovalOutcome::AllowedOnce);
+}
+
+#[tokio::test]
+async fn nonzero_exact_shell_result_does_not_install_the_process_grant() {
+    let session =
+        Session::with_clock("exact-shell-nonzero", IncrementingClock(Mutex::new(2_000))).unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        duplicate_tool_response(),
+        text_response(),
+    ]));
+    let approvals = Arc::new(RememberingApproval::default());
+    let (tools, run_count) = ScriptedActions::exact_many(vec![
+        ActionScript::StartedNonzero,
+        ActionScript::StartedAndQuiescent,
+    ]);
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(approvals.clone())
+        .with_shell_policy(ShellPolicy::Ask);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+    assert_eq!(run_count.load(Ordering::SeqCst), 2);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter(|event| event.kind().event_type() == "approval/asked")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn a_failed_cache_hit_consumes_the_grant_and_the_third_call_asks_again() {
+    let session = Session::with_clock(
+        "exact-shell-hit-failure",
+        IncrementingClock(Mutex::new(2_500)),
+    )
+    .unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        triple_duplicate_tool_response(),
+        text_response(),
+    ]));
+    let approvals = Arc::new(RememberingApproval::default());
+    let (tools, run_count) = ScriptedActions::exact_many(vec![
+        ActionScript::StartedAndQuiescent,
+        ActionScript::StartedNonzero,
+        ActionScript::StartedAndQuiescent,
+    ]);
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(approvals.clone())
+        .with_shell_policy(ShellPolicy::Ask);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+    assert_eq!(run_count.load(Ordering::SeqCst), 3);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 2);
+    let order = agent
+        .session()
+        .events()
+        .iter()
+        .map(|event| event.kind().event_type())
+        .filter(|event_type| event_type.starts_with("tool/") || event_type.starts_with("approval/"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order,
+        [
+            "tool/call",
+            "approval/asked",
+            "approval/decided",
+            "tool/result",
+            "tool/call",
+            "tool/result",
+            "tool/call",
+            "approval/asked",
+            "approval/decided",
+            "tool/result",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_cache_hit_is_consumed_and_the_next_turn_asks_again() {
+    let session = Session::with_clock(
+        "exact-shell-hit-cancelled",
+        IncrementingClock(Mutex::new(2_750)),
+    )
+    .unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response_with_id("call-clean-first"),
+        text_response(),
+        tool_response_with_id("call-cancelled-hit"),
+        tool_response_with_id("call-clean-third"),
+        text_response(),
+    ]));
+    let approvals = Arc::new(RememberingApproval::default());
+    let running = Arc::new(Semaphore::new(0));
+    let cleanup_entered = Arc::new(Semaphore::new(0));
+    let cleanup_release = Arc::new(Semaphore::new(0));
+    let (tools, run_count) = ScriptedActions::exact_many(vec![
+        ActionScript::StartedAndQuiescent,
+        ActionScript::StopThenCleanup(StopThenCleanup {
+            running: running.clone(),
+            cleanup_entered: cleanup_entered.clone(),
+            cleanup_release: cleanup_release.clone(),
+        }),
+        ActionScript::StartedAndQuiescent,
+    ]);
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(approvals.clone())
+        .with_shell_policy(ShellPolicy::Ask);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let first = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(first.reason(), &TurnEndReason::Completed);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 1);
+
+    let cancellation = CancellationToken::new();
+    let cancelled = {
+        let turn = agent.run_turn(TurnProposal::Enter(vec![user()]), cancellation.clone());
+        tokio::pin!(turn);
+        tokio::select! {
+            biased;
+            permit = running.acquire() => drop(permit.unwrap()),
+            result = &mut turn => panic!("cached action ended before it started: {result:?}"),
+        }
+        cancellation.cancel();
+        tokio::select! {
+            biased;
+            permit = cleanup_entered.acquire() => drop(permit.unwrap()),
+            result = &mut turn => panic!("cached action ended before cleanup: {result:?}"),
+        }
+        cleanup_release.add_permits(1);
+        turn.await.unwrap()
+    };
+    assert!(matches!(cancelled.reason(), TurnEndReason::Aborted { .. }));
+    assert_eq!(
+        approvals.requests.load(Ordering::SeqCst),
+        1,
+        "the cancelled action must have consumed an existing grant"
+    );
+
+    let third = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(third.reason(), &TurnEndReason::Completed);
+    assert_eq!(run_count.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        approvals.requests.load(Ordering::SeqCst),
+        2,
+        "cancellation must not restore the consumed grant"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_allow_once_never_installs_an_exact_shell_process_grant() {
+    let session =
+        Session::with_clock("exact-shell-once", IncrementingClock(Mutex::new(3_000))).unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        duplicate_tool_response(),
+        text_response(),
+    ]));
+    let approvals = Arc::new(CountingAllowApproval::default());
+    let (tools, run_count) = ScriptedActions::exact_many(vec![
+        ActionScript::StartedAndQuiescent,
+        ActionScript::StartedAndQuiescent,
+    ]);
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(approvals.clone())
+        .with_shell_policy(ShellPolicy::Ask);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+    assert_eq!(run_count.load(Ordering::SeqCst), 2);
+    assert_eq!(approvals.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn rebuilding_an_agent_for_resume_starts_with_no_exact_shell_grants() {
+    let session = Session::with_clock(
+        "exact-shell-resume-reset",
+        IncrementingClock(Mutex::new(4_000)),
+    )
+    .unwrap();
+    let first_approvals = Arc::new(RememberingApproval::default());
+    let first_provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response_with_id("call-resumed"),
+        text_response(),
+    ]));
+    let (first_tools, _) = ScriptedActions::exact_many(vec![ActionScript::StartedAndQuiescent]);
+    let first_config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(first_approvals.clone())
+        .with_shell_policy(ShellPolicy::Ask);
+    let runtime = Arc::new(FixedRuntime::default());
+    let mut first = AgentLoop::with_runtime(
+        session,
+        first_provider,
+        first_tools,
+        runtime.clone(),
+        first_config,
+    )
+    .unwrap();
+    first
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(first_approvals.requests.load(Ordering::SeqCst), 1);
+
+    let second_approvals = Arc::new(RememberingApproval::default());
+    let second_provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response(),
+        text_response(),
+    ]));
+    let (second_tools, run_count) =
+        ScriptedActions::exact_many(vec![ActionScript::StartedAndQuiescent]);
+    let second_config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_approval_provider(second_approvals.clone())
+        .with_shell_policy(ShellPolicy::Ask);
+    let mut resumed = AgentLoop::with_runtime(
+        first.shutdown_into_session().await.unwrap(),
+        second_provider,
+        second_tools,
+        runtime,
+        second_config,
+    )
+    .unwrap();
+    let second_user = Message::user(
+        "user-2",
+        vec![ContentBlock::text("run it again after resume").unwrap()],
+        MessageSource::user().unwrap(),
+    )
+    .unwrap();
+    resumed
+        .run_turn(
+            TurnProposal::Enter(vec![second_user]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(run_count.load(Ordering::SeqCst), 1);
+    assert_eq!(second_approvals.requests.load(Ordering::SeqCst), 1);
 }
 
 fn mutation_response() -> Vec<StreamChunk> {
@@ -3774,12 +4292,15 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         .unwrap()
         .with_shell_policy(ShellPolicy::Allow);
     let mut request_header_logged = true;
+    let mut exact_shell_grants = super::approval::ExactShellGrantStore::new();
     let mut driver = super::Driver {
         provider: &provider,
         tools: tools.as_ref(),
         runtime: &runtime,
         config: &config,
         request_header_logged: &mut request_header_logged,
+        exact_shell_grants: &mut exact_shell_grants,
+        pending_shell_grant: None,
         counters: super::Counters::default(),
         final_message: None,
         observer_unavailable: false,

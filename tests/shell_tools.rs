@@ -720,6 +720,7 @@ fn workdir_preview_result_and_next_request_keep_one_call_provenance() {
         Some(approval.clone()),
     ));
     let request = approval.requests().into_iter().next().unwrap();
+    assert!(format!("{request:?}").contains("exact_shell_scope_available: true"));
     assert_eq!(request.tool_name(), "bash");
     assert_eq!(request.call_id().as_str(), "shell-call-1");
     assert_eq!(

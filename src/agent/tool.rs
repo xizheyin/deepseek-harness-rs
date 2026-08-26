@@ -9,7 +9,10 @@ use crate::{
     session::ToolFailure,
 };
 
-use super::{MAX_AGENT_TOOL_RESULT_BYTES, approval::ApprovalPrompt};
+use super::{
+    MAX_AGENT_TOOL_RESULT_BYTES,
+    approval::{ApprovalPrompt, ExactShellGrantIdentity},
+};
 
 /// Future returned by one tool implementation without spawning detached work.
 pub type ToolExecutionFuture<'a> =
@@ -367,6 +370,7 @@ pub struct PreparedToolAction {
     contract: ActionContract,
     prompt: ApprovalPrompt,
     maximum_result_event_bytes: usize,
+    exact_shell_identity: Option<ExactShellGrantIdentity>,
     decline: ToolActionDeclineFn,
     run: ToolActionRunFn,
 }
@@ -380,6 +384,10 @@ impl std::fmt::Debug for PreparedToolAction {
             .field(
                 "maximum_result_event_bytes",
                 &self.maximum_result_event_bytes,
+            )
+            .field(
+                "exact_shell_identity_present",
+                &self.exact_shell_identity.is_some(),
             )
             .field("single_use_decline", &true)
             .field("single_use_run", &true)
@@ -407,9 +415,23 @@ impl PreparedToolAction {
             contract: ActionContract::Shell,
             prompt,
             maximum_result_event_bytes,
+            exact_shell_identity: None,
             decline,
             run,
         })
+    }
+
+    pub(crate) fn new_exact_shell(
+        dispatch: ToolDispatchBinding,
+        prompt: ApprovalPrompt,
+        exact_shell_identity: ExactShellGrantIdentity,
+        maximum_result_event_bytes: usize,
+        decline: ToolActionDeclineFn,
+        run: ToolActionRunFn,
+    ) -> Result<Self, ToolExecutorError> {
+        let mut action = Self::new(dispatch, prompt, maximum_result_event_bytes, decline, run)?;
+        action.exact_shell_identity = Some(exact_shell_identity);
+        Ok(action)
     }
 
     pub(crate) fn new_plugin(
@@ -443,6 +465,11 @@ impl PreparedToolAction {
     #[must_use]
     pub(crate) fn maximum_result_event_bytes(&self) -> usize {
         self.maximum_result_event_bytes
+    }
+
+    #[must_use]
+    pub(crate) fn exact_shell_identity(&self) -> Option<&ExactShellGrantIdentity> {
+        self.exact_shell_identity.as_ref()
     }
 
     pub(crate) fn decline(
@@ -490,6 +517,20 @@ pub(crate) fn validate_action_started_result(
     contract: &ActionContract,
 ) -> Result<(), ToolExecutorError> {
     validate_action_result(result, contract, true, false)
+}
+
+pub(crate) fn is_clean_exact_shell_result(result: &ToolExecutionResult) -> bool {
+    if result.is_error() {
+        return false;
+    }
+    let Some(fields) = result.meta().and_then(|meta| meta.as_value().as_object()) else {
+        return false;
+    };
+    fields.get("started").and_then(serde_json::Value::as_bool) == Some(true)
+        && fields.get("exitCode").and_then(serde_json::Value::as_i64) == Some(0)
+        && fields.get("signal").is_some_and(serde_json::Value::is_null)
+        && fields.get("timedOut").and_then(serde_json::Value::as_bool) == Some(false)
+        && fields.get("aborted").and_then(serde_json::Value::as_bool) == Some(false)
 }
 
 fn validate_action_result(
@@ -1078,9 +1119,40 @@ mod tests {
     };
 
     use super::{
-        ActionContract, ToolExecutionResult, validate_action_not_started_result,
-        validate_action_started_result,
+        ActionContract, ToolExecutionResult, is_clean_exact_shell_result,
+        validate_action_not_started_result, validate_action_started_result,
     };
+
+    fn shell_result(
+        is_error: bool,
+        started: bool,
+        exit_code: serde_json::Value,
+        signal: serde_json::Value,
+        timed_out: bool,
+        aborted: bool,
+    ) -> ToolExecutionResult {
+        let error = is_error.then(|| ToolFailure {
+            name: "ShellError".to_owned(),
+            code: "SHELL_TEST_FAILURE".to_owned(),
+        });
+        ToolExecutionResult::new(
+            vec![ContentBlock::text("shell result").unwrap()],
+            is_error,
+            error,
+            Some(
+                JsonValue::new(serde_json::json!({
+                    "started": started,
+                    "exitCode": exit_code,
+                    "signal": signal,
+                    "timedOut": timed_out,
+                    "aborted": aborted,
+                }))
+                .unwrap(),
+            ),
+            false,
+        )
+        .unwrap()
+    }
 
     fn plugin_result(
         dispatched: bool,
@@ -1175,5 +1247,71 @@ mod tests {
         );
         assert!(!ActionContract::Shell.matches_profile(&claim));
         assert!(super::ToolClaimProfile::plugin_action("INVALID".to_owned()).is_err());
+    }
+
+    #[test]
+    fn exact_shell_grants_require_one_clean_zero_exit() {
+        let clean = shell_result(
+            false,
+            true,
+            serde_json::json!(0),
+            serde_json::Value::Null,
+            false,
+            false,
+        );
+        assert!(is_clean_exact_shell_result(&clean));
+
+        for not_clean in [
+            shell_result(
+                false,
+                false,
+                serde_json::json!(0),
+                serde_json::Value::Null,
+                false,
+                false,
+            ),
+            shell_result(
+                false,
+                true,
+                serde_json::json!(1),
+                serde_json::Value::Null,
+                false,
+                false,
+            ),
+            shell_result(
+                false,
+                true,
+                serde_json::Value::Null,
+                serde_json::json!(15),
+                false,
+                false,
+            ),
+            shell_result(
+                false,
+                true,
+                serde_json::json!(0),
+                serde_json::Value::Null,
+                true,
+                false,
+            ),
+            shell_result(
+                false,
+                true,
+                serde_json::json!(0),
+                serde_json::Value::Null,
+                false,
+                true,
+            ),
+            shell_result(
+                true,
+                true,
+                serde_json::json!(0),
+                serde_json::Value::Null,
+                false,
+                false,
+            ),
+        ] {
+            assert!(!is_clean_exact_shell_result(&not_clean));
+        }
     }
 }

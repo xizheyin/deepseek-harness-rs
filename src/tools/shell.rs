@@ -1,5 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
+    os::unix::ffi::OsStrExt as _,
     sync::Arc,
     time::Duration,
 };
@@ -9,9 +10,10 @@ use serde_json::{Value, json};
 
 use crate::{
     agent::{
-        ActionDeclineReason, ApprovalPrompt, PreparedToolAction, PreparedToolActionSetup,
-        ToolActionSetupControl, ToolActionSetupOutcome, ToolActionTurnStop, ToolDispatchBinding,
-        ToolExecutionRequest, ToolExecutionResult, ToolExecutorError, ToolPreparation,
+        ActionDeclineReason, ApprovalPrompt, ExactShellGrantIdentity, PreparedToolAction,
+        PreparedToolActionSetup, ToolActionDeclineFn, ToolActionRunFn, ToolActionSetupControl,
+        ToolActionSetupOutcome, ToolActionTurnStop, ToolDispatchBinding, ToolExecutionRequest,
+        ToolExecutionResult, ToolExecutorError, ToolPreparation,
     },
     model::{ContentBlock, JsonValue, ToolSchema},
     session::ToolFailure,
@@ -719,24 +721,100 @@ pub(crate) fn finish_action(
     runner: Arc<ProcessRunner>,
 ) -> Result<PreparedToolAction, ToolExecutorError> {
     let prompt = approval_prompt(invocation.arguments(), invocation.workdir().display())?;
+    let exact_shell_identity = build_exact_shell_identity(&invocation, &environment);
     let timeout_ms = invocation.arguments().timeout_ms();
     let decline_workdir = invocation.workdir().display().to_owned();
     let run_workdir = decline_workdir.clone();
-    PreparedToolAction::new(
-        dispatch,
-        prompt,
-        MAX_SHELL_RESULT_EVENT_BYTES,
-        Box::new(move |reason| declined_result(reason, timeout_ms, &decline_workdir)),
-        Box::new(move |control| {
-            Box::pin(run_prepared_action(
-                invocation,
-                environment,
-                runner,
-                run_workdir,
-                control,
-            ))
-        }),
+    let decline: ToolActionDeclineFn =
+        Box::new(move |reason| declined_result(reason, timeout_ms, &decline_workdir));
+    let run: ToolActionRunFn = Box::new(move |control| {
+        Box::pin(run_prepared_action(
+            invocation,
+            environment,
+            runner,
+            run_workdir,
+            control,
+        ))
+    });
+    match exact_shell_identity {
+        Some(identity) => PreparedToolAction::new_exact_shell(
+            dispatch,
+            prompt,
+            identity,
+            MAX_SHELL_RESULT_EVENT_BYTES,
+            decline,
+            run,
+        ),
+        None => {
+            PreparedToolAction::new(dispatch, prompt, MAX_SHELL_RESULT_EVENT_BYTES, decline, run)
+        }
+    }
+}
+
+fn build_exact_shell_identity(
+    invocation: &PreparedShellInvocation,
+    environment: &[(OsString, OsString)],
+) -> Option<ExactShellGrantIdentity> {
+    build_exact_shell_identity_parts(
+        invocation.arguments().command(),
+        invocation.arguments().timeout_ms(),
+        invocation.workdir().exact_shell_identity_fields(),
+        environment,
     )
+}
+
+fn build_exact_shell_identity_parts(
+    command: &str,
+    timeout_ms: u64,
+    workdir_identity: (&str, u64, u64, u64, u64),
+    environment: &[(OsString, OsString)],
+) -> Option<ExactShellGrantIdentity> {
+    const DOMAIN: &[u8] = b"dsh-exact-shell-v1";
+    const LAUNCHER: &[u8] = b"/bin/bash\0--noprofile\0--norc\0-c\0no-sandbox-v1";
+
+    #[cfg(test)]
+    {
+        let mut fail_for = exact_shell_identity_failure_command().lock().unwrap();
+        if fail_for.as_deref() == Some(command) {
+            *fail_for = None;
+            return None;
+        }
+    }
+
+    let mut encoded = Vec::new();
+    push_identity_field(&mut encoded, DOMAIN)?;
+    push_identity_field(&mut encoded, command.as_bytes())?;
+    push_identity_field(&mut encoded, &timeout_ms.to_be_bytes())?;
+    let (workdir, root_dev, root_ino, workdir_dev, workdir_ino) = workdir_identity;
+    push_identity_field(&mut encoded, workdir.as_bytes())?;
+    for value in [root_dev, root_ino, workdir_dev, workdir_ino] {
+        push_identity_field(&mut encoded, &value.to_be_bytes())?;
+    }
+    let environment_count = u64::try_from(environment.len()).ok()?;
+    push_identity_field(&mut encoded, &environment_count.to_be_bytes())?;
+    for (name, value) in environment {
+        push_identity_field(&mut encoded, name.as_os_str().as_bytes())?;
+        push_identity_field(&mut encoded, value.as_os_str().as_bytes())?;
+    }
+    push_identity_field(&mut encoded, LAUNCHER)?;
+    ExactShellGrantIdentity::new(encoded)
+}
+
+#[cfg(test)]
+fn exact_shell_identity_failure_command() -> &'static std::sync::Mutex<Option<String>> {
+    static COMMAND: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    COMMAND.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn push_identity_field(encoded: &mut Vec<u8>, field: &[u8]) -> Option<()> {
+    let length = u64::try_from(field.len()).ok()?;
+    encoded
+        .try_reserve_exact(8_usize.saturating_add(field.len()))
+        .ok()?;
+    encoded.extend_from_slice(&length.to_be_bytes());
+    encoded.extend_from_slice(field);
+    Some(())
 }
 
 struct LaunchReady {
@@ -1478,7 +1556,9 @@ fn append_line(output: &mut String, line: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt};
+    use std::{collections::BTreeMap, ffi::OsString, os::unix::ffi::OsStringExt, sync::Arc};
+
+    use tokio_util::sync::CancellationToken;
 
     use serde_json::json;
 
@@ -1486,7 +1566,12 @@ mod tests {
         DEFAULT_SHELL_TIMEOUT_MS, MAX_CHILD_ENVIRONMENT_BYTES, MAX_SHELL_COMMAND_BYTES,
         MAX_SHELL_DESCRIPTION_BYTES, MAX_SHELL_TIMEOUT_MS, MAX_SHELL_WORKDIR_BYTES,
         ShellEnvironment, ShellPrimary, ShellTermination, StartedShellResult, approval_prompt,
-        build_environment, parse_arguments, schema, started_result,
+        build_environment, build_exact_shell_identity_parts, exact_shell_identity_failure_command,
+        finish_action, parse_arguments, schema, started_result,
+    };
+    use crate::{
+        agent::ToolDispatchBinding,
+        tools::{process::ProcessRunner, workspace::Workspace},
     };
 
     fn result_with(
@@ -1546,6 +1631,78 @@ mod tests {
         ] {
             assert!(parse_arguments(&invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn exact_shell_identity_covers_every_execution_field_and_not_display_reason() {
+        let environment = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
+        let build = |command: &str,
+                     timeout_ms: u64,
+                     workdir: (&str, u64, u64, u64, u64),
+                     environment: &[(OsString, OsString)]| {
+            build_exact_shell_identity_parts(command, timeout_ms, workdir, environment).unwrap()
+        };
+        let baseline = build("printf ok", 25_000, (".", 1, 2, 1, 2), &environment);
+        assert_eq!(
+            baseline,
+            build("printf ok", 25_000, (".", 1, 2, 1, 2), &environment)
+        );
+        for changed in [
+            build("printf  ok", 25_000, (".", 1, 2, 1, 2), &environment),
+            build("printf ok", 24_999, (".", 1, 2, 1, 2), &environment),
+            build("printf ok", 25_000, ("nested", 1, 2, 1, 2), &environment),
+            build("printf ok", 25_000, (".", 9, 2, 1, 2), &environment),
+            build("printf ok", 25_000, (".", 1, 9, 1, 2), &environment),
+            build("printf ok", 25_000, (".", 1, 2, 9, 2), &environment),
+            build("printf ok", 25_000, (".", 1, 2, 1, 9), &environment),
+            build(
+                "printf ok",
+                25_000,
+                (".", 1, 2, 1, 2),
+                &[(OsString::from("PATH"), OsString::from("/different"))],
+            ),
+        ] {
+            assert_ne!(baseline, changed);
+        }
+
+        // Description is intentionally absent: it changes only UI text, not
+        // the process invocation. The real PTY test varies it and still hits.
+        assert_eq!(
+            baseline,
+            build("printf ok", 25_000, (".", 1, 2, 1, 2), &environment)
+        );
+    }
+
+    #[test]
+    fn exact_shell_identity_allocation_failure_keeps_an_ordinary_action() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-shell-identity-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let workspace = Workspace::open(&root).unwrap();
+        let resolved = workspace.resolve_shell_workdir(".").unwrap();
+        let workdir = workspace
+            .prepare_shell_workdir(resolved, &CancellationToken::new())
+            .unwrap();
+        let command = "printf identity-allocation-fallback";
+        let arguments = parse_arguments(&json!({
+            "command": command,
+            "description": "exercise the fail-closed identity fallback"
+        }))
+        .unwrap();
+        *exact_shell_identity_failure_command().lock().unwrap() = Some(command.to_owned());
+        let action = finish_action(
+            ToolDispatchBinding::new(),
+            super::PreparedShellInvocation { arguments, workdir },
+            Arc::from([(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]),
+            Arc::new(ProcessRunner::open().unwrap()),
+        )
+        .unwrap();
+
+        assert!(action.exact_shell_identity().is_none());
+        drop(action);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

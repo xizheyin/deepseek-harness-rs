@@ -98,6 +98,27 @@ fn tool_sse() -> String {
     )
 }
 
+fn shell_sse() -> String {
+    let arguments = serde_json::to_string(&serde_json::json!({
+        "command":"printf shell-grant > shell-grant.txt",
+        "description":"establish one exact Shell process grant"
+    }))
+    .expect("shell arguments should encode");
+    let delta = serde_json::json!({
+        "choices":[{"delta":{"tool_calls":[{
+            "index":0,
+            "id":"call-shell-grant",
+            "type":"function",
+            "function":{"name":"bash","arguments":arguments}
+        }]}}]
+    });
+    format!(
+        "data: {delta}\n\n\
+         data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+         data: [DONE]\n\n"
+    )
+}
+
 fn invalid_plugin_tool_sse() -> String {
     let arguments = serde_json::to_string(&serde_json::json!({"extra":true}))
         .expect("tool arguments should encode");
@@ -151,6 +172,82 @@ fn only_session_id(root: &Path) -> String {
         .collect::<Vec<_>>();
     assert_eq!(sessions.len(), 1, "expected one durable session");
     sessions.remove(0)
+}
+
+#[test]
+fn exact_shell_process_grant_never_authorizes_a_configured_plugin() {
+    let workspace = PluginWorkspace::new();
+    let config = plugin_fixture(&workspace.0);
+    let session_root = TestSessionRoot::new();
+    let server = SequenceSseServer::start(vec![
+        shell_sse(),
+        text_sse("shell grant ready"),
+        tool_sse(),
+        text_sse("plugin stayed separately approved"),
+    ]);
+    let mut dsh = PtyHarness::spawn_color_with_plugin_config_and_session_root(
+        &server.base_url,
+        &workspace.0,
+        &config,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"establish the exact shell grant\r");
+    dsh.approval_ready_occurrence(1);
+    dsh.expect(b"Allow exact Shell");
+    dsh.write(b"\x1b[B");
+    dsh.expect(b"> Allow exact Shell");
+    dsh.write(b"\r");
+    dsh.expect(b"shell grant ready");
+    dsh.expect(b"Turn complete");
+    dsh.expect_occurrences(b"Enter send", 2);
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("shell-grant.txt")).unwrap(),
+        "shell-grant"
+    );
+
+    let plugin_turn = dsh.checkpoint();
+    dsh.write(b"now use the configured plugin\r");
+    dsh.approval_ready_for_call(b"call-plugin-1");
+    let plugin_selector = dsh.snapshot();
+    assert!(
+        !plugin_selector[plugin_turn..]
+            .windows(b"Allow exact Shell".len())
+            .any(|bytes| bytes == b"Allow exact Shell"),
+        "a plugin selector must never inherit the Shell-only fourth choice"
+    );
+    assert!(
+        !workspace.0.join("plugin-calls.log").exists(),
+        "the plugin must still wait for its own approval"
+    );
+    dsh.write(b"\x1b[A");
+    dsh.expect_after(plugin_turn, b"> Allow once");
+    assert!(!workspace.0.join("plugin-calls.log").exists());
+    dsh.write(b"\r");
+    dsh.expect(b"plugin stayed separately approved");
+    dsh.expect_occurrences("❯".as_bytes(), 3);
+    let (status, transcript) = dsh.exit_cleanly();
+    let transcript = String::from_utf8_lossy(&transcript);
+    assert!(status.success(), "{transcript}");
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("plugin-calls.log")).unwrap(),
+        "call\n"
+    );
+
+    assert_eq!(server.finish().len(), 4);
+    let session_id = only_session_id(session_root.path());
+    let journal = fs::read_to_string(session_root.path().join(format!("{session_id}.jsonl")))
+        .expect("combined Session should be readable");
+    for event_type in ["approval/asked", "approval/decided", "tool/result"] {
+        assert_eq!(
+            journal
+                .matches(&format!("\"type\":\"{event_type}\""))
+                .count(),
+            2,
+            "Shell and plugin must each retain their own {event_type} fact"
+        );
+    }
 }
 
 #[test]

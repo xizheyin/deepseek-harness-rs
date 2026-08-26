@@ -33,12 +33,14 @@ pub(crate) enum DockInteraction {
         snapshot: CommandPaletteSnapshot,
     },
     Approval(DockApprovalSelection),
+    ExactShellApproval(DockApprovalSelection),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DockApprovalSelection {
     AllowOnce,
     Reject,
+    AllowExactShellForProcess,
     Cancel,
 }
 
@@ -179,8 +181,16 @@ impl DockFrame {
             .try_reserve_exact(MAX_DOCK_ROWS)
             .map_err(|_| DockError::Capacity)?;
 
-        let software_cursor = !matches!(model.interaction, DockInteraction::Approval(_));
-        let composer_start = if let DockInteraction::Approval(selected) = model.interaction {
+        let software_cursor = !matches!(
+            model.interaction,
+            DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+        );
+        let approval = match model.interaction {
+            DockInteraction::Approval(selected) => Some((selected, false)),
+            DockInteraction::ExactShellApproval(selected) => Some((selected, true)),
+            _ => None,
+        };
+        let composer_start = if let Some((selected, allow_exact_shell)) = approval {
             lines.push(line(
                 DockRole::Notice,
                 fit_ascii(
@@ -199,9 +209,17 @@ impl DockFrame {
                     "Allow once | apply exact preview",
                 ),
                 (DockApprovalSelection::Reject, "Reject | make no change"),
+                (
+                    DockApprovalSelection::AllowExactShellForProcess,
+                    "Allow exact Shell | until dsh exits",
+                ),
                 (DockApprovalSelection::Cancel, "Stop turn | cancel work"),
             ];
             for (choice, label) in choices {
+                if choice == DockApprovalSelection::AllowExactShellForProcess && !allow_exact_shell
+                {
+                    continue;
+                }
                 if compact && choice != selected {
                     continue;
                 }
@@ -209,6 +227,7 @@ impl DockFrame {
                     match choice {
                         DockApprovalSelection::AllowOnce => "Allow once",
                         DockApprovalSelection::Reject => "Reject",
+                        DockApprovalSelection::AllowExactShellForProcess => "Allow exact",
                         DockApprovalSelection::Cancel => "Stop turn",
                     }
                 } else {
@@ -245,9 +264,10 @@ impl DockFrame {
         } else {
             let palette = match model.interaction {
                 DockInteraction::CommandPalette { snapshot, .. } => Some(snapshot),
-                DockInteraction::Idle | DockInteraction::Running | DockInteraction::Approval(_) => {
-                    None
-                }
+                DockInteraction::Idle
+                | DockInteraction::Running
+                | DockInteraction::Approval(_)
+                | DockInteraction::ExactShellApproval(_) => None,
             };
             let file_suggestions = model
                 .file_suggestions
@@ -306,7 +326,9 @@ impl DockFrame {
                     DockInteraction::CommandPalette { running: true, .. } => {
                         working_status(model.working)
                     }
-                    DockInteraction::Approval(_) => "Approval required".to_owned(),
+                    DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_) => {
+                        "Approval required".to_owned()
+                    }
                 };
                 lines.push(line(DockRole::Queue, fit_ascii(&status, width_usize)));
             }
@@ -355,7 +377,9 @@ impl DockFrame {
                     }
                     DockInteraction::CommandPalette { .. } if compact => "Enter · Esc",
                     DockInteraction::CommandPalette { .. } => "Enter complete · Esc close",
-                    DockInteraction::Approval(_) => "Arrow keys move | Enter confirms | Esc stops",
+                    DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_) => {
+                        "Arrow keys move | Enter confirms | Esc stops"
+                    }
                 }
             };
             let mut hint = if wrapped.hidden_below {
@@ -1367,7 +1391,10 @@ mod tests {
             .unwrap();
             assert_eq!(frame.rows().unwrap(), 4);
             assert_eq!(frame.output_bottom(), 2);
-            if matches!(interaction, DockInteraction::Approval(_)) {
+            if matches!(
+                interaction,
+                DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+            ) {
                 assert_eq!(frame.lines[0].text, "Not applied");
                 assert!(
                     frame
@@ -1503,6 +1530,60 @@ mod tests {
                     <= usize::from(columns - 1)
             }));
         }
+    }
+
+    #[test]
+    fn exact_shell_approval_adds_one_explicit_process_choice_only() {
+        let composer = Composer::default();
+        let queue = PromptQueue::default();
+        let exact = DockFrame::layout(
+            DockModel {
+                interaction: DockInteraction::ExactShellApproval(
+                    DockApprovalSelection::AllowExactShellForProcess,
+                ),
+                composer: &composer,
+                queue: &queue,
+                notice: None,
+                file_suggestions: FileSuggestionSnapshot::Hidden,
+                working: WorkingPresentation::PLAIN,
+            },
+            24,
+            80,
+        )
+        .unwrap();
+        assert_eq!(exact.lines.len(), 8);
+        assert!(
+            exact
+                .lines
+                .iter()
+                .any(|line| line.text.contains("> Allow exact Shell"))
+        );
+        assert!(
+            exact
+                .lines
+                .iter()
+                .any(|line| line.text.contains("until dsh exits"))
+        );
+
+        let ordinary = DockFrame::layout(
+            DockModel {
+                interaction: DockInteraction::Approval(DockApprovalSelection::Reject),
+                composer: &composer,
+                queue: &queue,
+                notice: None,
+                file_suggestions: FileSuggestionSnapshot::Hidden,
+                working: WorkingPresentation::PLAIN,
+            },
+            24,
+            80,
+        )
+        .unwrap();
+        assert!(
+            !ordinary
+                .lines
+                .iter()
+                .any(|line| line.text.contains("exact Shell"))
+        );
     }
 
     #[test]

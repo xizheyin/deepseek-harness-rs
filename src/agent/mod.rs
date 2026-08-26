@@ -45,6 +45,7 @@ use crate::{
 
 pub(crate) use approval::{
     ApprovalDiffRowKind, ApprovalPatchOperation, ApprovalPreviewKind, CanonicalPatchApproval,
+    ExactShellGrantIdentity,
 };
 pub use approval::{
     ApprovalFuture, ApprovalPrompt, ApprovalPromptError, ApprovalProvider, ApprovalProviderError,
@@ -55,8 +56,9 @@ pub use error::{
     AgentBuildError, AgentLoopError, AgentReleaseError, AgentRuntimeError, AgentShutdownError,
 };
 pub(crate) use tool::{
-    ActionContract, ActionDeclineReason, ToolActionControl, ToolActionOutcome,
-    ToolActionSetupControl, ToolActionSetupOutcome, ToolActionTurnStop, ToolDispatchBinding,
+    ActionContract, ActionDeclineReason, ToolActionControl, ToolActionDeclineFn, ToolActionOutcome,
+    ToolActionRunFn, ToolActionSetupControl, ToolActionSetupOutcome, ToolActionTurnStop,
+    ToolDispatchBinding,
 };
 pub use tool::{
     MutationDeclineReason, NoTools, PreparedToolAction, PreparedToolActionSetup,
@@ -695,6 +697,7 @@ pub struct AgentLoop {
     runtime: Arc<dyn AgentRuntime>,
     config: AgentLoopConfig,
     request_header_logged: bool,
+    exact_shell_grants: approval::ExactShellGrantStore,
     poisoned: bool,
 }
 
@@ -770,6 +773,7 @@ impl AgentLoop {
             runtime,
             config,
             request_header_logged: false,
+            exact_shell_grants: approval::ExactShellGrantStore::new(),
             poisoned: false,
         })
     }
@@ -861,6 +865,7 @@ impl AgentLoop {
             runtime.as_ref(),
             &config,
             &mut self.request_header_logged,
+            &mut self.exact_shell_grants,
             proposal,
             cancellation,
         )
@@ -1069,6 +1074,8 @@ struct Driver<'a> {
     runtime: &'a dyn AgentRuntime,
     config: &'a AgentLoopConfig,
     request_header_logged: &'a mut bool,
+    exact_shell_grants: &'a mut approval::ExactShellGrantStore,
+    pending_shell_grant: Option<approval::ExactShellGrantDigest>,
     counters: Counters,
     final_message: Option<Message>,
     observer_unavailable: bool,
@@ -1118,6 +1125,7 @@ async fn run_turn_inner(
     runtime: &dyn AgentRuntime,
     config: &AgentLoopConfig,
     request_header_logged: &mut bool,
+    exact_shell_grants: &mut approval::ExactShellGrantStore,
     proposal: TurnProposal,
     cancellation: CancellationToken,
 ) -> Result<TurnOutcome, AgentLoopError> {
@@ -1155,6 +1163,8 @@ async fn run_turn_inner(
         runtime,
         config,
         request_header_logged,
+        exact_shell_grants,
+        pending_shell_grant: None,
         counters: Counters::default(),
         final_message: None,
         observer_unavailable: false,
@@ -2784,6 +2794,15 @@ async fn commit_tool_round(
                         let committed_preferred =
                             settle_tool_result(reservation, driver, plan, result, settlement)
                                 .await?;
+                        let stop =
+                            latch_tool_stop(stop, sample_tool_stop(cancellation, driver.deadline));
+                        if committed_preferred && stop == ToolStop::None {
+                            if let Some(digest) = driver.pending_shell_grant.take() {
+                                let _ = driver.exact_shell_grants.insert(digest);
+                            }
+                        } else {
+                            driver.pending_shell_grant = None;
+                        }
                         concludes_turn |= requested_conclusion && committed_preferred;
                         latched_stop = latch_tool_stop(latched_stop, stop);
                         match stop {
@@ -3419,7 +3438,17 @@ async fn resolve_action(
         Err(error) => return Err(error.into()),
     }
 
-    let action = if approval_required {
+    let exact_shell_digest = if approval_required && contract == ActionContract::Shell {
+        action
+            .exact_shell_identity()
+            .and_then(|identity| driver.exact_shell_grants.digest(identity))
+    } else {
+        None
+    };
+    let cache_hit = exact_shell_digest.is_some_and(|digest| driver.exact_shell_grants.take(digest));
+    let mut shell_grant_candidate = cache_hit.then_some(exact_shell_digest).flatten();
+
+    let action = if approval_required && !cache_hit {
         let approval_id = match next_id(driver.runtime, AgentIdKind::Approval) {
             Ok(id) => ApprovalRequestId::new(id),
             Err(_) => {
@@ -3430,12 +3459,27 @@ async fn resolve_action(
                 ));
             }
         };
-        let request = ApprovalRequest::new(
-            approval_id.clone(),
-            plan.call.name.clone(),
-            plan.call.id.clone(),
-            action.prompt(),
-        );
+        let exact_scope_digest =
+            exact_shell_digest.filter(|_| driver.exact_shell_grants.can_insert());
+        let (request, scope_receipt) = if exact_scope_digest.is_some() {
+            let (request, receipt) = ApprovalRequest::new_with_exact_shell_scope(
+                approval_id.clone(),
+                plan.call.name.clone(),
+                plan.call.id.clone(),
+                action.prompt(),
+            );
+            (request, Some(receipt))
+        } else {
+            (
+                ApprovalRequest::new(
+                    approval_id.clone(),
+                    plan.call.name.clone(),
+                    plan.call.id.clone(),
+                    action.prompt(),
+                ),
+                None,
+            )
+        };
         let asked = NewEvent::log(EventKind::approval_asked(ApprovalAskedEvent::new(
             approval_id.clone(),
             plan.call.name.clone(),
@@ -3490,7 +3534,12 @@ async fn resolve_action(
             driver.observer_unavailable = true;
         }
         match outcome {
-            ApprovalOutcome::AllowedOnce if stop == ToolStop::None && decision_visible => action,
+            ApprovalOutcome::AllowedOnce if stop == ToolStop::None && decision_visible => {
+                if scope_receipt.is_some_and(|receipt| receipt.was_requested()) {
+                    shell_grant_candidate = exact_scope_digest;
+                }
+                action
+            }
             ApprovalOutcome::AllowedOnce => {
                 return Ok(decline_action(
                     action,
@@ -3616,6 +3665,11 @@ async fn resolve_action(
             {
                 ToolRun::ActionUnresolved { stop }
             } else {
+                if stop == ToolStop::None && tool::is_clean_exact_shell_result(&result) {
+                    if let Some(digest) = shell_grant_candidate {
+                        driver.pending_shell_grant = Some(digest);
+                    }
+                }
                 ToolRun::Completed {
                     result,
                     settlement: ResultSettlement::PreferredRequired,

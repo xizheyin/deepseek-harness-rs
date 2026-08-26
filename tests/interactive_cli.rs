@@ -265,6 +265,35 @@ fn tool_sse(call_id: &str, name: &str, arguments: serde_json::Value) -> String {
     )
 }
 
+fn two_tool_sse(
+    first: (&str, &str, serde_json::Value),
+    second: (&str, &str, serde_json::Value),
+) -> String {
+    let calls = [first, second]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, name, arguments))| {
+            serde_json::json!({
+                "index": index,
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": serde_json::to_string(&arguments).unwrap()
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let delta = serde_json::json!({
+        "choices": [{ "delta": { "tool_calls": calls } }]
+    });
+    format!(
+        "data: {delta}\n\n\
+         data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\n\
+         data: [DONE]\n\n"
+    )
+}
+
 fn wait_for_file(path: &std::path::Path, timeout: Duration) {
     let deadline = std::time::Instant::now() + timeout;
     while !path.exists() {
@@ -3788,6 +3817,132 @@ fn foreground_shell_runs_only_after_the_confirmed_terminal_approval() {
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "shell-ok");
     assert_eq!(requests.len(), 2);
     assert!(requests[1].contains("call-shell"));
+}
+
+#[test]
+fn exact_shell_process_choice_runs_a_normalized_repeat_without_a_second_prompt() {
+    let command = "printf x >> shell-result.txt";
+    let server = SequenceSseServer::start(vec![
+        two_tool_sse(
+            (
+                "call-shell-exact-1",
+                "bash",
+                serde_json::json!({
+                    "command": command,
+                    "description": "first display reason",
+                    "timeoutMs": 25_000
+                }),
+            ),
+            (
+                "call-shell-exact-2",
+                "bash",
+                serde_json::json!({
+                    "command": command,
+                    "description": "different display reason",
+                    "workdir": "."
+                }),
+            ),
+        ),
+        text_sse("both exact shell calls finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let target = workspace.0.join("shell-result.txt");
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"run the exact command twice\r");
+    dsh.approval_ready();
+    dsh.expect(b"Allow exact Shell");
+    assert!(!target.exists());
+    dsh.write(b"\x1b[B");
+    dsh.expect(b"> Allow exact Shell");
+    assert!(!target.exists());
+    dsh.write(b"\r");
+    // Reaching the final answer proves the second call did not stop on a new
+    // selector. Both calls still execute and produce their own result.
+    dsh.expect(b"both exact shell calls finished");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "xx");
+    assert_eq!(requests.len(), 2);
+    let entries = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let journal = std::fs::read(entries[0].path()).unwrap();
+    for event in [
+        b"\"type\":\"approval/asked\"".as_slice(),
+        b"\"type\":\"approval/decided\"".as_slice(),
+    ] {
+        assert_eq!(
+            journal
+                .windows(event.len())
+                .filter(|row| *row == event)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        journal
+            .windows(b"\"type\":\"tool/result\"".len())
+            .filter(|row| *row == b"\"type\":\"tool/result\"")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn linear_exact_shell_process_choice_requires_a_fresh_confirmation() {
+    let command = "printf y >> linear-shell-result.txt";
+    let server = SequenceSseServer::start(vec![
+        two_tool_sse(
+            (
+                "call-linear-exact-1",
+                "bash",
+                serde_json::json!({
+                    "command": command,
+                    "description": "first linear reason"
+                }),
+            ),
+            (
+                "call-linear-exact-2",
+                "bash",
+                serde_json::json!({
+                    "command": command,
+                    "description": "second linear reason"
+                }),
+            ),
+        ),
+        text_sse("linear exact calls finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("linear-shell-result.txt");
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"run the exact linear command twice\r");
+    dsh.approval_ready();
+    dsh.expect(b"Allow exact Shell for this process");
+    dsh.write(b"\x1b[B");
+    dsh.expect(b"[x] Allow exact Shell for this process");
+    assert!(!target.exists());
+    dsh.write(b"\n");
+    dsh.expect(b"assistant | linear exact calls finished");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "yy");
+    assert_eq!(server.finish().len(), 2);
 }
 
 #[test]
