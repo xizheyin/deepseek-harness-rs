@@ -18,6 +18,7 @@ use crate::tui::inline_screen::POISON_TEARDOWN_BYTES;
 
 pub(super) const TERMINAL_READ_BYTES: usize = 8 * 1024;
 pub(super) const ENHANCED_VISUAL_RESET_BYTES: &[u8] = b"\x1b[r\x1b[?6l\x1b[?2004l\x1b[?25h\x1b[0m";
+const CURSOR_FIRST_VISUAL_RESET_BYTES: &[u8] = b"\x1b[?25h\x1b[0m";
 #[cfg(any(target_os = "macos", test))]
 const MIN_MACOS_CANONICAL_BYTES: i64 = 1_001;
 #[cfg(any(target_os = "linux", test))]
@@ -247,6 +248,19 @@ impl AsyncTerminal {
             }
         }
     }
+
+    /// Allocation-free selector backstop that does not erase primary-screen
+    /// history. It restores only modes a small selector may have changed.
+    pub(super) fn best_effort_cursor_reset(&self) {
+        let _ = rustix::io::write(self.output.get_ref(), CURSOR_FIRST_VISUAL_RESET_BYTES);
+    }
+
+    /// Allocation-free poisoned-screen backstop. Enhanced Dock ownership may
+    /// need to sacrifice uncertain coordinates after a partial transaction.
+    pub(super) fn best_effort_visual_reset(&self) {
+        self.best_effort_cursor_reset();
+        let _ = rustix::io::write(self.output.get_ref(), POISON_TEARDOWN_BYTES);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -396,7 +410,7 @@ impl TerminalSession {
         // never waits and is only a backstop for a partially written frame;
         // normal control flow already sends the same reset through the bounded
         // asynchronous writer.
-        let _ = rustix::io::write(self.terminal.output.get_ref(), POISON_TEARDOWN_BYTES);
+        self.terminal.best_effort_visual_reset();
     }
 }
 

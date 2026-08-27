@@ -183,6 +183,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             SessionStore::open_default().map_err(EntryError::storage)?,
             id,
             workspace.as_deref().map(PathBuf::from),
+            None,
         )),
         Some(ResumeTarget::Picker) => {
             let store = SessionStore::open_default().map_err(EntryError::storage)?;
@@ -205,7 +206,8 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
                     presentation,
                 )) {
                     Ok(PickerOutcome::Selected(id)) => {
-                        break Some((store, id, Some(authority.canonical_path().to_path_buf())));
+                        let asserted_workspace = authority.canonical_path().to_path_buf();
+                        break Some((store, id, Some(asserted_workspace), Some(authority)));
                     }
                     Ok(PickerOutcome::Cancelled) => return Ok(0),
                     Ok(PickerOutcome::Signal(UiSignal::Suspend)) => {
@@ -241,7 +243,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
     };
 
     let prepared = match resume_plan {
-        Some((store, id, asserted_workspace)) => loop {
+        Some((store, id, asserted_workspace, _workspace_guard)) => loop {
             let target = match &surface {
                 LaunchSurface::Script(_) => WarningTarget::Script,
                 LaunchSurface::Interactive(terminal) => WarningTarget::Interactive(terminal),

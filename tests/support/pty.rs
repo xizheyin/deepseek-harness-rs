@@ -134,6 +134,7 @@ struct PtyLaunch {
     binary: PathBuf,
     extra_args: Vec<std::ffi::OsString>,
     extra_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    preloaded_input: Vec<u8>,
     initial_rows: u16,
     initial_columns: u16,
 }
@@ -146,6 +147,7 @@ impl PtyLaunch {
             binary: cargo_test_binary(),
             extra_args: Vec::new(),
             extra_environment: Vec::new(),
+            preloaded_input: Vec::new(),
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -159,6 +161,7 @@ impl PtyLaunch {
             binary: cargo_test_binary(),
             extra_args: vec!["--plugin-config".into(), config.as_os_str().to_owned()],
             extra_environment: Vec::new(),
+            preloaded_input: Vec::new(),
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -177,6 +180,7 @@ impl PtyLaunch {
                 prompt.into(),
             ],
             extra_environment: Vec::new(),
+            preloaded_input: Vec::new(),
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -190,6 +194,7 @@ impl PtyLaunch {
             binary: dsh_binary(),
             extra_args: Vec::new(),
             extra_environment: Vec::new(),
+            preloaded_input: Vec::new(),
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -203,6 +208,7 @@ impl PtyLaunch {
             binary: dsh_binary(),
             extra_args: vec!["--plugin-config".into(), config.as_os_str().to_owned()],
             extra_environment: Vec::new(),
+            preloaded_input: Vec::new(),
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -335,6 +341,26 @@ impl PtyHarness {
         )
     }
 
+    pub fn spawn_picker_color_with_preloaded_input(
+        base_url: &str,
+        workspace: &Path,
+        session_root: TestSessionRoot,
+        input: &[u8],
+    ) -> Self {
+        let mut launch = PtyLaunch::cargo(true);
+        launch.extra_args.push("--resume".into());
+        launch.preloaded_input = input.to_vec();
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            launch,
+        )
+    }
+
     pub fn spawn_picker_linear_cargo(
         base_url: &str,
         workspace: &Path,
@@ -342,6 +368,26 @@ impl PtyHarness {
     ) -> Self {
         let mut launch = PtyLaunch::cargo(false);
         launch.extra_args.push("--resume".into());
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            launch,
+        )
+    }
+
+    pub fn spawn_picker_linear_with_preloaded_input(
+        base_url: &str,
+        workspace: &Path,
+        session_root: TestSessionRoot,
+        input: &[u8],
+    ) -> Self {
+        let mut launch = PtyLaunch::cargo(false);
+        launch.extra_args.push("--resume".into());
+        launch.preloaded_input = input.to_vec();
         Self::spawn_with_transcript_mode(
             base_url,
             workspace,
@@ -634,6 +680,7 @@ impl PtyHarness {
             binary,
             extra_args,
             extra_environment,
+            preloaded_input,
             initial_rows,
             initial_columns,
         } = launch;
@@ -719,6 +766,13 @@ impl PtyHarness {
         master
             .resize(Size::new(initial_rows, initial_columns))
             .expect("PTY should resize");
+        if !preloaded_input.is_empty() {
+            let mut input = &master;
+            input
+                .write_all(&preloaded_input)
+                .expect("preloaded PTY input should write");
+            input.flush().expect("preloaded PTY input should flush");
+        }
         let reader_fd = rustix::io::dup(&master).expect("PTY master should duplicate");
         let transcript = Arc::new((
             Mutex::new(TranscriptState {

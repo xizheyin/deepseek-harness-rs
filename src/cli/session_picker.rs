@@ -224,9 +224,11 @@ async fn pick_enhanced(
     signals: &mut SignalStreams,
     sessions: &[SessionMetadata],
 ) -> Result<PickerOutcome, PickerError> {
-    let mode = terminal.enter_selector_mode()?;
     let mut state = PickerState::new()?;
+    terminal.flush_input()?;
+    let mode = terminal.enter_selector_mode()?;
     let mut paint = PaintState::default();
+    let mut cleanup_safe = true;
     let mut scratch = [0_u8; TERMINAL_READ_BYTES];
 
     let result = async {
@@ -237,11 +239,18 @@ async fn pick_enhanced(
             });
             let frame = render_enhanced_frame(sessions, &state, size, paint)?;
             let frame_lines = frame.line_count;
-            let report = write_all(terminal, signals, frame.bytes.as_bytes()).await?;
-            paint.lines = frame_lines;
+            let report = match write_all(terminal, signals, frame.bytes.as_bytes()).await {
+                Ok(report) => report,
+                Err(error) => {
+                    cleanup_safe = false;
+                    return Err(error);
+                }
+            };
             if let Some(signal) = report.signal {
+                cleanup_safe = false;
                 return Ok(PickerOutcome::Signal(signal));
             }
+            paint.lines = frame_lines;
             if report.resized {
                 continue;
             }
@@ -284,8 +293,12 @@ async fn pick_enhanced(
     }
     .await;
 
+    terminal.best_effort_cursor_reset();
     mode.restore()?;
     let result = result?;
+    if !cleanup_safe {
+        return Ok(result);
+    }
     let cleanup = render_cleanup(paint.lines)?;
     let report = write_all(terminal, signals, cleanup.as_bytes()).await?;
     Ok(report.signal.map(PickerOutcome::Signal).unwrap_or(result))
@@ -302,6 +315,7 @@ async fn pick_linear(
     signals: &mut SignalStreams,
     sessions: &[SessionMetadata],
 ) -> Result<PickerOutcome, PickerError> {
+    terminal.flush_input()?;
     let snapshot = render_linear_snapshot(sessions)?;
     let report = write_all(terminal, signals, snapshot.as_bytes()).await?;
     if let Some(signal) = report.signal {
@@ -374,15 +388,16 @@ fn parse_linear_event(event: InputRecordEvent, session_count: usize) -> LinearCh
     let InputRecordEvent::Record { text, .. } = event else {
         return LinearChoice::Retry;
     };
-    let answer = text.trim_matches(|character: char| character.is_ascii_whitespace());
-    if answer.is_empty() {
+    if text.is_empty() {
         return LinearChoice::Select(0);
     }
-    if answer == "q" {
+    if text == "q" {
         return LinearChoice::Cancel;
     }
-    answer
-        .parse::<usize>()
+    if text.starts_with('0') || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return LinearChoice::Retry;
+    }
+    text.parse::<usize>()
         .ok()
         .filter(|number| (1..=session_count).contains(number))
         .map(|number| LinearChoice::Select(number - 1))
@@ -550,7 +565,12 @@ async fn write_all(
             write = terminal.write_once(&bytes[written..]) => WriteEvent::Write(write),
         };
         match event {
-            WriteEvent::Signal(InteractiveSignal::Resize) => report.resized = true,
+            WriteEvent::Signal(InteractiveSignal::Resize) => {
+                report.resized = true;
+                if Instant::now() >= deadline {
+                    return Err(PickerError::Output);
+                }
+            }
             WriteEvent::Signal(InteractiveSignal::Stop(signal)) => {
                 report.signal = Some(signal);
                 return Ok(report);
@@ -637,12 +657,9 @@ mod tests {
         assert!(frame.bytes.contains("\\u{1b}"));
         assert!(frame.bytes.len() < 8 * 1024);
 
-        for (rows, columns, expected_lines) in [
-            (34, 112, 11),
-            (24, 80, 11),
-            (20, 44, 11),
-            (5, 12, 4),
-        ] {
+        for (rows, columns, expected_lines) in
+            [(34, 112, 11), (24, 80, 11), (20, 44, 11), (5, 12, 4)]
+        {
             let compact = render_enhanced_frame(
                 &sessions,
                 &picker,
@@ -705,5 +722,17 @@ mod tests {
             parse_linear_event(InputRecordEvent::InvalidUtf8, 2),
             LinearChoice::Retry
         );
+        for invalid in ["0", "3", "01", "+1", " 1 ", "Q"] {
+            assert_eq!(
+                parse_linear_event(
+                    InputRecordEvent::Record {
+                        text: invalid.to_owned(),
+                        terminated_by_lf: true,
+                    },
+                    2,
+                ),
+                LinearChoice::Retry
+            );
+        }
     }
 }
