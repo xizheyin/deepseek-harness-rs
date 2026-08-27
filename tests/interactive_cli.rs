@@ -3016,6 +3016,27 @@ fn bare_resume_picker_is_read_only_until_selection_and_reuses_the_real_resume_pa
     assert_eq!(status.code(), Some(130));
     assert_eq!(std::fs::read(entry.path()).unwrap(), before_cancel);
 
+    let mut blocked = PtyHarness::spawn_picker_color_with_blocked_first_frame(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+    blocked.wait_for_selector_input_mode();
+    blocked.write(b"\r");
+    blocked.resume_reading();
+    blocked.expect(b"Resume a session");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !blocked
+            .snapshot()
+            .windows(b"resumed session".len())
+            .any(|window| window == b"resumed session")
+    );
+    blocked.write(b"\x1b");
+    let (status, _) = blocked.wait_for_exit(Duration::from_secs(5));
+    assert!(status.success());
+    assert_eq!(std::fs::read(entry.path()).unwrap(), before_cancel);
+
     let mut stale_linear = PtyHarness::spawn_picker_linear_with_preloaded_input(
         &server.base_url,
         &workspace.0,

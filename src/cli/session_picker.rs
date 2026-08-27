@@ -18,7 +18,7 @@ use super::{
     approval_selector::ESCAPE_SEQUENCE_WAIT,
     input::{CanonicalRecordParser, InputRecordEvent, MAX_INTERACTIVE_PROMPT_BYTES},
     interactive::{InteractivePresentation, presentation_uses_enhanced},
-    signal::{InteractiveSignal, SignalStreams, UiSignal},
+    signal::{DriverMode, InteractiveSignal, SignalLatch, SignalStreams, UiSignal},
     terminal::{AsyncTerminal, TERMINAL_READ_BYTES, TerminalError, TerminalSize},
 };
 
@@ -254,6 +254,9 @@ async fn pick_enhanced(
             if report.resized {
                 continue;
             }
+            // A key typed before this complete frame became authoritative is
+            // stale. Fresh input begins only after this explicit arm point.
+            terminal.flush_input()?;
 
             loop {
                 let escape_deadline = state
@@ -299,6 +302,21 @@ async fn pick_enhanced(
     if !cleanup_safe {
         return Ok(result);
     }
+    if let PickerOutcome::Signal(primary) = &result {
+        let primary = *primary;
+        let mut latch = SignalLatch::default();
+        latch.observe(DriverMode::Interactive, primary);
+        let cleanup = match render_cleanup(paint.lines) {
+            Ok(cleanup) => cleanup,
+            Err(_) => return Ok(PickerOutcome::Signal(primary)),
+        };
+        if let Ok(report) = write_all(terminal, signals, cleanup.as_bytes()).await {
+            if let Some(signal) = report.signal {
+                latch.observe(DriverMode::Interactive, signal);
+            }
+        }
+        return Ok(PickerOutcome::Signal(latch.observed().unwrap_or(primary)));
+    }
     let cleanup = render_cleanup(paint.lines)?;
     let report = write_all(terminal, signals, cleanup.as_bytes()).await?;
     Ok(report.signal.map(PickerOutcome::Signal).unwrap_or(result))
@@ -321,6 +339,7 @@ async fn pick_linear(
     if let Some(signal) = report.signal {
         return Ok(PickerOutcome::Signal(signal));
     }
+    terminal.flush_input()?;
 
     let mut parser = CanonicalRecordParser::new(MAX_INTERACTIVE_PROMPT_BYTES);
     let mut scratch = [0_u8; TERMINAL_READ_BYTES];
@@ -365,6 +384,7 @@ async fn pick_linear(
                         if let Some(signal) = report.signal {
                             return Ok(PickerOutcome::Signal(signal));
                         }
+                        terminal.flush_input()?;
                     }
                 }
             }
@@ -622,6 +642,16 @@ mod tests {
         assert_eq!(picker.selected(), 0);
         assert_eq!(picker.feed(b"\x1b[A", 3), PickerUpdate::Redraw);
         assert_eq!(picker.selected(), 0);
+
+        let mut paging = PickerState::new().unwrap();
+        assert_eq!(paging.feed(b"\x1b[6~", 20), PickerUpdate::Redraw);
+        assert_eq!(paging.selected(), 8);
+        assert_eq!(paging.feed(b"\t", 20), PickerUpdate::Redraw);
+        assert_eq!(paging.selected(), 9);
+        assert_eq!(paging.feed(b"\x1b[Z", 20), PickerUpdate::Redraw);
+        assert_eq!(paging.selected(), 8);
+        assert_eq!(paging.feed(b"\x1b[5~", 20), PickerUpdate::Redraw);
+        assert_eq!(paging.selected(), 0);
     }
 
     #[test]

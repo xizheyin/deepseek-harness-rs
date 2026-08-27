@@ -2128,6 +2128,55 @@ fn explicit_approval_mode_rejects_each_redirected_output_before_loading_plugins(
     std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn bare_resume_rejects_piped_and_partial_terminals_before_plugins_or_sessions() {
+    let workspace = script_workspace("resume-picker-noninteractive");
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join("missing-session-root");
+    let missing_config = workspace.join("must-not-be-read.json");
+    let missing_config_text = missing_config.to_str().unwrap();
+    let expected = "dsh: CLI_USAGE: bare --resume is available only in interactive terminal mode\n";
+
+    let mut piped = Command::new(env!("CARGO_BIN_EXE_dsh"));
+    piped
+        .args(["--resume", "--plugin-config", missing_config_text])
+        .env_clear()
+        .env("DEEPSEEK_API_KEY", "resume-picker-secret")
+        .env("DSH_SESSION_ROOT", &root)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let piped = OwnedScriptChild::new(piped.spawn().expect("piped picker should spawn"))
+        .wait_with_output(Duration::from_secs(5));
+    assert_eq!(piped.status.code(), Some(2));
+    assert_eq!(stdout(&piped), "");
+    assert_eq!(stderr(&piped), expected);
+    assert!(!stderr(&piped).contains("resume-picker-secret"));
+
+    let arguments = ["--resume", "--plugin-config", missing_config_text];
+    let (stdout_redirected, terminal_stderr) =
+        run_with_pty_and_one_redirected_output(&arguments, RedirectedTerminalStream::Stdout);
+    assert_eq!(stdout_redirected.status.code(), Some(2));
+    assert_eq!(stdout(&stdout_redirected), "");
+    assert_eq!(
+        String::from_utf8_lossy(&terminal_stderr).replace("\r\n", "\n"),
+        expected
+    );
+
+    let (stderr_redirected, terminal_stdout) =
+        run_with_pty_and_one_redirected_output(&arguments, RedirectedTerminalStream::Stderr);
+    assert_eq!(stderr_redirected.status.code(), Some(2));
+    assert_eq!(stderr(&stderr_redirected), expected);
+    assert!(terminal_stdout.is_empty());
+    assert!(!missing_config.exists());
+    assert!(!root.exists());
+
+    std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
+}
+
 #[test]
 fn unknown_arguments_fail_and_are_reported() {
     let output = run(&["--unknown", "value"]);

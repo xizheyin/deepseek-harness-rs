@@ -135,6 +135,7 @@ struct PtyLaunch {
     extra_args: Vec<std::ffi::OsString>,
     extra_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     preloaded_input: Vec<u8>,
+    blocked_output_at_start: bool,
     initial_rows: u16,
     initial_columns: u16,
 }
@@ -148,6 +149,7 @@ impl PtyLaunch {
             extra_args: Vec::new(),
             extra_environment: Vec::new(),
             preloaded_input: Vec::new(),
+            blocked_output_at_start: false,
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -162,6 +164,7 @@ impl PtyLaunch {
             extra_args: vec!["--plugin-config".into(), config.as_os_str().to_owned()],
             extra_environment: Vec::new(),
             preloaded_input: Vec::new(),
+            blocked_output_at_start: false,
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -181,6 +184,7 @@ impl PtyLaunch {
             ],
             extra_environment: Vec::new(),
             preloaded_input: Vec::new(),
+            blocked_output_at_start: false,
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -195,6 +199,7 @@ impl PtyLaunch {
             extra_args: Vec::new(),
             extra_environment: Vec::new(),
             preloaded_input: Vec::new(),
+            blocked_output_at_start: false,
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -209,6 +214,7 @@ impl PtyLaunch {
             extra_args: vec!["--plugin-config".into(), config.as_os_str().to_owned()],
             extra_environment: Vec::new(),
             preloaded_input: Vec::new(),
+            blocked_output_at_start: false,
             initial_rows: 24,
             initial_columns: 120,
         }
@@ -350,6 +356,25 @@ impl PtyHarness {
         let mut launch = PtyLaunch::cargo(true);
         launch.extra_args.push("--resume".into());
         launch.preloaded_input = input.to_vec();
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            launch,
+        )
+    }
+
+    pub fn spawn_picker_color_with_blocked_first_frame(
+        base_url: &str,
+        workspace: &Path,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        let mut launch = PtyLaunch::cargo(true);
+        launch.extra_args.push("--resume".into());
+        launch.blocked_output_at_start = true;
         Self::spawn_with_transcript_mode(
             base_url,
             workspace,
@@ -681,6 +706,7 @@ impl PtyHarness {
             extra_args,
             extra_environment,
             preloaded_input,
+            blocked_output_at_start,
             initial_rows,
             initial_columns,
         } = launch;
@@ -773,6 +799,27 @@ impl PtyHarness {
                 .expect("preloaded PTY input should write");
             input.flush().expect("preloaded PTY input should flush");
         }
+        if blocked_output_at_start {
+            let original_flags =
+                rustix::fs::fcntl_getfl(&slave).expect("PTY slave flags should be readable");
+            rustix::fs::fcntl_setfl(&slave, original_flags | rustix::fs::OFlags::NONBLOCK)
+                .expect("PTY slave should become nonblocking for output prefill");
+            let block = [b' '; 8 * 1024];
+            loop {
+                match rustix::io::write(&slave, &block) {
+                    Ok(_) => {}
+                    Err(error)
+                        if error == rustix::io::Errno::AGAIN
+                            || error == rustix::io::Errno::WOULDBLOCK =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("PTY output prefill should be bounded: {error}"),
+                }
+            }
+            rustix::fs::fcntl_setfl(&slave, original_flags)
+                .expect("PTY slave flags should restore before child spawn");
+        }
         let reader_fd = rustix::io::dup(&master).expect("PTY master should duplicate");
         let transcript = Arc::new((
             Mutex::new(TranscriptState {
@@ -781,7 +828,13 @@ impl PtyHarness {
             }),
             Condvar::new(),
         ));
-        let reader_control = Arc::new((Mutex::new(ReaderControlState::default()), Condvar::new()));
+        let reader_control = Arc::new((
+            Mutex::new(ReaderControlState {
+                paused: blocked_output_at_start,
+                ..ReaderControlState::default()
+            }),
+            Condvar::new(),
+        ));
         let reader_state = Arc::clone(&transcript);
         let reader_commands = Arc::clone(&reader_control);
         let reader = thread::spawn(move || {
@@ -982,6 +1035,10 @@ impl PtyHarness {
             && !state
                 .input_modes
                 .contains(rustix::termios::InputModes::IXOFF)
+    }
+
+    pub fn wait_for_selector_input_mode(&self) {
+        wait_for_selector_mode(self.master.as_ref().expect("PTY master should exist"));
     }
 
     pub fn expect(&mut self, marker: &[u8]) {
