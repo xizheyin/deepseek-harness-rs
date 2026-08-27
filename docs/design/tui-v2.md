@@ -775,13 +775,45 @@ commits, the existing 100 ms quiet period, input flush, decoder epoch reset,
 and default-Reject selector arm exactly as before. Approval never automatically
 returns to the old detail view.
 
-`dsh --resume` without an ID may later open a bounded picker after the Session
-root and workspace policy are validated. The first picker may show only facts
-already present in the bounded session listing: a safe workspace basename,
-creation time, and shortened ID. A last-message summary or last-active time
-would require a separately bounded read-only journal scan and is not inferred
-from header metadata. No history is opened, mutated, or resumed merely by
-moving selection.
+`dsh --resume` without an ID opens a bounded picker after the Session root and
+the requested/current workspace capability are validated. The existing
+`dsh --resume <SESSION_ID>` form remains exact and unchanged. Bare `--resume`
+is interactive-only: `--prompt`, piped stdin, or a partial terminal fails before
+credentials, Provider construction, or Session mutation. `--resume=` remains
+an invalid empty value rather than an alias for the picker.
+
+The picker calls the existing header-only `SessionStore::list` with the retained
+workspace identity. It therefore inherits the 128 canonical-session and 256
+directory-entry bounds, newest-first order, no-follow checks, and corrupt-root
+failure behavior. The first picker shows only facts already present in that
+bounded listing: a control-safe workspace basename, creation time, and
+shortened ID. A last-message summary or last-active time would require a
+separately bounded read-only journal scan and is not inferred from header
+metadata. No history is opened, locked, repaired, mutated, or resumed merely by
+listing or moving selection. Enter hands the exact selected `SessionId` to the
+existing prepare/warn/commit resume lifecycle; only that lifecycle may open the
+history.
+
+The color-capable picker uses the primary screen and a temporary cbreak owner,
+not the alternate screen. It keeps at most eight visible rows, retains
+selection identity across resize, starts on the newest Session, and supports
+Up/Down, Tab/BackTab, PageUp/PageDown, Home/End, Enter, Esc, and EOF. Movement
+clamps at the ends. Navigation and Enter received in the same terminal read may
+move but cannot confirm; a fresh Enter is required. Paste, printable text,
+unknown sequences, and stale decoder epochs cannot select or resume anything.
+The plain/linear path emits no escape sequence: it prints a bounded numbered
+snapshot and accepts one canonical number, an empty record for the newest
+Session, or `q` to cancel. An empty list reports that no resumable Session exists
+for the workspace and exits without constructing a Provider or creating a new
+Session.
+
+Every picker output transaction has the existing five-second progress deadline.
+Resize redraws from the same header snapshot. Ctrl+C cancels with the stable
+interactive interrupt exit, Ctrl+Z restores canonical terminal state before
+suspension and rebuilds the picker after resume, and HUP/QUIT/TERM restore the
+terminal before their stable exits. Esc/EOF/`q` are ordinary user cancellation
+and exit successfully. Terminal or output failure never falls through to the
+selected Session.
 
 ## Commands and suggestions
 
@@ -1288,6 +1320,13 @@ remain in force.
 | invalid UTF-8 key bytes | visible local input error; draft and Session unchanged |
 | incomplete/unknown CSI | dismiss command and file menus at the current Composer revision with draft unchanged; cancel approval or insert visible text elsewhere as specified; never Allow |
 | command prefix has no match | fixed local empty-state row; draft remains submittable as an ordinary prompt |
+| bare `--resume` without a complete terminal | stable usage/terminal failure before Provider construction or Session mutation |
+| Session picker list is empty | bounded local message, successful exit, and no new Session |
+| Session picker header scan fails | stable storage failure; no candidate history is opened |
+| Session picker navigation and Enter share one read | move only; require a fresh Enter to resume |
+| invalid/pasted picker input | ignore or show a fixed local notice; never select, submit, or open history |
+| resize during Session picker | redraw the same bounded header snapshot and preserve selected identity |
+| signal during Session picker | restore canonical termios before cancel, suspend, or stable signal exit |
 | resize/partial write while command palette is open | preserve draft and selected command identity through the existing screen transaction; no command action |
 | approval arrives while command palette is open | suppress palette, commit approval takeover, and retain default Reject; draft remains unchanged |
 | file suggestion scan is pending | fixed loading row; draft stays editable; no implicit submit or file read |
@@ -1481,6 +1520,15 @@ remain in force.
     suspend/resume retention, new-process resume reset, startup flag behavior,
     and linear zero-ESC/zero-ticker output. Cleanup proves there is no background
     timer or post-exit frame.
+13. Session-picker reducer/render tests cover newest-first identity, the
+    inherited 128-entry listing bound, 112/80/44/12-column layouts, eight-row
+    windows, clamp/page/home/end movement, same-read Enter fencing, invalid
+    input, empty state, resize retention, and control-safe basename rendering.
+    Parser/help tests distinguish bare, exact, empty-attached, duplicate, and
+    script/partial-terminal forms. Real PTY journeys cover selection into the
+    existing resume path, Esc/EOF/Ctrl+C cancellation, suspend/resume, zero-ESC
+    linear selection, terminal restoration, and proof that moving selection
+    does not modify any journal.
 
 ## Implementation checkpoints
 
