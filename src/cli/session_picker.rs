@@ -206,17 +206,30 @@ pub(super) async fn pick(
             b"No resumable sessions for this workspace.\n",
         )
         .await?;
-        return Ok(report
+        let outcome = report
             .signal
             .map(PickerOutcome::Signal)
-            .unwrap_or(PickerOutcome::Cancelled));
+            .unwrap_or(PickerOutcome::Cancelled);
+        return Ok(finalize_signal(outcome, signals).await);
     }
 
-    if presentation_uses_enhanced(presentation, terminal.size()) {
+    let outcome = if presentation_uses_enhanced(presentation, terminal.size()) {
         pick_enhanced(terminal, signals, sessions).await
     } else {
         pick_linear(terminal, signals, sessions).await
-    }
+    }?;
+    Ok(finalize_signal(outcome, signals).await)
+}
+
+async fn finalize_signal(outcome: PickerOutcome, signals: &mut SignalStreams) -> PickerOutcome {
+    let PickerOutcome::Signal(primary) = outcome else {
+        return outcome;
+    };
+    let mut latch = SignalLatch::default();
+    latch.observe(DriverMode::Interactive, primary);
+    tokio::task::yield_now().await;
+    signals.drain_ready(DriverMode::Interactive, &mut latch);
+    PickerOutcome::Signal(latch.observed().unwrap_or(primary))
 }
 
 async fn pick_enhanced(
