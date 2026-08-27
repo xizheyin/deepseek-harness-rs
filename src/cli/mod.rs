@@ -17,6 +17,7 @@ mod script;
 mod script_driver;
 mod script_io;
 mod session_list;
+mod session_picker;
 mod session_resume;
 mod shutdown;
 mod signal;

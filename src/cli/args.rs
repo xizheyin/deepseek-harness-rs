@@ -30,6 +30,12 @@ pub(super) enum ApprovalMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ResumeTarget {
+    Picker,
+    Exact(SessionId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ParseAction {
     Help,
     Version,
@@ -49,7 +55,7 @@ pub(super) struct CliOptions {
     pub(super) model: Option<String>,
     pub(super) workspace: Option<String>,
     pub(super) plugin_config: Option<String>,
-    pub(super) resume: Option<SessionId>,
+    pub(super) resume: Option<ResumeTarget>,
     pub(super) no_color: bool,
     pub(super) reduced_motion: bool,
     pub(super) tui: TuiMode,
@@ -87,6 +93,8 @@ pub(super) enum ParseError {
     ValueTooLarge { option: &'static str },
     #[error("--resume requires one canonical lower-case session UUID v4")]
     InvalidSessionId,
+    #[error("bare --resume is available only in interactive terminal mode")]
+    ResumePickerRequiresInteractive,
     #[error("--tui accepts only auto, enhanced, or linear")]
     InvalidTuiMode,
     #[error("--approval-mode accepts only ask or auto-edit")]
@@ -151,6 +159,23 @@ pub(super) fn parse_args_os(
             index += 1;
             continue;
         }
+        if argument == "--resume" {
+            mark_once(&mut resume_seen, "--resume")?;
+            match arguments.get(index + 1) {
+                Some(value) if !value.starts_with('-') => {
+                    if value.len() > MAX_SESSION_ID_BYTES {
+                        return Err(ParseError::ValueTooLarge { option: "--resume" });
+                    }
+                    options.resume = Some(ResumeTarget::Exact(parse_session_id(value)?));
+                    index += 2;
+                }
+                _ => {
+                    options.resume = Some(ResumeTarget::Picker);
+                    index += 1;
+                }
+            }
+            continue;
+        }
 
         let long_value = [
             ("--prompt", "--prompt"),
@@ -190,7 +215,6 @@ pub(super) fn parse_args_os(
             "--model" | "-m" => Some("--model"),
             "--workspace" | "-w" => Some("--workspace"),
             "--plugin-config" => Some("--plugin-config"),
-            "--resume" => Some("--resume"),
             "--tui" => Some("--tui"),
             "--approval-mode" => Some("--approval-mode"),
             _ => None,
@@ -306,7 +330,7 @@ fn set_value(
         "--model" => options.model = Some(value.to_owned()),
         "--workspace" => options.workspace = Some(value.to_owned()),
         "--plugin-config" => options.plugin_config = Some(value.to_owned()),
-        "--resume" => options.resume = Some(parse_session_id(value)?),
+        "--resume" => options.resume = Some(ResumeTarget::Exact(parse_session_id(value)?)),
         "--tui" => {
             options.tui = match value {
                 "auto" => TuiMode::Auto,
@@ -352,7 +376,7 @@ mod tests {
     use super::{
         ApprovalMode, MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_MODEL_BYTES,
         MAX_PLUGIN_CONFIG_BYTES, MAX_PROMPT_BYTES, MAX_SESSION_ID_BYTES, MAX_WORKSPACE_BYTES,
-        ParseAction, ParseError, TuiMode, admit_args_os, parse_args_os,
+        ParseAction, ParseError, ResumeTarget, TuiMode, admit_args_os, parse_args_os,
     };
 
     fn os(values: &[&str]) -> Vec<OsString> {
@@ -476,7 +500,6 @@ mod tests {
             "--model",
             "--workspace",
             "--plugin-config",
-            "--resume",
             "--tui",
             "--approval-mode",
             "-p",
@@ -711,10 +734,10 @@ mod tests {
         let ParseAction::Run(options) = action else {
             panic!("expected run options");
         };
-        assert_eq!(
-            options.resume.as_ref().map(|id| id.as_str()),
-            Some(canonical)
-        );
+        assert!(matches!(
+            options.resume.as_ref(),
+            Some(ResumeTarget::Exact(id)) if id.as_str() == canonical
+        ));
         assert_eq!(options.prompt.as_deref(), Some("continue"));
         assert_eq!(options.model.as_deref(), Some("deepseek-chat"));
 
@@ -732,6 +755,29 @@ mod tests {
         ] {
             assert!(parse_args_os(os(&["--resume", invalid])).is_err());
         }
+    }
+
+    #[test]
+    fn bare_resume_selects_the_picker_without_stealing_the_next_option() {
+        for values in [
+            &["--resume"][..],
+            &["--resume", "--tui", "enhanced"][..],
+            &["--resume", "--workspace=/tmp/work"][..],
+        ] {
+            let ParseAction::Run(options) = parse_args_os(os(values)).unwrap() else {
+                panic!("expected run options");
+            };
+            assert_eq!(options.resume, Some(ResumeTarget::Picker));
+        }
+
+        assert!(matches!(
+            parse_args_os(os(&["--resume="])),
+            Err(ParseError::EmptyValue { option: "--resume" })
+        ));
+        assert!(matches!(
+            parse_args_os(os(&["--resume", "--resume"])),
+            Err(ParseError::DuplicateOption { option: "--resume" })
+        ));
     }
 
     #[test]

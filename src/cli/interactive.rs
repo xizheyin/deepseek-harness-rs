@@ -269,7 +269,7 @@ pub(super) async fn run(
     }
 }
 
-fn presentation_uses_enhanced(
+pub(super) fn presentation_uses_enhanced(
     presentation: InteractivePresentation,
     size: Option<TerminalSize>,
 ) -> bool {

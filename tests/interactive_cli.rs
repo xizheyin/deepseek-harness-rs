@@ -2937,6 +2937,143 @@ fn interactive_resume_reuses_the_stored_context_and_reaches_a_new_prompt() {
 }
 
 #[test]
+fn bare_resume_picker_is_read_only_until_selection_and_reuses_the_real_resume_path() {
+    let server = SequenceSseServer::start(vec![
+        text_sse("picker seed answer"),
+        text_sse("linear picker answer"),
+        text_sse("enhanced picker answer"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let seeded = Command::new(env!("CARGO_BIN_EXE_dsh"))
+        .args([
+            "--prompt",
+            "seed the picker session",
+            "--model",
+            "deepseek-chat",
+            "--workspace",
+            workspace.0.to_str().unwrap(),
+            "--no-color",
+        ])
+        .env_clear()
+        .env("DEEPSEEK_BASE_URL", &server.base_url)
+        .env("DEEPSEEK_API_KEY", "test-key-for-loopback-only")
+        .env("DSH_SESSION_ROOT", session_root.path())
+        .env("HOME", &workspace.0)
+        .env("PATH", "/usr/bin:/bin")
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("picker seed should run");
+    assert!(seeded.status.success());
+
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .expect("one picker session should exist")
+        .unwrap();
+    let session_id = entry
+        .file_name()
+        .into_string()
+        .unwrap()
+        .strip_suffix(".jsonl")
+        .unwrap()
+        .to_owned();
+    let before_cancel = std::fs::read(entry.path()).unwrap();
+
+    let mut cancelled =
+        PtyHarness::spawn_picker_color_cargo(&server.base_url, &workspace.0, session_root.clone());
+    cancelled.expect(b"Resume a session");
+    cancelled.signal(Signal::TSTP);
+    cancelled.wait_until_stopped();
+    assert_eq!(
+        cancelled.terminal_state(),
+        cancelled.initial_terminal_state()
+    );
+    let resumed_picker = cancelled.checkpoint();
+    cancelled.signal(Signal::CONT);
+    cancelled.expect_after(resumed_picker, b"Resume a session");
+    let resized_picker = cancelled.checkpoint();
+    cancelled.resize(12, 44);
+    cancelled.expect_after(resized_picker, b"Resume a session");
+    let redraw = cancelled.checkpoint();
+    cancelled.write(b"\x1b[B");
+    cancelled.expect_after(redraw, b"Resume a session");
+    cancelled.write(b"\x1b");
+    let (status, _) = cancelled.wait_for_exit(Duration::from_secs(5));
+    assert!(status.success());
+    assert_eq!(std::fs::read(entry.path()).unwrap(), before_cancel);
+
+    let mut interrupted =
+        PtyHarness::spawn_picker_color_cargo(&server.base_url, &workspace.0, session_root.clone());
+    interrupted.expect(b"Resume a session");
+    interrupted.signal(Signal::INT);
+    let (status, _) = interrupted.wait_for_exit(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(std::fs::read(entry.path()).unwrap(), before_cancel);
+
+    let mut linear =
+        PtyHarness::spawn_picker_linear_cargo(&server.base_url, &workspace.0, session_root.clone());
+    linear.expect(b"Resume a session:");
+    assert!(!linear.snapshot().contains(&b'\x1b'));
+    linear.write(b"\r");
+    linear.expect(format!("resumed session {session_id}").as_bytes());
+    linear.expect(b"dsh > ");
+    linear.write(b"continue through linear picker\r");
+    linear.expect(b"assistant | linear picker answer");
+    linear.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = linear.exit_cleanly();
+    assert!(status.success());
+    assert!(!transcript.contains(&b'\x1b'));
+
+    let mut enhanced =
+        PtyHarness::spawn_picker_color_cargo(&server.base_url, &workspace.0, session_root);
+    enhanced.expect(b"Resume a session");
+    enhanced.write(b"\r");
+    enhanced.expect(format!("resumed session {session_id}").as_bytes());
+    enhanced.expect("❯".as_bytes());
+    enhanced.write(b"continue through enhanced picker\r");
+    enhanced.expect(b"enhanced picker answer");
+    enhanced.expect(b"Turn complete");
+    let (status, _) = enhanced.exit_cleanly();
+    assert!(status.success());
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(last_user_content(&requests[0]), "seed the picker session");
+    assert_eq!(
+        last_user_content(&requests[1]),
+        "continue through linear picker"
+    );
+    assert_eq!(
+        last_user_content(&requests[2]),
+        "continue through enhanced picker"
+    );
+}
+
+#[test]
+fn bare_resume_picker_empty_state_exits_without_creating_a_session_or_calling_provider() {
+    let server = SequenceSseServer::start(Vec::new());
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    assert!(!session_root.path().exists());
+
+    let mut picker =
+        PtyHarness::spawn_picker_color_cargo(&server.base_url, &workspace.0, session_root.clone());
+    picker.expect(b"No resumable sessions for this workspace.");
+    let (status, transcript) = picker.wait_for_exit(Duration::from_secs(5));
+
+    assert!(status.success());
+    assert!(!session_root.path().exists());
+    assert!(
+        !transcript
+            .windows(b"dsh | interactive".len())
+            .any(|window| { window == b"dsh | interactive" })
+    );
+    assert!(server.finish().is_empty());
+}
+
+#[test]
 fn enhanced_theme_and_motion_are_process_local_and_resume_starts_from_defaults() {
     let server = SequenceSseServer::start(vec![text_sse("theme persistence seed")]);
     let workspace = TestWorkspace::new();

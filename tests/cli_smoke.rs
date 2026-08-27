@@ -624,7 +624,7 @@ fn help_describes_only_available_options() {
         assert!(help.contains("--workspace"));
         assert!(help.contains("--approval-mode <MODE>"));
         assert!(help.contains("ask (default) or auto-edit"));
-        assert!(help.contains("--resume <SESSION_ID>"));
+        assert!(help.contains("--resume [SESSION_ID]"));
         assert!(help.contains("resume: stored model"));
         assert!(help.contains("resume: optional identity check"));
         assert!(help.contains("--help"));
@@ -1084,6 +1084,24 @@ fn invalid_or_missing_resume_stops_before_root_creation_credentials_or_network()
     assert_eq!(stdout(&invalid), "");
     assert!(stderr(&invalid).starts_with("dsh: CLI_USAGE:"));
 
+    let mut bare = Command::new(env!("CARGO_BIN_EXE_dsh"));
+    bare.args(["--resume", "--prompt", "must not run"])
+        .env_clear()
+        .env("DEEPSEEK_BASE_URL", &base_url)
+        .env("DEEPSEEK_API_KEY", "resume-sentinel-secret")
+        .env("DSH_SESSION_ROOT", &root)
+        .env("PATH", "/usr/bin:/bin")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let bare = OwnedScriptChild::new(bare.spawn().expect("bare script resume should spawn"))
+        .wait_with_output(Duration::from_secs(5));
+    assert_eq!(bare.status.code(), Some(2));
+    assert_eq!(stdout(&bare), "");
+    assert_eq!(
+        stderr(&bare),
+        "dsh: CLI_USAGE: bare --resume is available only in interactive terminal mode\n"
+    );
+
     let mut missing = resume_script_command(
         &base_url,
         &root,
@@ -1103,6 +1121,7 @@ fn invalid_or_missing_resume_stops_before_root_creation_credentials_or_network()
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
     ));
     assert!(!stderr(&invalid).contains("resume-sentinel-secret"));
+    assert!(!stderr(&bare).contains("resume-sentinel-secret"));
     assert!(!stderr(&missing).contains("resume-sentinel-secret"));
     std::fs::remove_dir_all(parent).unwrap();
 }

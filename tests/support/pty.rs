@@ -317,6 +317,42 @@ impl PtyHarness {
         )
     }
 
+    pub fn spawn_picker_color_cargo(
+        base_url: &str,
+        workspace: &Path,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        let mut launch = PtyLaunch::cargo(true);
+        launch.extra_args.push("--resume".into());
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            launch,
+        )
+    }
+
+    pub fn spawn_picker_linear_cargo(
+        base_url: &str,
+        workspace: &Path,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        let mut launch = PtyLaunch::cargo(false);
+        launch.extra_args.push("--resume".into());
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            launch,
+        )
+    }
+
     pub fn spawn_color_with_tui_mode(base_url: &str, workspace: &Path, mode: &str) -> Self {
         let mut launch = PtyLaunch::cargo(true);
         launch.enhanced = matches!(mode, "auto" | "enhanced");

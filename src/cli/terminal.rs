@@ -179,6 +179,12 @@ impl AsyncTerminal {
     }
 
     pub(super) fn enter_approval_mode(&self) -> Result<ApprovalTerminalMode<'_>, TerminalError> {
+        self.enter_selector_mode()
+    }
+
+    /// Temporarily enter the same directional, signal-preserving mode used by
+    /// startup selectors. The returned guard restores the exact prior termios.
+    pub(super) fn enter_selector_mode(&self) -> Result<ApprovalTerminalMode<'_>, TerminalError> {
         self.revalidate()?;
         let original = tcgetattr(self.input.get_ref()).map_err(|_| TerminalError::Unsupported)?;
         let selector = selector_termios(&original);

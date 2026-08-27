@@ -11,13 +11,17 @@ use tokio_util::sync::CancellationToken;
 use crate::{session::SessionStore, tools::PluginConfig, workspace_authority::WorkspaceAuthority};
 
 use super::{
-    args::{CliOptions, ListSessionsOptions, ParseAction, ParseError, TuiMode, parse_args_os},
+    args::{
+        CliOptions, ListSessionsOptions, ParseAction, ParseError, ResumeTarget, TuiMode,
+        parse_args_os,
+    },
     assembly::{AgentAssembly, AssemblyError, assemble_session, prepare_new_session},
     interactive::{self, InteractiveError},
     render::VisibleRenderer,
     script_driver::{self, ScriptDriverError},
     script_io::{ScriptInputError, read_piped_prompt_or_exit},
     session_list::write_session_list,
+    session_picker::{PickerError, PickerOutcome},
     session_resume::{ResumeError, WarningTarget},
     shutdown,
     signal::{DriverMode, SignalLatch, SignalStreams, UiSignal, self_suspend},
@@ -29,7 +33,7 @@ const HELP: &str = concat!(
     "dsh - terminal coding agent for DeepSeek\n",
     "\n",
     "Usage: dsh [OPTIONS]\n",
-    "       dsh --resume <SESSION_ID> [OPTIONS]\n",
+    "       dsh --resume [SESSION_ID] [OPTIONS]\n",
     "       dsh --list-sessions [-w <PATH>] [--no-color]\n",
     "\n",
     "Options:\n",
@@ -42,7 +46,7 @@ const HELP: &str = concat!(
     "      --reduced-motion         Disable periodic enhanced-UI animation\n",
     "      --no-color               Disable color and force the linear terminal UI\n",
     "      --list-sessions          List persisted session headers\n",
-    "      --resume <SESSION_ID>    Resume one persisted session\n",
+    "      --resume [SESSION_ID]    Pick or resume one persisted session\n",
     "  -h, --help                   Print help\n",
     "  -V, --version                Print version\n",
 );
@@ -115,6 +119,14 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
     let stdin_is_terminal = io::stdin().is_terminal();
     let stdout_is_terminal = io::stdout().is_terminal();
     let stderr_is_terminal = io::stderr().is_terminal();
+    let resume_picker = matches!(resume, Some(ResumeTarget::Picker));
+    if resume_picker
+        && (prompt.is_some() || !stdin_is_terminal || !stdout_is_terminal || !stderr_is_terminal)
+    {
+        return Err(EntryError::usage(
+            ParseError::ResumePickerRequiresInteractive,
+        ));
+    }
     if approval_mode_explicit
         && (prompt.is_some() || !stdin_is_terminal || !stdout_is_terminal || !stderr_is_terminal)
     {
@@ -166,62 +178,121 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
     let mode = surface.mode();
     let interactive = matches!(surface, LaunchSurface::Interactive(_));
 
-    let prepared = match resume {
-        Some(id) => {
+    let resume_plan = match resume {
+        Some(ResumeTarget::Exact(id)) => Some((
+            SessionStore::open_default().map_err(EntryError::storage)?,
+            id,
+            workspace.as_deref().map(PathBuf::from),
+        )),
+        Some(ResumeTarget::Picker) => {
             let store = SessionStore::open_default().map_err(EntryError::storage)?;
+            let picker_workspace = resolve_workspace(workspace.clone())?;
+            let authority =
+                WorkspaceAuthority::open(&picker_workspace).map_err(|_| EntryError::workspace())?;
+            let sessions = store
+                .list(Some(authority.identity()))
+                .map_err(EntryError::storage)?;
+            let LaunchSurface::Interactive(terminal) = &surface else {
+                return Err(EntryError::usage(
+                    ParseError::ResumePickerRequiresInteractive,
+                ));
+            };
             loop {
-                let target = match &surface {
-                    LaunchSurface::Script(_) => WarningTarget::Script,
-                    LaunchSurface::Interactive(terminal) => WarningTarget::Interactive(terminal),
-                };
-                match runtime.block_on(super::session_resume::resume(
-                    &store,
-                    id.clone(),
-                    workspace.as_deref().map(PathBuf::from),
-                    target,
+                match runtime.block_on(super::session_picker::pick(
+                    terminal,
                     &mut signals,
+                    &sessions,
+                    presentation,
                 )) {
-                    Ok(ready) => break ready.assembly,
-                    Err(ResumeError::Storage(error)) => {
-                        return Err(EntryError::storage(error));
+                    Ok(PickerOutcome::Selected(id)) => {
+                        break Some((store, id, Some(authority.canonical_path().to_path_buf())));
                     }
-                    Err(ResumeError::Terminal(error)) => {
+                    Ok(PickerOutcome::Cancelled) => return Ok(0),
+                    Ok(PickerOutcome::Signal(UiSignal::Suspend)) => {
+                        match runtime
+                            .block_on(interactive::suspend_and_resume(terminal, &mut signals))
+                        {
+                            Ok(None) => continue,
+                            Ok(Some(signal)) => {
+                                return Ok(exit_after_startup_signal(
+                                    signal,
+                                    DriverMode::Interactive,
+                                    &mut signals,
+                                ));
+                            }
+                            Err(error) => return Err(EntryError::terminal(error)),
+                        }
+                    }
+                    Ok(PickerOutcome::Signal(signal)) => {
+                        return Ok(exit_after_startup_signal(
+                            signal,
+                            DriverMode::Interactive,
+                            &mut signals,
+                        ));
+                    }
+                    Err(PickerError::Terminal(error)) => {
                         return Err(EntryError::terminal(error));
                     }
-                    Err(ResumeError::Output) => return Err(EntryError::failed_output()),
-                    Err(ResumeError::Signal(signal)) => match resume_signal_action(mode, signal) {
-                        ResumeSignalAction::RetryAfterInterrupt => {
-                            let LaunchSurface::Interactive(terminal) = &surface else {
-                                return Err(EntryError::agent());
-                            };
-                            terminal.flush_input().map_err(EntryError::terminal)?;
-                            continue;
-                        }
-                        ResumeSignalAction::SuspendThenRetry => {
-                            let LaunchSurface::Interactive(terminal) = &surface else {
-                                return Err(EntryError::agent());
-                            };
-                            match runtime
-                                .block_on(interactive::suspend_and_resume(terminal, &mut signals))
-                            {
-                                Ok(None) => continue,
-                                Ok(Some(signal)) => {
-                                    return Ok(exit_after_startup_signal(
-                                        signal,
-                                        DriverMode::Interactive,
-                                        &mut signals,
-                                    ));
-                                }
-                                Err(error) => return Err(EntryError::terminal(error)),
-                            }
-                        }
-                        ResumeSignalAction::Exit => {
-                            return Ok(exit_after_startup_signal(signal, mode, &mut signals));
-                        }
-                    },
+                    Err(PickerError::Output) => return Err(EntryError::failed_output()),
                 }
             }
         }
+        None => None,
+    };
+
+    let prepared = match resume_plan {
+        Some((store, id, asserted_workspace)) => loop {
+            let target = match &surface {
+                LaunchSurface::Script(_) => WarningTarget::Script,
+                LaunchSurface::Interactive(terminal) => WarningTarget::Interactive(terminal),
+            };
+            match runtime.block_on(super::session_resume::resume(
+                &store,
+                id.clone(),
+                asserted_workspace.clone(),
+                target,
+                &mut signals,
+            )) {
+                Ok(ready) => break ready.assembly,
+                Err(ResumeError::Storage(error)) => {
+                    return Err(EntryError::storage(error));
+                }
+                Err(ResumeError::Terminal(error)) => {
+                    return Err(EntryError::terminal(error));
+                }
+                Err(ResumeError::Output) => return Err(EntryError::failed_output()),
+                Err(ResumeError::Signal(signal)) => match resume_signal_action(mode, signal) {
+                    ResumeSignalAction::RetryAfterInterrupt => {
+                        let LaunchSurface::Interactive(terminal) = &surface else {
+                            return Err(EntryError::agent());
+                        };
+                        terminal.flush_input().map_err(EntryError::terminal)?;
+                        continue;
+                    }
+                    ResumeSignalAction::SuspendThenRetry => {
+                        let LaunchSurface::Interactive(terminal) = &surface else {
+                            return Err(EntryError::agent());
+                        };
+                        match runtime
+                            .block_on(interactive::suspend_and_resume(terminal, &mut signals))
+                        {
+                            Ok(None) => continue,
+                            Ok(Some(signal)) => {
+                                return Ok(exit_after_startup_signal(
+                                    signal,
+                                    DriverMode::Interactive,
+                                    &mut signals,
+                                ));
+                            }
+                            Err(error) => return Err(EntryError::terminal(error)),
+                        }
+                    }
+                    ResumeSignalAction::Exit => {
+                        return Ok(exit_after_startup_signal(signal, mode, &mut signals));
+                    }
+                },
+            }
+        },
         None => {
             let workspace = resolve_workspace(workspace)?;
             prepare_new_session(&workspace).map_err(EntryError::assembly)?
@@ -611,7 +682,7 @@ mod tests {
         assert_eq!(run([OsString::from("--help")]).unwrap(), 0);
         assert!(HELP.contains("--prompt"));
         assert!(HELP.contains("--list-sessions"));
-        assert!(HELP.contains("--resume <SESSION_ID>"));
+        assert!(HELP.contains("--resume [SESSION_ID]"));
         assert!(HELP.contains("--plugin-config <PATH>"));
         assert!(HELP.contains("--tui <MODE>"));
         assert!(HELP.contains("--approval-mode <MODE>"));
