@@ -1290,8 +1290,12 @@ bounded workspace-file suggestions from the retained workspace capability and
 inserts only literal `@relative/path ` text. It performs no implicit read,
 attachment, Session event, or Provider request; approval and detail views own
 input priority, and linear mode performs no scan. Reduced Motion is now a
-process-local presentation path with no Session/Provider fact; the Session
-picker remains unfinished. The command palette, table subset, and six
+process-local presentation path with no Session/Provider fact. Bare interactive
+`--resume` now uses the already researched header-only persistence listing seam:
+it filters by retained workspace identity, shows only header facts, and opens no
+history until a fresh Enter confirms one ID. The directional primary-screen and
+zero-ESC numbered presentations are Rust-owned because the fixed upstream has
+no built-in human TUI. The command palette, table subset, and six
 closed semantic themes are Rust terminal-only presentation choices: they change
 no Session or upstream Agent fact, accept no user-defined escape strings, and
 themes reset to Adaptive in a new process. Installed Phase 11 evidence,

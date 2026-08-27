@@ -122,7 +122,9 @@ default-Reject selector, while lookalike generic text remains opaque. File
 suggestions insert only bounded relative-path literals from the retained
 workspace capability and never read content. Reduced Motion now provides a
 process-local flag/command, bounded turn-owned clock, and preemptible screen
-transaction without changing Session or Provider facts. The Session picker, screenshots, real-emulator
+transaction without changing Session or Provider facts. Bare interactive
+`--resume` now provides a bounded header-only Session picker and hands only the
+confirmed ID to the existing recovery lifecycle. Screenshots, real-emulator
 evidence, and final same-candidate platform validation still prevent Phase 11
 completion.
 

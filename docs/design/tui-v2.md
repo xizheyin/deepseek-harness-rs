@@ -9,9 +9,10 @@ tool, one joined turn receipt, bounded assistant-only presentation, and a
 generator-provenanced semantic preview for real `apply_patch` approvals. A
 bounded current-turn Inspect and one-summary Review now use the same primary-
 screen ledger. Six closed semantic palettes, bounded source-preserving tables,
-a closed eight-command completion palette, bounded file suggestions, and Reduced
-Motion now use the same transactional screen ownership. The Session picker,
-installed screenshots, and the real-emulator matrix remain incomplete.
+a closed eight-command completion palette, bounded file suggestions, Reduced
+Motion, and a bounded header-only Session picker now use the same transactional
+screen ownership. Installed screenshots and the real-emulator matrix remain
+incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
 interactive presentation and input ownership.
@@ -36,9 +37,9 @@ existing primary-screen Dock. The panel is owned by the same `InlineScreen`
 ledger as the composer, so committed output continues into native scrollback
 above it and no second transcript is retained or replayed. The panel is never
 written into scrollback as a report merely because the user opens it. A later
-Session picker may use an alternate screen only after a separate terminal
-ownership checkpoint proves every partial-write, signal, suspend, resize, and
-Drop path; Phase 11 does not rely on that acceleration. A bounded plain
+Session-picker acceleration may use an alternate screen only after a separate
+terminal ownership checkpoint proves every partial-write, signal, suspend,
+resize, and Drop path; the implemented picker stays on the primary screen. A bounded plain
 renderer remains
 authoritative for `--tui linear`, `--no-color`, `NO_COLOR`, `TERM=dumb`,
 non-TTY output, and screen-reader use. `--tui auto` selects enhanced only for a
@@ -799,7 +800,10 @@ not the alternate screen. It keeps at most eight visible rows, retains
 selection identity across resize, starts on the newest Session, and supports
 Up/Down, Tab/BackTab, PageUp/PageDown, Home/End, Enter, Esc, and EOF. Movement
 clamps at the ends. Navigation and Enter received in the same terminal read may
-move but cannot confirm; a fresh Enter is required. Paste, printable text,
+move but cannot confirm; a fresh Enter is required. Here “fresh” means input
+received only after the corresponding complete picker frame has committed and
+armed: bytes queued before launch or while that frame/redraw was still writing
+are flushed and cannot open history. Paste, printable text,
 unknown sequences, and stale decoder epochs cannot select or resume anything.
 The plain/linear path emits no escape sequence: it prints a bounded numbered
 snapshot and accepts one canonical number, an empty record for the newest
@@ -1555,11 +1559,11 @@ remain in force.
    reasoning moved out of enhanced Focus, exact context estimates, truthful
    compaction chronology, one joined summary Review, and transactional primary-
    screen Inspect/Review panels with local commands and approval takeover.
-8. **Remaining product checkpoint (partial)**: the six closed, transactional
+8. **Remaining product checkpoint (green)**: the six closed, transactional
    semantic themes, bounded source-preserving tables, closed eight-command
-   palette, file suggestions, and Reduced Motion are green. The Session
-   picker remains. Each sub-slice stays independently green and pushed; this line does
-   not claim that the remaining items are implemented.
+   palette, file suggestions, Reduced Motion, and the bounded header-only
+   Session picker are green. Each sub-slice is independently tested and pushed;
+   this line is a product-feature checkpoint, not a Phase 11 completion claim.
 9. **Release checkpoint**: remove the replaced log renderer, installed-binary
    journeys, screenshots, documentation, full clean-target gates, independent
    review, non-force push, dual-platform CI, and a separate completion-status

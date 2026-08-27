@@ -813,12 +813,85 @@ permission, not a sandbox, and not Phase 11 completion. Exact repetition can
 repeat destructive filesystem or network side effects. The Session picker and
 the previously listed terminal/release evidence remain pending.
 
+## Header-only Session picker slice — 2026-08-28
+
+Design commit `49f4173` freezes the bare-resume grammar, header-only authority
+boundary, primary-screen/linear presentation, input arming, signal behavior,
+and failure matrix. Implementation commit `d5897eb` adds the production path;
+`ada0160`, `a6f9e6c`, and `5131dc2` close review findings around stale input,
+partial output, terminal restoration, workspace-identity lifetime, resize
+deadline, canonical linear numbers, and stable signal priority.
+
+Bare interactive `dsh --resume` now validates the complete terminal surface,
+opens the retained workspace capability, and calls the existing bounded
+`SessionStore::list` with that exact device/inode identity. It shows at most
+eight visible newest-first header rows containing only a control-safe workspace
+basename, `createdAt`, and short ID. Moving selection neither opens nor changes
+a journal. A confirmed exact ID alone enters the existing prepare/warn/commit
+resume lifecycle; the original workspace capability remains open until that
+preparation has completed.
+
+Enhanced input is armed only after the corresponding complete frame commits.
+Startup bytes, input arriving while a blocked frame is writing, and same-read
+navigation plus Enter cannot resume a Session. The linear path accepts only an
+empty record, lowercase `q`, or the canonical decimal range `1..=N` and emits
+zero ESC bytes. Esc, Ctrl+C, Ctrl+Z/CONT, Ctrl+D/EOF, resize, empty listing,
+blocked output, and cancellation restore the original terminal and preserve
+the complete Session-root byte snapshot. Piped stdin, `--prompt`, or either
+redirected output stream rejects bare resume before plugin configuration,
+Session-root creation, credentials, or network activity.
+
+Default-enabled evidence includes three picker reducer/render tests, parser and
+help coverage, the expanded CLI admission smoke, and three real PTY tests. The
+PTY journeys seed one and two independent durable Sessions, select a nondefault
+ID across same-read navigation and resize, verify the exact resumed context,
+exercise enhanced and zero-ESC linear selection, inject stale input before
+launch and while the first frame is deterministically blocked, suspend/resume,
+cancel by Esc/Ctrl+C/EOF, compare full journal/root snapshots, and prove the
+Provider request count changes only after a fresh confirmed selection and
+prompt.
+
+The focused commands were:
+
+```console
+cargo test cli::session_picker::tests:: -- --nocapture
+cargo test --test cli_smoke \
+  bare_resume_rejects_piped_and_partial_terminals_before_plugins_or_sessions \
+  -- --nocapture
+cargo test --test interactive_cli bare_resume_picker -- --nocapture
+cargo test --test interactive_cli \
+  session_picker_selects_a_nondefault_session_and_eof_is_read_only \
+  -- --nocapture
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+RUST_TEST_THREADS=4 ./scripts/verify.sh
+git diff --check
+```
+
+The final bounded-concurrency verification passed 777 library tests and 360
+binary/integration/example tests (1,137 total), with zero failed or ignored
+tests; formatting, all-target checks, example builds, Clippy with warnings
+denied, and both whitespace gates were green. Two preceding default-parallel
+runs each exposed a different existing Darwin PTY/plugin-test timing flake; the
+isolated failing test passed immediately on focused rerun, and the independent
+test reviewer also completed a full green verification. No product assertion
+or Session-picker test failed in those attempts.
+
+Three independent read-only reviews examined the selection algorithm, terminal
+transactions and signal priority, authority/security boundary, and test
+oracles. All final reports contain P0/P1 = 0; algorithm and safety also report
+P2 = 0. The test review records one optional P2 evidence debt for a
+picker-specific simultaneous-signal PTY, while the shared latch and existing
+signal-priority PTYs cover the implemented rule. This closes the remaining
+Phase 11 product-feature checkpoint, but not Phase 11 itself: installed
+same-candidate screenshots, real-emulator evidence, final acceptance, and
+macOS/Ubuntu validation are still pending.
+
 ## Evidence pending
 
 - remaining product files and default-enabled Phase 11 acceptance tests;
 - exact-limit and one-over tests for remaining card/receipt/Dock fields and
-  the Review activity/text and reasoning omission-step caps, plus later picker
-  resources;
+  the Review activity/text and reasoning omission-step caps;
 - installed candidate SHA and release acceptance output;
 - screenshot sizes and digests generated from real installed PTY bytes;
 - macOS and Ubuntu job URLs for the same candidate;

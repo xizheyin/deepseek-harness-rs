@@ -236,10 +236,14 @@ dsh --list-sessions --workspace .
 从列表复制一个会话 ID 后继续：
 
 ```console
+dsh --resume
 dsh --resume session-550e8400-e29b-41d4-a716-446655440000
 dsh --resume session-550e8400-e29b-41d4-a716-446655440000 \
   --prompt '继续上一项工作'
 ```
+
+交互终端中的裸 `dsh --resume` 会打开当前工作区的有界会话选择器；它只读取会话头，
+选中之前不会打开、修复或修改历史。纯文本终端会显示编号列表，不输出 ANSI 控制码。
 
 不传 `--workspace` 时，`dsh` 使用日志中已经验证过的原工作区；不传 `--model` 时，
 沿用最近记录的模型。损坏或不支持的历史会在新的模型请求或工具副作用前失败，结果
@@ -278,7 +282,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | 当前版本 | `0.1.0-alpha.0`，预发布 |
 | Phase 0–9 | 已完成：v0.1 源码安装候选、终端体验、离线验收和双平台矩阵均已通过 |
 | Phase 10 | 已完成：受限的本地子进程工具插件、两个真实示例和故障矩阵已通过双平台验收 |
-| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据、assistant 有限 Markdown/代码/围栏 diff/简单表格、真实补丁语义预览、只读 Inspect/Review、6 套内置语义主题、7 条本地命令面板和有界工作区文件建议已有生产路径；Reduced Motion、Session picker、截图与双平台验收未完成 |
+| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据、assistant 有限 Markdown/代码/围栏 diff/简单表格、真实补丁语义预览、只读 Inspect/Review、6 套内置语义主题、8 条本地命令面板、有界工作区文件建议、Reduced Motion 和 Session picker 已有生产路径；截图、真实终端与双平台验收未完成 |
 
 Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHub-hosted
 `macos-14` arm64 和 `ubuntu-24.04` x86_64 的完整仓库检查、v0.1 安装版旅程与插件
@@ -293,7 +297,7 @@ Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHu
 - `apply_patch` 一次只处理一个文件，Shell 只运行有界的前台命令，且获批 Shell 不是沙箱；
 - 会话恢复面向正常退出后的继续工作，不是数据库级持久化或备份；
 - 自动压缩每个 turn 最多尝试一次摘要，不保证摘要无损或事实完美；
-- Phase 11 的 Inspect 只保留当前回合，Review 只保留最近一个可信关联的摘要；它们不重建恢复点之前的历史，也不提供完整 canonical diff 或完整命令记录；主题选择只属于当前进程，恢复会话时重新使用 Adaptive，窄 Dock 可能截断主题列表；表格只支持上面列出的有限子集，命令面板也只包含上面列出的 7 条本地命令；文件建议只插入扫描时得到的相对路径字面量，不读取内容，也不保证文件在选择时仍存在；Reduced Motion、Session picker、最终安装版验收和截图仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
+- Phase 11 的 Inspect 只保留当前回合，Review 只保留最近一个可信关联的摘要；它们不重建恢复点之前的历史，也不提供完整 canonical diff 或完整命令记录；主题选择只属于当前进程，恢复会话时重新使用 Adaptive，窄 Dock 可能截断主题列表；表格只支持上面列出的有限子集，命令面板也只包含上面列出的 8 条本地命令；文件建议只插入扫描时得到的相对路径字面量，不读取内容，也不保证文件在选择时仍存在；Session picker 只显示会话头中的工作区名、创建时间和短 ID，不扫描最后一条消息；最终安装版验收和截图仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
 - Auto 暂不在 tmux、GNU Screen、Zellij、未知终端或初始小于 44×12 的窗口启用增强界面；已进入增强模式后可缩到 12×5，继续缩小会安全恢复并退出；
 - primary-screen resize/reflow/copy 目前只有确定性终端模型和 PTY 字节证据，真实 iTerm/Terminal/VS Code 矩阵仍待完成；
 - Windows 以及未列入发布矩阵的 Unix 平台尚未支持。
