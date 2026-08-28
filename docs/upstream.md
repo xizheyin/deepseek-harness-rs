@@ -2434,3 +2434,29 @@ the end of a turn, the next turn, or orderly shutdown. Custom loopback endpoints
 retain the immediate fallback but skip the extra provider call. Local listing
 scans only closed, shared-locked, current-format journals up to 16 MiB and omits
 unavailable title metadata without weakening resume validation.
+
+## Phase 46 title-enriched prior-Session search — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The focused sources inspected were:
+
+- `packages/session-query/session-query/src/index.ts` and title observation
+  tests in `tests/session-query.spec.ts` for live-preferred/persisted latest-title
+  folding, ordered batch observation, cancellation and isolated failures;
+- `packages/session-query/tool-session-query/src/workspace-access.ts` for
+  workspace authorization before title exposure and the `untitled` fallback;
+- `packages/session-query/tool-session-query/src/{operations,presentation}.ts`
+  and title tests for enriching base matches without changing ranking or
+  dropping results when title lookup fails.
+
+Official search presentation renders `Session <id> — <title>` and preserves the
+base result when a title is missing or its backend fails. Its broader tool also
+enriches event operations and lineage traces and can attach a sanitized
+per-title unavailable code.
+
+Fresh `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`; the relevant title-enrichment
+contract is unchanged. Rust Phase 46 narrows delivery to the primary
+`session_search` result and reuses the same strict closed-journal metadata scan
+introduced in Phase 45. It renders both an absent title and a title-only read
+failure as `untitled`, while preserving the match, ordering and existing bounds.

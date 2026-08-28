@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–45 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–46 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -53,6 +53,7 @@ for behavior that users can run today.
 | 43 | Background-job completion notices and bounded idle wakeups | `complete` | [`validation/phase-43.md`](validation/phase-43.md) |
 | 44 | Consuming incremental output for background Shell jobs | `complete` | [`validation/phase-44.md`](validation/phase-44.md) |
 | 45 | Durable first-prompt Session titles | `complete` | [`validation/phase-45.md`](validation/phase-45.md) |
+| 46 | Title-enriched prior-Session search | `complete` | [`validation/phase-46.md`](validation/phase-46.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -70,6 +71,15 @@ outside the model-visible conversation. Normally closed local journals expose
 their latest title in `--list-sessions` and the interactive resume picker.
 Phase 45 does not add manual rename, title refresh, fork inheritance, a title
 index/database or background work that survives process shutdown.
+
+## Phase 46 boundary (2026-08-29)
+
+Phase 46 threads the already validated, latest durable Session title into each
+`session_search` result. A missing, busy, malformed or over-limit title degrades
+to `untitled`; it never removes the base match or weakens the existing strict
+same-workspace journal scan. Event read/search and lineage trace title headers,
+live sessions, title-specific indexing and unavailable error codes remain
+future work.
 
 ## Phase 8 revised boundary (2026-08-18)
 

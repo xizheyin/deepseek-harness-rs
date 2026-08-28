@@ -1171,7 +1171,12 @@ pub(crate) fn render_result(outcome: &SessionSearchOutcome) -> String {
         for (index, hit) in outcome.hits().iter().enumerate() {
             lines.extend([
                 String::new(),
-                format!("{}. Session {}", index + 1, hit.session_id()),
+                format!(
+                    "{}. Session {} — {}",
+                    index + 1,
+                    hit.session_id(),
+                    hit.title().unwrap_or("untitled")
+                ),
                 format!("   Created: {}", format_time(hit.created_at())),
                 "   Availability: persisted".to_owned(),
                 format!(
@@ -1460,6 +1465,25 @@ mod tests {
         assert!(rendered.starts_with(fixture["canonical"]["trust"].as_str().unwrap()));
         assert!(rendered.contains(fixture["canonical"]["heading"].as_str().unwrap()));
         assert!(rendered.contains(fixture["canonical"]["cap"].as_str().unwrap()));
+        assert!(rendered.contains("— untitled"));
+
+        let titled = SessionSearchOutcome::for_test(
+            vec![
+                SessionSearchHit::for_test(
+                    SessionId::new("session-650e8400-e29b-41d4-a716-446655440000"),
+                    0,
+                    4,
+                    "user/message",
+                    1_000,
+                    "matched text",
+                    1,
+                )
+                .with_title_for_test("Parsed title"),
+            ],
+            false,
+            false,
+        );
+        assert!(render_result(&titled).contains("— Parsed title"));
     }
 
     #[test]

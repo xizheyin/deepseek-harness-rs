@@ -2038,6 +2038,7 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
     );
     assert!(after_session_search.contains("Alpha Beta release marker"));
     assert!(after_session_search.contains(&historical_id));
+    assert!(after_session_search.contains("— Remember the Alpha Beta release"));
     let after_event_search = request_json(&second_requests[2]).to_string();
     assert!(after_event_search.contains("Event search results (1):"));
     assert!(after_event_search.contains(&format!("seq {historical_seq} | user/message | current")));

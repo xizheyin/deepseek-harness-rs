@@ -81,6 +81,7 @@ impl SessionSearchQuery {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionSearchHit {
     session_id: SessionId,
+    title: Option<String>,
     created_at: i64,
     event_seq: u64,
     event_type: String,
@@ -103,6 +104,7 @@ impl SessionSearchHit {
     ) -> Self {
         Self {
             session_id,
+            title: None,
             created_at,
             event_seq,
             event_type: event_type.into(),
@@ -114,6 +116,16 @@ impl SessionSearchHit {
 
     pub(crate) fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_title_for_test(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     pub(crate) fn created_at(&self) -> i64 {
@@ -968,6 +980,7 @@ fn search_filtered_sync(
                     provisional.push((
                         SessionSearchHit {
                             session_id: metadata.id().clone(),
+                            title: metadata.title().map(str::to_owned),
                             created_at: metadata.created_at().get(),
                             event_seq: best.event_seq,
                             event_type: best.event_type,
@@ -1821,8 +1834,8 @@ mod tests {
     use crate::{
         model::{CallId, Message, MessageSource},
         session::{
-            EventSeq, NewEvent, Session, SessionHeader, SurfaceIntent, TodoItem, TurnEndReason,
-            TurnId, UnixMillis,
+            EventSeq, NewEvent, Session, SessionHeader, SessionTitleEvent, SessionTitleSource,
+            SurfaceIntent, TodoItem, TurnEndReason, TurnId, UnixMillis,
         },
         workspace_authority::WorkspaceAuthority,
     };
@@ -2472,7 +2485,13 @@ mod tests {
         let visible = SessionId::new("session-550e8400-e29b-41d4-a716-446655440000");
         let busy = SessionId::new("session-650e8400-e29b-41d4-a716-446655440000");
         let hidden = SessionId::new("session-750e8400-e29b-41d4-a716-446655440000");
-        write_history(&root, &authority, &visible, "alpha shared marker");
+        write_titled_history(
+            &root,
+            &authority,
+            &visible,
+            "alpha shared marker",
+            "Shared parser work",
+        );
         let busy_path = write_history(&root, &authority, &busy, "alpha busy marker");
         write_history(&root, &other, &hidden, "alpha hidden marker");
 
@@ -2507,6 +2526,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [visible.clone()]
         );
+        assert_eq!(outcome.hits()[0].title(), Some("Shared parser work"));
 
         let caller_runtime = SessionSearchRuntime::new(
             SessionStore::open_existing(&root).unwrap(),
@@ -2707,6 +2727,26 @@ mod tests {
         id: &SessionId,
         text: &str,
     ) -> std::path::PathBuf {
+        write_history_with_title(root, authority, id, text, None)
+    }
+
+    fn write_titled_history(
+        root: &std::path::Path,
+        authority: &WorkspaceAuthority,
+        id: &SessionId,
+        text: &str,
+        title: &str,
+    ) -> std::path::PathBuf {
+        write_history_with_title(root, authority, id, text, Some(title))
+    }
+
+    fn write_history_with_title(
+        root: &std::path::Path,
+        authority: &WorkspaceAuthority,
+        id: &SessionId,
+        text: &str,
+        title: Option<&str>,
+    ) -> std::path::PathBuf {
         let header = SessionHeader::new_durable(
             id.clone(),
             UnixMillis::new(1_000).unwrap(),
@@ -2731,6 +2771,17 @@ mod tests {
                 SurfaceIntent::append(),
             ))
             .unwrap();
+        if let Some(title) = title {
+            let title = SessionTitleEvent::new(
+                title,
+                vec![EventSeq::new(1).unwrap()],
+                SessionTitleSource::Fallback,
+            )
+            .unwrap();
+            session
+                .append(NewEvent::log(EventKind::session_title(title)))
+                .unwrap();
+        }
         session
             .append(NewEvent::log(EventKind::turn_end(
                 turn,

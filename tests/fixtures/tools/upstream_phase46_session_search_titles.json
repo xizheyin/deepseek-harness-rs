@@ -1,0 +1,15 @@
+{
+  "upstreamCommit": "47f943859bef60e4160492346772ded9b24f765a",
+  "sources": [
+    "packages/session-query/session-query/src/index.ts",
+    "packages/session-query/session-query/tests/session-query.spec.ts",
+    "packages/session-query/tool-session-query/src/workspace-access.ts",
+    "packages/session-query/tool-session-query/src/presentation.ts",
+    "packages/session-query/tool-session-query/src/operations.ts"
+  ],
+  "searchResult": {
+    "titleEnriched": "1. Session session-example — Parsed title",
+    "missingTitle": "1. Session session-example — untitled",
+    "titleFailureKeepsBaseResult": true
+  }
+}
