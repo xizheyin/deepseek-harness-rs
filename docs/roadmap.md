@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–46 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–47 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -54,6 +54,7 @@ for behavior that users can run today.
 | 44 | Consuming incremental output for background Shell jobs | `complete` | [`validation/phase-44.md`](validation/phase-44.md) |
 | 45 | Durable first-prompt Session titles | `complete` | [`validation/phase-45.md`](validation/phase-45.md) |
 | 46 | Title-enriched prior-Session search | `complete` | [`validation/phase-46.md`](validation/phase-46.md) |
+| 47 | Title-enriched historical event and lineage tools | `complete` | [`validation/phase-47.md`](validation/phase-47.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -80,6 +81,15 @@ to `untitled`; it never removes the base match or weakens the existing strict
 same-workspace journal scan. Event read/search and lineage trace title headers,
 live sessions, title-specific indexing and unavailable error codes remain
 future work.
+
+## Phase 47 boundary (2026-08-29)
+
+Phase 47 applies the same already-authorized title metadata to
+`session_event_search`, `session_event_read`, `session_trace` and
+`session_event_trace`. It changes only human/model-facing headings and lineage
+rows; event payloads, filters, ranking, ancestry, surface classification and
+workspace authorization remain unchanged. Missing title metadata renders as
+`untitled` and never removes the underlying result.
 
 ## Phase 8 revised boundary (2026-08-18)
 

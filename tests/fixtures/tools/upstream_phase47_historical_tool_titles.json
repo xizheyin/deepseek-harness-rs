@@ -1,0 +1,17 @@
+{
+  "upstreamCommit": "47f943859bef60e4160492346772ded9b24f765a",
+  "sources": [
+    "packages/session-query/tool-session-query/src/workspace-access.ts",
+    "packages/session-query/tool-session-query/src/operations.ts",
+    "packages/session-query/tool-session-query/src/presentation.ts",
+    "packages/session-query/tool-session-query/tests/tool-session-query.spec.ts"
+  ],
+  "titleEnrichedOperations": [
+    "session_event_search",
+    "session_event_read",
+    "session_trace",
+    "session_event_trace"
+  ],
+  "missingTitle": "untitled",
+  "titleFailureKeepsBaseResult": true
+}

@@ -1209,7 +1209,7 @@ pub(crate) fn render_event_search(outcome: &SessionEventSearchOutcome) -> String
     let mut lines = vec![
         EVENT_TRUST_NOTICE.to_owned(),
         String::new(),
-        format!("Session {}", outcome.session_id()),
+        session_heading(outcome.session_id(), outcome.title()),
     ];
     if outcome.hits().is_empty() {
         lines.extend([String::new(), "No prior event matches found.".to_owned()]);
@@ -1249,7 +1249,7 @@ pub(crate) fn render_event_read(
     let mut lines = vec![
         EVENT_TRUST_NOTICE.to_owned(),
         String::new(),
-        format!("Session {}", outcome.session_id()),
+        session_heading(outcome.session_id(), outcome.title()),
         format!("Target event seq {}:", outcome.target().seq()),
         "```json".to_owned(),
         target,
@@ -1274,7 +1274,7 @@ pub(crate) fn render_session_trace(outcome: &SessionTraceOutcome) -> String {
     let mut lines = vec![
         EVENT_TRUST_NOTICE.to_owned(),
         String::new(),
-        format!("Session {}", outcome.target().session_id()),
+        session_heading(outcome.target().session_id(), outcome.target().title()),
         format!("Created: {}", format_time(outcome.target().created_at())),
         "Availability: persisted".to_owned(),
         String::new(),
@@ -1285,8 +1285,9 @@ pub(crate) fn render_session_trace(outcome: &SessionTraceOutcome) -> String {
     }
     for record in outcome.ancestors() {
         lines.push(format!(
-            "- {} | {} | persisted",
+            "- {} — {} | {} | persisted",
             record.session_id(),
+            record.title().unwrap_or("untitled"),
             format_time(record.created_at())
         ));
     }
@@ -1312,9 +1313,10 @@ pub(crate) fn render_session_trace(outcome: &SessionTraceOutcome) -> String {
 fn render_descendants(lines: &mut Vec<String>, nodes: &[SessionLineageNode], depth: usize) {
     for node in nodes {
         lines.push(format!(
-            "{}- {} | {} | persisted",
+            "{}- {} — {} | {} | persisted",
             "  ".repeat(depth),
             node.record().session_id(),
+            node.record().title().unwrap_or("untitled"),
             format_time(node.record().created_at())
         ));
         render_descendants(lines, node.descendants(), depth.saturating_add(1));
@@ -1333,7 +1335,7 @@ pub(crate) fn render_event_trace(outcome: &SessionEventTraceOutcome) -> String {
     [
         EVENT_TRUST_NOTICE.to_owned(),
         String::new(),
-        format!("Session {}", outcome.session_id()),
+        session_heading(outcome.session_id(), outcome.title()),
         format!(
             "Target: seq {} | {} | {} | {}",
             outcome.target_seq(),
@@ -1365,6 +1367,10 @@ pub(crate) fn render_event_trace(outcome: &SessionEventTraceOutcome) -> String {
         ),
     ]
     .join("\n")
+}
+
+fn session_heading(session_id: &crate::session::SessionId, title: Option<&str>) -> String {
+    format!("Session {session_id} — {}", title.unwrap_or("untitled"))
 }
 
 fn format_seq_list(values: &[u64]) -> String {
@@ -1679,8 +1685,10 @@ mod tests {
                 12,
             )],
             true,
-        );
+        )
+        .with_title_for_test("Event search title");
         let rendered = render_event_search(&outcome);
+        assert!(rendered.contains("— Event search title"));
         assert!(rendered.contains(fixture["eventSearch"]["heading"].as_str().unwrap()));
         assert!(rendered.contains("seq 2 | user/message | current"));
         assert!(rendered.contains("Result cap reached"));
@@ -1696,8 +1704,10 @@ mod tests {
                 1_001,
                 Some("neighbor text".to_owned()),
             )],
-        );
+        )
+        .with_title_for_test("Event read title");
         let rendered = render_event_read(&read).unwrap();
+        assert!(rendered.contains("— Event read title"));
         assert!(rendered.contains("```json"));
         assert!(rendered.contains("\"text\": \"target full text\""));
         assert!(rendered.contains("Before:"));
@@ -1744,12 +1754,14 @@ mod tests {
             assert!(parse_event_trace(&value).is_err());
         }
 
-        let target = SessionLineageRecord::for_test(SessionId::new(id), 1_000, None);
+        let target = SessionLineageRecord::for_test(SessionId::new(id), 1_000, None)
+            .with_title_for_test("Trace target");
         let child = SessionLineageRecord::for_test(
             SessionId::new("session-650e8400-e29b-41d4-a716-446655440000"),
             2_000,
             Some(SessionId::new(id)),
-        );
+        )
+        .with_title_for_test("Trace child");
         let trace = SessionTraceOutcome::for_test(
             target,
             Vec::new(),
@@ -1758,6 +1770,8 @@ mod tests {
             true,
         );
         let rendered = render_session_trace(&trace);
+        assert!(rendered.contains("— Trace target"));
+        assert!(rendered.contains("— Trace child"));
         assert!(rendered.contains(fixture["sessionTrace"]["ancestorHeading"].as_str().unwrap()));
         assert!(rendered.contains(fixture["sessionTrace"]["root"].as_str().unwrap()));
         assert!(
@@ -1780,8 +1794,10 @@ mod tests {
             vec![1],
             vec![1, 0],
             vec![8],
-        );
+        )
+        .with_title_for_test("Event trace title");
         let rendered = render_event_trace(&event);
+        assert!(rendered.contains("— Event trace title"));
         assert!(rendered.contains("Target: seq 2 | user/message | shadowed"));
         assert!(rendered.contains("Replaced by: 4"));
         assert!(rendered.contains("Replacement chain: 4, 8"));

@@ -2460,3 +2460,25 @@ contract is unchanged. Rust Phase 46 narrows delivery to the primary
 `session_search` result and reuses the same strict closed-journal metadata scan
 introduced in Phase 45. It renders both an absent title and a title-only read
 failure as `untitled`, while preserving the match, ordering and existing bounds.
+
+## Phase 47 titles across historical event and lineage tools — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The focused evidence is the same
+authorized title-observation boundary from
+`packages/session-query/tool-session-query/src/workspace-access.ts`, combined
+with the event-search/read, Session-trace and event-trace paths in
+`src/{operations,presentation}.ts` and their title tests.
+
+Official presentation prefixes each targeted event operation with
+`Session <id> — <title>`. Session lineage presentation also adds the title to
+the target, every visible ancestor and every visible descendant. Title lookup
+is authorized before rendering, and an isolated title failure keeps the base
+operation result.
+
+Fresh `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`; these headings and failure semantics
+are unchanged. Rust Phase 47 copies title metadata from the same strict journal
+candidate already used for each event or lineage fact, so it adds no scan or
+authority. As in Phase 46, unavailable and absent titles both render
+`untitled` rather than carrying an official sanitized per-item error code.

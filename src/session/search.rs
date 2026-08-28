@@ -368,6 +368,7 @@ impl SessionEventSearchHit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionEventSearchOutcome {
     session_id: SessionId,
+    title: Option<String>,
     hits: Vec<SessionEventSearchHit>,
     result_capped: bool,
 }
@@ -381,6 +382,7 @@ impl SessionEventSearchOutcome {
     ) -> Self {
         Self {
             session_id,
+            title: None,
             hits,
             result_capped,
         }
@@ -388,6 +390,16 @@ impl SessionEventSearchOutcome {
 
     pub(crate) fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_title_for_test(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     pub(crate) fn hits(&self) -> &[SessionEventSearchHit] {
@@ -443,6 +455,7 @@ impl SessionEventSummary {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionEventReadOutcome {
     session_id: SessionId,
+    title: Option<String>,
     target: SessionEvent,
     before: Vec<SessionEventSummary>,
     after: Vec<SessionEventSummary>,
@@ -451,6 +464,7 @@ pub(crate) struct SessionEventReadOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionLineageRecord {
     session_id: SessionId,
+    title: Option<String>,
     created_at: i64,
     parent_session: Option<SessionId>,
 }
@@ -464,6 +478,7 @@ impl SessionLineageRecord {
     ) -> Self {
         Self {
             session_id,
+            title: None,
             created_at,
             parent_session,
         }
@@ -471,6 +486,16 @@ impl SessionLineageRecord {
 
     pub(crate) fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_title_for_test(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     pub(crate) fn created_at(&self) -> i64 {
@@ -556,6 +581,7 @@ impl SessionTraceOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionEventTraceOutcome {
     session_id: SessionId,
+    title: Option<String>,
     target_seq: u64,
     target_type: String,
     target_time: i64,
@@ -584,6 +610,7 @@ impl SessionEventTraceOutcome {
     ) -> Self {
         Self {
             session_id,
+            title: None,
             target_seq,
             target_type: target_type.into(),
             target_time,
@@ -598,6 +625,16 @@ impl SessionEventTraceOutcome {
 
     pub(crate) fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_title_for_test(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     pub(crate) fn target_seq(&self) -> u64 {
@@ -647,6 +684,7 @@ impl SessionEventReadOutcome {
     ) -> Self {
         Self {
             session_id,
+            title: None,
             target,
             before,
             after,
@@ -655,6 +693,16 @@ impl SessionEventReadOutcome {
 
     pub(crate) fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_title_for_test(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     pub(crate) fn target(&self) -> &SessionEvent {
@@ -1108,6 +1156,7 @@ fn event_search_filtered_sync(
     hits.truncate(MAX_SESSION_SEARCH_RESULTS);
     Ok(SessionEventSearchOutcome {
         session_id,
+        title: metadata.title().map(str::to_owned),
         hits,
         result_capped,
     })
@@ -1174,6 +1223,7 @@ fn event_read_sync(
     let target = target.ok_or(SessionSearchError::EventNotFound)?;
     Ok(SessionEventReadOutcome {
         session_id,
+        title: metadata.title().map(str::to_owned),
         target,
         before: preceding,
         after: following,
@@ -1318,6 +1368,7 @@ fn scan_lineage_candidate(
     }
     Ok(Some(SessionLineageRecord {
         session_id: scan.header().id().clone(),
+        title: metadata.title().map(str::to_owned),
         created_at: scan.header().created_at().get(),
         parent_session: scan.header().parent_session().cloned(),
     }))
@@ -1446,6 +1497,7 @@ fn event_trace_sync(
     };
     Ok(SessionEventTraceOutcome {
         session_id,
+        title: metadata.title().map(str::to_owned),
         target_seq: seq,
         target_type,
         target_time,
@@ -2027,6 +2079,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trace.target().session_id(), &target_id);
+        assert_eq!(trace.target().title(), Some("Lineage title"));
         assert_eq!(
             trace
                 .ancestors()
@@ -2094,6 +2147,7 @@ mod tests {
             .trace_event(id.clone(), original, CancellationToken::new())
             .await
             .unwrap();
+        assert_eq!(trace.title(), Some("Event trace title"));
         assert_eq!(trace.target_surface(), SessionEventSurface::Shadowed);
         assert_eq!(trace.replaced_by(), Some(first));
         assert_eq!(trace.replacement_chain(), &[first, final_seq]);
@@ -2396,6 +2450,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(searched.session_id(), &visible);
+        assert_eq!(searched.title(), Some("Navigation title"));
         assert_eq!(searched.hits().len(), 3);
         assert_eq!(searched.hits()[0].surface(), SessionEventSurface::LogOnly);
         assert_eq!(searched.hits()[1].surface(), SessionEventSurface::Current);
@@ -2406,6 +2461,7 @@ mod tests {
             .read_event(visible.clone(), target_seq, 1, 1, CancellationToken::new())
             .await
             .unwrap();
+        assert_eq!(read.title(), Some("Navigation title"));
         assert_eq!(read.target().seq().get(), target_seq);
         assert_eq!(read.before().len(), 1);
         assert_eq!(read.after().len(), 1);
@@ -2841,6 +2897,15 @@ mod tests {
                 }],
             }))
             .unwrap();
+        let title = SessionTitleEvent::new(
+            "Navigation title",
+            vec![original.seq()],
+            SessionTitleSource::Fallback,
+        )
+        .unwrap();
+        session
+            .append(NewEvent::log(EventKind::session_title(title)))
+            .unwrap();
         session
             .append(NewEvent::log(EventKind::turn_end(
                 turn,
@@ -2882,6 +2947,11 @@ mod tests {
                 turn,
                 TurnEndReason::Completed,
             )))
+            .unwrap();
+        let title =
+            SessionTitleEvent::new("Lineage title", Vec::new(), SessionTitleSource::User).unwrap();
+        session
+            .append(NewEvent::log(EventKind::session_title(title)))
             .unwrap();
         write_session(root, &header, &session)
     }
@@ -2942,6 +3012,12 @@ mod tests {
                 turn,
                 TurnEndReason::Completed,
             )))
+            .unwrap();
+        let title =
+            SessionTitleEvent::new("Event trace title", Vec::new(), SessionTitleSource::User)
+                .unwrap();
+        session
+            .append(NewEvent::log(EventKind::session_title(title)))
             .unwrap();
         write_session(root, &header, &session);
         (
