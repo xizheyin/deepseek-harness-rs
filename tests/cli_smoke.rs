@@ -1564,6 +1564,88 @@ fn real_script_entry_reaches_the_agent_and_loopback_provider() {
 }
 
 #[test]
+fn real_script_reminds_the_model_after_three_identical_tool_calls() {
+    let (base_url, server) = spawn_response_server(vec![
+        tool_round_sse(&[(
+            "repeat-read-1",
+            "read",
+            serde_json::json!({"file_path":"repeat.txt"}),
+        )]),
+        tool_round_sse(&[(
+            "repeat-read-2",
+            "read",
+            serde_json::json!({"file_path":"repeat.txt"}),
+        )]),
+        tool_round_sse(&[(
+            "repeat-read-3",
+            "read",
+            serde_json::json!({"file_path":"repeat.txt"}),
+        )]),
+        text_sse("changed approach after reminder"),
+    ]);
+    let workspace = script_workspace("repeat-tool-reminder");
+    std::fs::write(workspace.join("repeat.txt"), "repeat sentinel\n").unwrap();
+    let output = run_script(&base_url, &workspace, "read until you have enough evidence");
+    let requests = server.join().expect("loopback server should join");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "changed approach after reminder\n");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(requests.len(), 4);
+    assert!(!requests[2].contains("repeating the exact same tool call"));
+    assert!(requests[3].contains("repeating the exact same tool call"));
+    assert!(requests[3].contains("repeat sentinel"));
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let journal_path = std::fs::read_dir(&root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let rows = std::fs::read_to_string(journal_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let third_result = rows
+        .iter()
+        .position(|row| {
+            row["type"] == "tool/result"
+                && row["data"]["message"]["content"][0]["toolCallId"] == "repeat-read-3"
+        })
+        .unwrap();
+    let third_step_end = rows
+        .iter()
+        .position(|row| {
+            row["type"] == "step/end" && row["data"]["turn"] == 1 && row["data"]["step"] == 3
+        })
+        .unwrap();
+    let notice = rows
+        .iter()
+        .position(|row| {
+            row["type"] == "user/message"
+                && row["data"]["source"]["plugin"] == "repeat-tool-reminder"
+                && row["data"]["source"]["form"] == "notice"
+                && row["data"]["source"]["summary"] == "read × 3"
+        })
+        .unwrap();
+    assert!(third_result < third_step_end);
+    assert!(third_step_end < notice);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["type"] == "tool/result")
+            .count(),
+        3
+    );
+    assert!(!rows.iter().any(|row| row["type"] == "approval/asked"));
+
+    std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
+}
+
+#[test]
 fn real_script_web_search_uses_the_separate_bounded_provider_and_continues() {
     const SEARCH_BODY: &str = r#"{"content":[{"type":"text","citations":[{"url":"https://example.test/current","cited_text":"current bounded excerpt"}]},{"type":"web_search_tool_result","content":[{"type":"web_search_result","url":"https://example.test/current","title":"Current source","page_age":"2026-08-29"}]}]}"#;
 

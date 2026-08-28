@@ -21,7 +21,7 @@ use deepseek_harness_cli::{
         TurnProposal,
     },
     model::{
-        ContentBlock, ContentBlockKind, ContentBlockType, FinishReason, LlmCallConfig,
+        ContentBlock, ContentBlockKind, ContentBlockType, ContextForm, FinishReason, LlmCallConfig,
         LlmCallConfigAdapterDefaults, LlmFailure, Message, MessageSource, MessageSourceKind,
         ModelError, PositiveFiniteNumber, StreamChunk, TokenUsage, ToolSchema,
     },
@@ -858,6 +858,15 @@ fn user_with_id(id: &str, text: &str) -> Message {
         id,
         vec![ContentBlock::text(text).unwrap()],
         MessageSource::user().unwrap(),
+    )
+    .unwrap()
+}
+
+fn plugin_user_with_id(id: &str, plugin: &str, text: &str) -> Message {
+    Message::user(
+        id,
+        vec![ContentBlock::text(text).unwrap()],
+        MessageSource::plugin(plugin).unwrap(),
     )
     .unwrap()
 }
@@ -1716,6 +1725,345 @@ async fn one_tool_result_becomes_the_next_steps_model_context() {
 }
 
 #[tokio::test]
+async fn repeated_tool_calls_add_the_official_gentle_and_detailed_next_step_notices() {
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/agent/upstream_phase31_repeat_tool_reminder.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        oracle["upstream"]["commit"],
+        "47f943859bef60e4160492346772ded9b24f765a"
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        tool_response_with_id("repeat-1"),
+        tool_response_with_id("repeat-2"),
+        tool_response_with_id("repeat-3"),
+        tool_response_with_id("repeat-4"),
+        tool_response_with_id("repeat-5"),
+        text_response("changed course"),
+    ]));
+    let tools = Arc::new(FakeTools::default());
+    let mut agent = agent("repeat-reminder", provider.clone(), tools.clone(), config());
+
+    let outcome = agent
+        .run_turn(
+            TurnProposal::Enter(vec![user("keep trying")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+    assert_eq!(outcome.steps(), 6);
+    assert_eq!(tools.calls.lock().unwrap().len(), 5);
+    let reminders = agent
+        .session()
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::UserMessage { message } => match message.source().kind() {
+                MessageSourceKind::Plugin {
+                    plugin,
+                    form: Some(ContextForm::Notice),
+                    summary: Some(summary),
+                    ..
+                } if plugin == "repeat-tool-reminder" => Some((
+                    message
+                        .content()
+                        .iter()
+                        .filter_map(|block| match block.kind() {
+                            ContentBlockKind::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                    summary.as_str(),
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reminders.len(), 2);
+    for (actual, expected) in reminders
+        .iter()
+        .zip(oracle["scenario"]["reminders"].as_array().unwrap().iter())
+    {
+        assert_eq!(actual.0, expected["text"].as_str().unwrap());
+        assert_eq!(actual.1, expected["source"]["summary"].as_str().unwrap());
+        assert_eq!(expected["source"]["kind"], "plugin");
+        assert_eq!(expected["source"]["plugin"], "repeat-tool-reminder");
+        assert_eq!(expected["source"]["form"], "notice");
+    }
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 6);
+    assert!(!request_has_repeat_notice(&requests[2]));
+    assert!(request_has_repeat_notice(&requests[3]));
+    assert!(request_has_repeat_notice(&requests[5]));
+
+    let third_result = agent
+        .session()
+        .events()
+        .iter()
+        .position(|event| {
+            matches!(
+                event.kind(),
+                EventKind::ToolResult { message, .. }
+                    if matches!(
+                        message.source().kind(),
+                        MessageSourceKind::Tool { call_id } if call_id.as_str() == "repeat-3"
+                    )
+            )
+        })
+        .unwrap();
+    let third_step_end = agent
+        .session()
+        .events()
+        .iter()
+        .position(|event| {
+            matches!(
+                event.kind(),
+                EventKind::StepEnd { step, .. } if step.get() == 3
+            )
+        })
+        .unwrap();
+    let fourth_step_start = agent
+        .session()
+        .events()
+        .iter()
+        .position(|event| {
+            matches!(
+                event.kind(),
+                EventKind::StepStart { step, .. } if step.get() == 4
+            )
+        })
+        .unwrap();
+    let gentle = agent
+        .session()
+        .events()
+        .iter()
+        .position(|event| {
+            matches!(
+                event.kind(),
+                EventKind::UserMessage { message }
+                    if matches!(
+                        message.source().kind(),
+                        MessageSourceKind::Plugin { plugin, .. }
+                            if plugin == "repeat-tool-reminder"
+                    )
+            )
+        })
+        .unwrap();
+    assert!(third_result < third_step_end);
+    assert!(third_step_end < fourth_step_start);
+    assert!(fourth_step_start < gentle);
+    assert_eq!(
+        oracle["scenario"]["firstReminderOrder"],
+        json!([
+            "tool/result:repeat-3",
+            "step/end:3",
+            "step/start:4",
+            "user/message:calculator × 3"
+        ])
+    );
+    assert!(
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter_map(|event| {
+                let EventKind::ToolResult { message, .. } = event.kind() else {
+                    return None;
+                };
+                let [block] = message.content() else {
+                    return Some(false);
+                };
+                Some(block.tool_result_content().is_some_and(|content| {
+                    content
+                        .iter()
+                        .any(|part| part["type"] == "text" && part["text"] == "tool says 4")
+                }))
+            })
+            .all(|unchanged| unchanged)
+    );
+}
+
+#[tokio::test]
+async fn a_new_direct_human_turn_resets_the_repeated_tool_chain() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        tool_response_with_id("before-reset-1"),
+        tool_response_with_id("before-reset-2"),
+        text_response("first turn done"),
+        tool_response_with_id("after-reset-1"),
+        text_response("second turn done"),
+    ]));
+    let tools = Arc::new(FakeTools::default());
+    let mut agent = agent("repeat-reset", provider, tools, config());
+
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id("first-user", "first task")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id("second-user", "new information")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(!agent.session().events().iter().any(|event| matches!(
+        event.kind(),
+        EventKind::UserMessage { message }
+            if matches!(
+                message.source().kind(),
+                MessageSourceKind::Plugin { plugin, .. }
+                    if plugin == "repeat-tool-reminder"
+            )
+    )));
+}
+
+#[tokio::test]
+async fn autonomous_plugin_continuation_keeps_the_repeated_tool_chain() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        tool_response_with_id("autonomous-1"),
+        tool_response_with_id("autonomous-2"),
+        text_response("round one done"),
+        tool_response_with_id("autonomous-3"),
+        text_response("changed course"),
+    ]));
+    let tools = Arc::new(FakeTools::default());
+    let mut agent = agent("repeat-autonomous", provider.clone(), tools, config());
+
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id("human-start", "start the goal")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![plugin_user_with_id(
+                "goal-round",
+                "goal-round-driver",
+                "continue autonomously",
+            )]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(request_has_repeat_notice(&provider.requests()[4]));
+}
+
+#[tokio::test]
+async fn reconstructed_agent_starts_with_a_fresh_repeated_tool_chain() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        tool_response_with_id("before-rebuild-1"),
+        tool_response_with_id("before-rebuild-2"),
+        text_response("first process done"),
+        tool_response_with_id("after-rebuild-1"),
+        text_response("second process done"),
+    ]));
+    let tools = Arc::new(FakeTools::default());
+    let mut original = agent(
+        "repeat-reconstruction",
+        provider.clone(),
+        tools.clone(),
+        config(),
+    );
+    original
+        .run_turn(
+            TurnProposal::Enter(vec![user_with_id("original-user", "start")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let session = original.shutdown_into_session().await.unwrap();
+
+    let mut reconstructed = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config(),
+    )
+    .unwrap();
+    reconstructed
+        .run_turn(
+            TurnProposal::Enter(vec![plugin_user_with_id(
+                "resumed-goal-round",
+                "goal-round-driver",
+                "continue after reconstruction",
+            )]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !provider
+            .requests()
+            .iter()
+            .any(|request| request_has_repeat_notice(request))
+    );
+}
+
+#[tokio::test]
+async fn repeated_model_facing_tool_errors_still_receive_the_advisory_notice() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        tool_response_with_id("failed-repeat-1"),
+        tool_response_with_id("failed-repeat-2"),
+        tool_response_with_id("failed-repeat-3"),
+        text_response("changed course"),
+    ]));
+    let mut agent = AgentLoop::with_runtime(
+        session("repeat-failed-results"),
+        provider.clone(),
+        Arc::new(ModelErrorTools),
+        Arc::new(FixedRuntime::default()),
+        config(),
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(
+            TurnProposal::Enter(vec![user("try the denied operation")]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+    assert!(request_has_repeat_notice(&provider.requests()[3]));
+    assert_eq!(
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter(|event| matches!(
+                event.kind(),
+                EventKind::ToolResult { error: Some(error), .. } if error.code == "DENIED"
+            ))
+            .count(),
+        3
+    );
+}
+
+fn request_has_repeat_notice(messages: &[Message]) -> bool {
+    messages.iter().any(|message| {
+        matches!(
+            message.source().kind(),
+            MessageSourceKind::Plugin { plugin, .. } if plugin == "repeat-tool-reminder"
+        )
+    })
+}
+
+#[tokio::test]
 async fn parallel_safe_tools_use_a_rolling_cap_and_commit_results_in_model_order() {
     let provider = Arc::new(FakeProvider::new(vec![
         many_tool_response(3),
@@ -1793,6 +2141,7 @@ async fn parallel_safe_tools_use_a_rolling_cap_and_commit_results_in_model_order
         })
         .collect::<Vec<_>>();
     assert_eq!(results, ["call-0", "call-1", "call-2"]);
+    assert!(request_has_repeat_notice(&requests[1]));
 }
 
 #[tokio::test]

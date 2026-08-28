@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–30 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–31 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -38,6 +38,7 @@ for behavior that users can run today.
 | 28 | Bounded DeepSeek-backed `web_search` tool | `complete` | [`validation/phase-28.md`](validation/phase-28.md) |
 | 29 | Current-master multi-query search and public `web_fetch` | `complete` | [`validation/phase-29.md`](validation/phase-29.md) |
 | 30 | Bounded parallel-safe tool scheduling | `complete` | [`validation/phase-30.md`](validation/phase-30.md) |
+| 31 | Advisory repeated-tool-call reminder | `complete` | [`validation/phase-31.md`](validation/phase-31.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -508,6 +509,34 @@ failure quiescence. A real CLI loopback journey asks for two independent Web
 searches; its server withholds both responses until both connections arrive,
 then verifies model and durable result order. No public network, real API,
 remote CI, or unrelated exhaustive check is required.
+
+## Phase 31 repeated-tool reminder boundary (2026-08-29)
+
+Phase 31 adds the fixed upstream's default advisory loop guard. For one live
+Agent, completed model-requested calls are compared by tool name and
+canonicalized JSON arguments. The first identical tracked call has count one;
+exact counts 3, 5, and 8 enqueue respectively one gentle and two detailed
+plugin notices for the next model step. A different tracked call resets the
+chain. A newly accepted direct-human prompt also resets it, while Goal-driven
+automatic continuation does not. The chain is deliberately process memory,
+so constructing or resuming a new Agent starts fresh.
+
+The notice never changes, blocks, delays, retries, approves, or replaces a
+tool result. It is appended as a bounded, source-attributed user-role context
+after the triggering step's results, then reconstructed from ordinary Session
+facts for the next request. Denied and model-facing failed calls count once;
+calls skipped before dispatch, unknown infrastructure outcomes, cancellation
+recovery, and direct registry calls do not. The fixed CLI has no exposed guard
+setting, so Rust ships the official defaults and a 500-character detailed
+argument preview rather than adding another public configuration surface.
+
+Acceptance is local-only: deterministic Agent tests cover default escalation,
+deep key-order canonicalization, resets, different-call reset, failure/denial,
+multiple calls in one step, bounded preview, source and event order, next-model
+replay, resume freshness, and parallel result ordering. One real script CLI
+journey must loop three times and prove the notice reaches the fourth request
+without changing tool results or requiring approval. No public network, real
+API, remote CI, or unrelated exhaustive check is required.
 
 ## Still deferred
 

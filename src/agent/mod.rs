@@ -8,6 +8,7 @@ mod error;
 mod phase6_tests;
 #[cfg(test)]
 mod phase7_tests;
+mod repeat_tool_reminder;
 mod retry;
 mod tool;
 
@@ -77,6 +78,7 @@ use assembler::{AssembledAssistant, without_tool_calls};
 use compaction::{
     CompactionOutcome, CompactionScope, compact_once, pressure_reached, retained_token_target,
 };
+use repeat_tool_reminder::RepeatToolReminder;
 use retry::{RetryDecision, decide, policy_key};
 
 pub const MAX_AGENT_STEPS_PER_TURN: usize = 64;
@@ -797,6 +799,7 @@ pub struct AgentLoop {
     pending_workspace_context: Option<Message>,
     workspace_instructions: Option<WorkspaceInstructionRuntime>,
     pending_workspace_touches: Vec<String>,
+    repeat_tool_reminder: RepeatToolReminder,
     poisoned: bool,
 }
 
@@ -876,6 +879,7 @@ impl AgentLoop {
             pending_workspace_context: None,
             workspace_instructions: None,
             pending_workspace_touches: Vec::new(),
+            repeat_tool_reminder: RepeatToolReminder::default(),
             poisoned: false,
         })
     }
@@ -971,6 +975,7 @@ impl AgentLoop {
         )?;
         let result = {
             let mut reservation = self.session.reservation();
+            let mut pending_repeat_contexts = Vec::new();
             let mut driver = Driver {
                 provider: provider.as_ref(),
                 tools: tools.as_ref(),
@@ -988,6 +993,8 @@ impl AgentLoop {
                 goal_tool_caller: GoalToolCaller::Untrusted,
                 workspace_instructions: self.workspace_instructions.as_ref(),
                 pending_workspace_touches: &mut self.pending_workspace_touches,
+                repeat_tool_reminder: &mut self.repeat_tool_reminder,
+                pending_repeat_contexts: &mut pending_repeat_contexts,
             };
             compact_once(
                 &mut reservation,
@@ -1135,6 +1142,7 @@ impl AgentLoop {
             &mut self.exact_shell_grants,
             self.workspace_instructions.as_ref(),
             &mut self.pending_workspace_touches,
+            &mut self.repeat_tool_reminder,
             proposal,
             cancellation,
         )
@@ -1365,6 +1373,8 @@ struct Driver<'a> {
     goal_tool_caller: GoalToolCaller,
     workspace_instructions: Option<&'a WorkspaceInstructionRuntime>,
     pending_workspace_touches: &'a mut Vec<String>,
+    repeat_tool_reminder: &'a mut RepeatToolReminder,
+    pending_repeat_contexts: &'a mut Vec<Message>,
 }
 
 impl Driver<'_> {
@@ -1411,6 +1421,7 @@ async fn run_turn_inner(
     exact_shell_grants: &mut approval::ExactShellGrantStore,
     workspace_instructions: Option<&WorkspaceInstructionRuntime>,
     pending_workspace_touches: &mut Vec<String>,
+    repeat_tool_reminder: &mut RepeatToolReminder,
     proposal: TurnProposal,
     cancellation: CancellationToken,
 ) -> Result<TurnOutcome, AgentLoopError> {
@@ -1443,6 +1454,7 @@ async fn run_turn_inner(
     let mut turn_end = opening.remove(0);
     reservation.settle_exact_settled(&mut turn_start).await?;
 
+    let mut pending_repeat_contexts = Vec::new();
     let mut driver = Driver {
         provider,
         tools,
@@ -1460,6 +1472,8 @@ async fn run_turn_inner(
         goal_tool_caller,
         workspace_instructions,
         pending_workspace_touches,
+        repeat_tool_reminder,
+        pending_repeat_contexts: &mut pending_repeat_contexts,
     };
 
     let mut reason = if cancellation.is_cancelled() {
@@ -1471,6 +1485,12 @@ async fn run_turn_inner(
             TurnProposal::Reject => TurnEndReason::Blocked,
             TurnProposal::Enter(messages) if messages.is_empty() => TurnEndReason::Completed,
             TurnProposal::Enter(messages) => {
+                if messages
+                    .iter()
+                    .any(|message| matches!(message.source().kind(), MessageSourceKind::User))
+                {
+                    driver.repeat_tool_reminder.reset();
+                }
                 run_entered_turn(
                     &mut reservation,
                     &mut driver,
@@ -1918,6 +1938,7 @@ async fn run_entered_turn(
         }
         match resolution.outcome {
             StepOutcome::Continue => {
+                messages.append(driver.pending_repeat_contexts);
                 if let Some(reason) = refresh_workspace_context(
                     reservation.session(),
                     driver,
@@ -3313,7 +3334,8 @@ async fn commit_tool_round(
                             "Goal change was not committed because the turn timed out",
                         )
                     };
-                    settle_model_error(reservation, plan, turn, step, code, message).await?;
+                    settle_model_error(reservation, driver, plan, turn, step, code, message)
+                        .await?;
                     if cancellation.is_cancelled() {
                         cancelled = true;
                         latched_stop = latch_tool_stop(latched_stop, ToolStop::Cancelled);
@@ -3383,7 +3405,8 @@ async fn commit_tool_round(
                             "Todo update was not committed because the turn timed out",
                         )
                     };
-                    settle_model_error(reservation, plan, turn, step, code, message).await?;
+                    settle_model_error(reservation, driver, plan, turn, step, code, message)
+                        .await?;
                     if cancellation.is_cancelled() {
                         cancelled = true;
                         latched_stop = latch_tool_stop(latched_stop, ToolStop::Cancelled);
@@ -3463,7 +3486,8 @@ async fn commit_tool_round(
                         ));
                     }
                     ToolRun::ModelError { code, message } => {
-                        settle_model_error(reservation, plan, turn, step, code, message).await?;
+                        settle_model_error(reservation, driver, plan, turn, step, code, message)
+                            .await?;
                     }
                     _ => {
                         return Err(AgentLoopError::Invariant(
@@ -3531,7 +3555,8 @@ async fn commit_tool_round(
                         ));
                     }
                     ToolRun::ModelError { code, message } => {
-                        settle_model_error(reservation, plan, turn, step, code, message).await?;
+                        settle_model_error(reservation, driver, plan, turn, step, code, message)
+                            .await?;
                     }
                     _ => {
                         return Err(AgentLoopError::Invariant(
@@ -3545,7 +3570,7 @@ async fn commit_tool_round(
                     cancelled = true;
                     latched_stop = latch_tool_stop(latched_stop, ToolStop::Cancelled);
                 }
-                settle_model_error(reservation, plan, turn, step, code, message).await?;
+                settle_model_error(reservation, driver, plan, turn, step, code, message).await?;
             }
             ToolRun::Infrastructure { stop } => {
                 if reservation.session().is_durable() {
@@ -3650,7 +3675,7 @@ async fn commit_tool_round(
         StepOutcome::Error(error)
     } else if cancelled {
         StepOutcome::Cancelled
-    } else if concludes_turn {
+    } else if concludes_turn && driver.pending_repeat_contexts.is_empty() {
         StepOutcome::Completed
     } else {
         StepOutcome::Continue
@@ -3687,6 +3712,22 @@ fn goal_tool_result(
 
 async fn settle_model_error(
     reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    plan: &mut PlannedTool,
+    turn: TurnId,
+    step: StepId,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), AgentLoopError> {
+    settle_model_error_unobserved(reservation, plan, turn, step, code, message).await?;
+    if !matches!(code, "ABORTED_BEFORE_DISPATCH" | "SESSION_LIMIT") {
+        record_repeat_tool_result(driver, plan)?;
+    }
+    Ok(())
+}
+
+async fn settle_model_error_unobserved(
+    reservation: &mut SessionReservation<'_>,
     plan: &mut PlannedTool,
     turn: TurnId,
     step: StepId,
@@ -3720,7 +3761,7 @@ async fn settle_unknown_tool_outcome(
     turn: TurnId,
     step: StepId,
 ) -> Result<(), AgentLoopError> {
-    settle_model_error(
+    settle_model_error_unobserved(
         reservation,
         plan,
         turn,
@@ -3935,7 +3976,7 @@ async fn run_parallel_tool_group(
         while next_to_start < group.len() {
             let plan = &mut group[next_to_start];
             let _ = commit_tool_call_intent(reservation, plan, turn, step).await?;
-            settle_model_error(
+            settle_model_error_unobserved(
                 reservation,
                 plan,
                 turn,
@@ -4015,6 +4056,7 @@ async fn settle_parallel_tool_run(
         ToolRun::ModelError { code, message } => {
             settle_model_error(
                 reservation,
+                driver,
                 plan,
                 plan_turn(plan, reservation)?,
                 plan_step(plan, reservation)?,
@@ -5272,6 +5314,7 @@ async fn settle_tool_result(
         reservation
             .settle_exact_settled(&mut plan.result_claim)
             .await?;
+        record_repeat_tool_result(driver, plan)?;
         return Ok(false);
     }
     let message = match Message::tool_result(
@@ -5286,6 +5329,7 @@ async fn settle_tool_result(
             reservation
                 .settle_exact_settled(&mut plan.result_claim)
                 .await?;
+            record_repeat_tool_result(driver, plan)?;
             return Ok(false);
         }
     };
@@ -5306,6 +5350,7 @@ async fn settle_tool_result(
             reservation
                 .settle_exact_settled(&mut plan.result_claim)
                 .await?;
+            record_repeat_tool_result(driver, plan)?;
             return Ok(false);
         }
     };
@@ -5329,6 +5374,7 @@ async fn settle_tool_result(
         }
         driver.counters.tool_result_bytes = driver.counters.tool_result_bytes.saturating_add(size);
         retain_workspace_touch(driver, workspace_touch);
+        record_repeat_tool_result(driver, plan)?;
         return Ok(true);
     }
     let inside_limits = size <= driver.config.limits.max_tool_result_bytes
@@ -5341,6 +5387,7 @@ async fn settle_tool_result(
         reservation
             .settle_exact_settled(&mut plan.result_claim)
             .await?;
+        record_repeat_tool_result(driver, plan)?;
         return Ok(false);
     }
     let settlement = reservation
@@ -5351,7 +5398,35 @@ async fn settle_tool_result(
         driver.counters.tool_result_bytes += size;
         retain_workspace_touch(driver, workspace_touch);
     }
+    record_repeat_tool_result(driver, plan)?;
     Ok(preferred)
+}
+
+fn record_repeat_tool_result(
+    driver: &mut Driver<'_>,
+    plan: &PlannedTool,
+) -> Result<(), AgentLoopError> {
+    let Some(notice) = driver
+        .repeat_tool_reminder
+        .observe(plan.call.name.as_str(), plan.call.arguments.as_str())
+        .map_err(|error| AgentLoopError::Serialization(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    if driver.pending_repeat_contexts.len() >= MAX_AGENT_TOOL_CALLS_PER_STEP {
+        return Err(AgentLoopError::Invariant(
+            "repeat-tool reminder context count exceeded the step tool limit",
+        ));
+    }
+    let source = MessageSource::plugin_notice("repeat-tool-reminder", notice.summary())?;
+    let content = ContentBlock::text(notice.text())?;
+    let message = Message::user(
+        next_id(driver.runtime, AgentIdKind::Message)?,
+        vec![content],
+        source,
+    )?;
+    driver.pending_repeat_contexts.push(message);
+    Ok(())
 }
 
 fn retain_workspace_touch(driver: &mut Driver<'_>, touch: Option<String>) {

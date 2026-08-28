@@ -1821,6 +1821,36 @@ outside the Rust product scope. Phase 30 therefore targets only the core
 parallel-safe scheduler and records Rust's immutable name-based classifier and
 fixed-per-Agent cap in `docs/design/parallel-tool-scheduling.md`.
 
+## Phase 31 repeated-tool reminder inspection — 2026-08-29
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/guard/repeat-tool-reminder/src/index.ts`, README, invariant, and
+  `tests/repeat-tool-reminder.spec.ts` for per-Agent in-memory chains, recursive
+  argument-key canonicalization, transparent exclusions, different-call and
+  direct-human resets, exact 3/5/8 escalation, 500-character preview, denied
+  call counting, source attribution, result preservation, and fail-loud plugin
+  configuration;
+- `.agents/notes/archived/feature/2026-07-08-repeat-tool-guard.md` for the
+  advisory-only decision, post-execute ownership, model-visible/logged rule,
+  resource rationale, and rejected hard-block/fuzzy/persistent alternatives;
+- `packages/bundle/base/cordis.patch.yml` and `package.json` for the shipped
+  default enablement with thresholds `[3, 5, 8]` and preview cap 500;
+- `packages/core/agent-loop/src/{agent,tool-calls}.ts` for ordered result
+  finalization, `additionalContexts` insertion into the next-step inbox,
+  `step/end` before the next claimed `user/message`, and the rule that a
+  non-empty next-step inbox continues even after a concluding result;
+- `packages/core/agent/src/inbox.ts` and its README/tests for durable next-step
+  ownership and message identity.
+
+Latest inspected master `cd5ef8148158c3a752a658978873241fdf8e2bbc`
+retains the detector, default thresholds, reset, advice text, capped detailed
+preview, and next-step delivery. Changes since the fixed commit are naming/type
+updates and expanded documentation/presentation metadata, not a new detection
+algorithm. Rust Phase 31 therefore follows the fixed default behavior while
+recording its smaller non-configurable, Agent-owned seam in
+`docs/design/repeated-tool-reminder.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

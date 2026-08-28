@@ -4940,6 +4940,8 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
     let mut request_header_logged = true;
     let mut exact_shell_grants = super::approval::ExactShellGrantStore::new();
     let mut pending_workspace_touches = Vec::new();
+    let mut repeat_tool_reminder = super::repeat_tool_reminder::RepeatToolReminder::default();
+    let mut pending_repeat_contexts = Vec::new();
     let mut driver = super::Driver {
         provider: &provider,
         tools: tools.as_ref(),
@@ -4961,6 +4963,8 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         goal_tool_caller: super::GoalToolCaller::Untrusted,
         workspace_instructions: None,
         pending_workspace_touches: &mut pending_workspace_touches,
+        repeat_tool_reminder: &mut repeat_tool_reminder,
+        pending_repeat_contexts: &mut pending_repeat_contexts,
     };
     let budget_failure = super::failure_reason(
         "AGENT_EVENT_BUDGET",

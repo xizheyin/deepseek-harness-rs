@@ -1,0 +1,52 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "sources": [
+      "packages/guard/repeat-tool-reminder/src/index.ts",
+      "packages/guard/repeat-tool-reminder/tests/repeat-tool-reminder.spec.ts",
+      "packages/core/agent-loop/src/agent.ts",
+      "packages/core/agent-loop/src/tool-calls.ts",
+      "packages/bundle/base/cordis.patch.yml"
+    ],
+    "method": "Deterministic source-and-test transcription of the fixed default five-call scenario; unstable message IDs and timestamps are omitted."
+  },
+  "scenario": {
+    "tool": "calculator",
+    "canonicalArguments": "{}",
+    "thresholds": [3, 5, 8],
+    "argumentsPreviewChars": 500,
+    "reminders": [
+      {
+        "afterCount": 3,
+        "text": "You are repeating the exact same tool call with identical arguments. Carefully analyze the previous result before calling again: if the task is not complete, try a different approach or different arguments instead of repeating the call.",
+        "source": {
+          "kind": "plugin",
+          "plugin": "repeat-tool-reminder",
+          "form": "notice",
+          "summary": "calculator × 3"
+        }
+      },
+      {
+        "afterCount": 5,
+        "text": "Repeated tool call detected:\n- tool: calculator\n- consecutive_calls: 5\n- arguments: {}\nThe repeated calls are not making progress. Do not call this tool with these exact arguments again. Inspect the latest result and choose a different action, different arguments, or finish the task if enough evidence has been gathered.",
+        "source": {
+          "kind": "plugin",
+          "plugin": "repeat-tool-reminder",
+          "form": "notice",
+          "summary": "calculator × 5"
+        }
+      }
+    ],
+    "firstReminderOrder": [
+      "tool/result:repeat-3",
+      "step/end:3",
+      "step/start:4",
+      "user/message:calculator × 3"
+    ],
+    "directHumanMessageResets": true,
+    "newAgentStartsFresh": true,
+    "toolResultIsUnchanged": true,
+    "reminderIsAdvisory": true
+  }
+}
