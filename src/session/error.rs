@@ -303,6 +303,8 @@ pub enum EventValidationError {
     InvalidApprovalEvent(&'static str),
     #[error("invalid compaction event: {0}")]
     InvalidCompactionEvent(&'static str),
+    #[error("invalid Goal event: {0}")]
+    InvalidGoalEvent(String),
     #[error("session contains {actual} events; maximum is {maximum}")]
     TooManyEvents { maximum: usize, actual: usize },
 }

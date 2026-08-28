@@ -40,15 +40,17 @@ pub(super) fn prepare_user_turn(
 pub(super) fn prepare_goal_turn(
     session: &Session,
     prompt: &str,
+    goal_id: &str,
+    revision: u64,
     round: u32,
 ) -> Result<PreparedUserTurn, IdentityError> {
-    prepare_turn(session, prompt, Some(round))
+    prepare_turn(session, prompt, Some((goal_id, revision, round)))
 }
 
 fn prepare_turn(
     session: &Session,
     prompt: &str,
-    goal_round: Option<u32>,
+    goal_round: Option<(&str, u64, u32)>,
 ) -> Result<PreparedUserTurn, IdentityError> {
     let start_seq = session
         .next_seq()
@@ -56,8 +58,10 @@ fn prepare_turn(
     let turn = session.state().next_turn();
     let content = ContentBlock::text(prompt).map_err(|_| IdentityError::InvalidUserMessage)?;
     let source = match goal_round {
-        Some(round) => MessageSource::from_value(serde_json::json!({
+        Some((goal_id, revision, round)) => MessageSource::from_value(serde_json::json!({
             "kind": "goal",
+            "goalId": goal_id,
+            "revision": revision,
             "round": round,
         })),
         None => MessageSource::user(),
@@ -65,7 +69,7 @@ fn prepare_turn(
     .map_err(|_| IdentityError::InvalidUserMessage)?;
     let message_id = goal_round.map_or_else(
         || format!("user-{turn}"),
-        |round| format!("goal-{turn}-{round}"),
+        |(_, _, round)| format!("goal-{turn}-{round}"),
     );
     let message = Message::user(message_id, vec![content], source)
         .map_err(|_| IdentityError::InvalidUserMessage)?;
@@ -148,12 +152,14 @@ mod tests {
     #[test]
     fn goal_round_has_a_distinct_recorded_source() {
         let session = Session::new("goal-identity").unwrap();
-        let prepared = prepare_goal_turn(&session, "<goal_round>", 2).unwrap();
+        let prepared = prepare_goal_turn(&session, "<goal_round>", "goal-1", 3, 2).unwrap();
         let TurnProposal::Enter(messages) = prepared.proposal else {
             panic!("a Goal round must enter the turn")
         };
         assert_eq!(messages[0].id().as_str(), "goal-1-2");
         assert_eq!(messages[0].source().raw().as_value()["kind"], "goal");
+        assert_eq!(messages[0].source().raw().as_value()["goalId"], "goal-1");
+        assert_eq!(messages[0].source().raw().as_value()["revision"], 3);
         assert_eq!(messages[0].source().raw().as_value()["round"], 2);
     }
 }

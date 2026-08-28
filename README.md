@@ -73,7 +73,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 文件修改 | 严格的单文件 `apply_patch`，检查实际 diff、路径、符号链接和并发修改；默认审批，也可显式启用进程级 `auto-edit` |
 | 命令执行 | 经审批的前台 `bash`，可显式记住完全相同的本进程调用；限制输出和运行时间，并在正常可观察路径下终止、回收同进程组工作 |
 | 交互控制 | 实验性 Unicode 多行 Composer、忙时下一回合队列、动态 Dock、安全粘贴、6 套内置语义主题、可关闭的工作状态动画、源文本保持的有限表格、每个工具生命周期至多一张最终卡、回合收据、只读 Inspect/Review、审批、Ctrl+C 取消，以及严格线性后备 |
-| Goal 自动续跑（实验性） | `/goal` 设置一个本进程目标；空闲时顺序执行最多 32 个自动回合，模型可读取、编辑、暂停、完成或在连续三轮阻塞后停止 |
+| Goal 自动续跑（实验性） | `/goal` 设置一个可随会话恢复的目标；空闲时顺序执行最多 32 个自动回合，模型可读取、编辑、暂停、完成或在三轮均受阻后停止 |
 | 脚本模式 | `--prompt` 或管道输入；不会停下来等待审批，并安全拒绝写文件或 Shell 请求 |
 | 长会话 | 有上限的本地 JSONL、会话列表与恢复，以及一次有界的自动上下文摘要 |
 | 本地工具插件（实验性） | 显式配置受信任的子进程工具；协议、队列、输出、超时和清理都有上限，交互调用仍需审批 |
@@ -97,7 +97,7 @@ dsh --workspace .
 | `/focus` | 仅增强界面：从详情返回默认 Focus |
 | `/theme [NAME]` | 查询或选择 `adaptive`、`midnight`、`paper`、`color-blind`、`high-contrast`、`mono`；线性界面始终保持纯文本 |
 | `/motion [full|reduced]` | 查询或切换本进程的增强界面动画；线性界面没有周期动画 |
-| `/goal [OBJECTIVE]` | 显示或创建本进程 Goal；还支持 `edit OBJECTIVE`、`pause`、`resume` 和 `clear` |
+| `/goal [OBJECTIVE]` | 显示或创建当前会话的 Goal；还支持 `edit OBJECTIVE`、`pause`、`resume` 和 `clear` |
 | <kbd>Enter</kbd> | 空闲时发送；当前回合运行时加入下一回合 FIFO |
 | <kbd>Ctrl</kbd> + <kbd>J</kbd> | 在增强 Composer 中插入换行 |
 | 方向键、Home/End、Backspace/Delete | 按 Unicode 字素编辑；上下方向在边界浏览本进程已提交历史 |
@@ -110,9 +110,10 @@ dsh --workspace .
 Goal 适合“持续修完这一组问题”这类需要多轮推进的任务。创建后，`dsh` 会在没有待发送
 人工输入时自动生成下一轮；模型通过 `get_goal`、`create_goal` 和 `update_goal` 读取或
 更新状态。每轮仍走原有工具、审批、超时、会话和进程清理路径。按 <kbd>Ctrl</kbd>+
-<kbd>C</kbd> 会先取消当前轮并把 Goal 暂停，`/goal resume` 才会继续。首版状态只保留在
-当前进程，重启或 `--resume` 不会恢复或自动重放旧 Goal；目标最多自动运行 32 轮，也不
-支持图片附件或后台并行工作。
+<kbd>C</kbd> 会先取消当前轮并把 Goal 暂停，`/goal resume` 才会继续。Goal 的目标、状态、
+修订号和已开始轮次会写入当前会话；重启后通过 `--resume` 可以查看，但默认保持
+`disarmed`（未武装，不会自动发模型请求），必须显式执行 `/goal resume` 才会续跑。
+目标最多自动运行 32 轮，也不支持图片附件或后台并行工作。
 
 默认情况下，文件修改、Shell 或插件执行前会显示完整预览和三项选择器。经过完整准备的
 内置 Shell 还会显示第四项 **Allow exact Shell for this process**。增强界面默认选中

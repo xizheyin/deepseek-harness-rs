@@ -1853,6 +1853,91 @@ fn cancelling_a_goal_round_pauses_automatic_continuation() {
 }
 
 #[test]
+fn resumed_goal_is_restored_disarmed_and_requires_explicit_resume() {
+    let partial =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"durable goal started\"}}]}\n\n".to_owned();
+    let first_server = StalledSseServer::start(partial);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut first = PtyHarness::spawn_color_with_session_root_cargo(
+        &first_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    first.expect("❯".as_bytes());
+    first.write(b"/goal persist across restart\r");
+    first.expect(b"durable goal started");
+    first.write(b"\x03");
+    first.expect(b"stopped");
+    first.expect("❯".as_bytes());
+    let (status, _) = first.exit_cleanly();
+    let (request, closed) = first_server.finish();
+    assert!(status.success());
+    assert!(closed);
+    assert!(last_user_content(&request).contains("Round: 1/32"));
+
+    let entries = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let filename = entries[0].file_name().into_string().unwrap();
+    let session_id = filename.strip_suffix(".jsonl").unwrap().to_owned();
+
+    let resumed_server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-resumed-goal-complete",
+            "update_goal",
+            serde_json::json!({
+                "expected_revision": 3,
+                "operation": "complete"
+            }),
+        ),
+        text_sse("resumed goal complete"),
+    ]);
+    let caller_workspace = TestWorkspace::new();
+    let mut resumed = PtyHarness::spawn_resume_color_cargo(
+        &resumed_server.base_url,
+        &caller_workspace.0,
+        session_root.clone(),
+        &session_id,
+    );
+    resumed.expect(format!("resumed session {session_id}").as_bytes());
+    resumed.expect("❯".as_bytes());
+    let shown = resumed.checkpoint();
+    resumed.write(b"/goal\r");
+    resumed.expect_after(shown, b"paused");
+    resumed.expect_after(shown, b"disarmed");
+    resumed.write(b"/goal resume\r");
+    resumed.expect(b"resumed goal complete");
+    let settled = resumed.checkpoint();
+    resumed.write(b"/goal\r");
+    resumed.expect_after(settled, b"complete");
+    let (status, _) = resumed.exit_cleanly();
+    let requests = resumed_server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(last_user_content(&requests[0]).contains("Round: 2/32"));
+    let journal = std::fs::read_to_string(session_root.path().join(filename)).unwrap();
+    let event_types = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|row| {
+            row.get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        event_types
+            .windows(3)
+            .any(|window| { window == ["tool/call", "goal/change", "tool/result"] })
+    );
+}
+
+#[test]
 fn active_turn_paste_fence_requires_a_fresh_enter_before_queueing() {
     let first =
         concat!("data: {\"choices\":[{\"delta\":{\"content\":\"active paste busy\"}}]}\n\n")

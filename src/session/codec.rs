@@ -311,6 +311,9 @@ fn decode_kind(
         "todo/write" => EventKind::TodoWrite {
             todos: payload!(TodoWriteData).todos,
         },
+        "goal/change" => EventKind::GoalChange {
+            change: payload!(crate::goal::GoalChange),
+        },
         "request/header" => {
             let data = payload!(RequestHeaderData);
             EventKind::RequestHeader {
@@ -469,6 +472,7 @@ pub(crate) fn kind_data_value(kind: &EventKind) -> Result<Value, serde_json::Err
             meta: meta.as_ref(),
         }),
         EventKind::TodoWrite { todos } => serde_json::to_value(TodoWriteRef { todos }),
+        EventKind::GoalChange { change } => serde_json::to_value(change),
         EventKind::RequestHeader { header, reason } => {
             serde_json::to_value(RequestHeaderRef { header, reason })
         }

@@ -639,10 +639,12 @@ async fn run_enhanced(
                             }
                             CommandId::Goal => {
                                 apply_goal_command(
+                                    &mut agent,
                                     &goal,
                                     Ok(GoalCommand::Show),
                                     &mut notice,
-                                );
+                                )
+                                .await;
                             }
                             CommandId::Exit | CommandId::Quit => {
                                 break Ok(InteractiveExit::Ordinary(0));
@@ -655,7 +657,7 @@ async fn run_enhanced(
                             apply_motion_command(command, &mut motion, &mut notice)?;
                         }
                         EnhancedSubmission::Goal(command) => {
-                            apply_goal_command(&goal, command, &mut notice);
+                            apply_goal_command(&mut agent, &goal, command, &mut notice).await;
                         }
                         EnhancedSubmission::Prompt => {
                             let prompt = copy_enhanced_prompt(&draft)?;
@@ -691,8 +693,14 @@ async fn run_enhanced(
                             .await?
                             {
                                 if let Some(round) = &goal_round {
-                                    goal.pause_after_round_failure(round.revision())
-                                        .map_err(|_| InteractiveError::Agent)?;
+                                    pause_goal_after_round_failure(
+                                        &mut agent,
+                                        &goal,
+                                        round.revision(),
+                                        round.number(),
+                                        false,
+                                    )
+                                    .await?;
                                 } else if let Some(id) = queued_id {
                                     input.release_reserved(id)?;
                                 } else {
@@ -731,12 +739,6 @@ async fn run_enhanced(
                                     .map(|round| (round.revision(), round.number())),
                             })
                             .await;
-                            if turn_result.is_err() {
-                                if let Some(round) = &goal_round {
-                                    goal.pause_after_round_failure(round.revision())
-                                        .map_err(|_| InteractiveError::Agent)?;
-                                }
-                            }
                             let disposition = turn_result?;
                             if matches!(
                                 disposition,
@@ -1155,17 +1157,63 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
     }
 }
 
-fn apply_goal_command(
+async fn apply_goal_command(
+    agent: &mut AgentLoop,
     goal: &GoalRuntime,
     command: Result<GoalCommand, GoalError>,
     notice: &mut Option<String>,
 ) {
     *notice = Some(
-        match command.and_then(|command| goal.apply_command(command)) {
+        match command.and_then(|command| goal.prepare_command(command)) {
+            Ok(crate::goal::GoalCommandPreparation::Show(message)) => Ok(message),
+            Ok(crate::goal::GoalCommandPreparation::Mutation(mutation)) => agent
+                .commit_goal_mutation(mutation)
+                .await
+                .map_err(|error| GoalError::Commit(error.to_string())),
+            Err(error) => Err(error),
+        }
+        .unwrap_or_else(|error| format!("Goal error · {error}")),
+    );
+}
+
+async fn pause_goal_after_round_failure(
+    agent: &mut AgentLoop,
+    goal: &GoalRuntime,
+    revision: u64,
+    round: u32,
+    prompt_committed: bool,
+) -> Result<(), InteractiveError> {
+    if !prompt_committed {
+        goal.rollback_uncommitted_round(revision, round)
+            .map_err(|_| InteractiveError::Agent)?;
+    }
+    match goal.prepare_update(revision, crate::goal::GoalUpdate::Pause, None) {
+        Ok(mutation) => {
+            agent
+                .commit_goal_mutation(mutation)
+                .await
+                .map_err(|_| InteractiveError::Agent)?;
+        }
+        Err(GoalError::InvalidTransition | GoalError::StaleRevision | GoalError::Missing) => {}
+        Err(_) => return Err(InteractiveError::Agent),
+    }
+    Ok(())
+}
+
+fn apply_active_goal_command(
+    goal: &GoalRuntime,
+    command: Result<GoalCommand, GoalError>,
+    notice: &mut Option<String>,
+) {
+    *notice = Some(match command {
+        Ok(GoalCommand::Show) => match goal.apply_command(GoalCommand::Show) {
             Ok(message) => message,
             Err(error) => format!("Goal error · {error}"),
         },
-    );
+        Ok(_) => "Goal error · wait for the current turn or press Ctrl+C before changing the Goal"
+            .to_owned(),
+        Err(error) => format!("Goal error · {error}"),
+    });
 }
 
 const MOTION_LIST_NOTICE: &str = "Motion modes · full · reduced";
@@ -2379,10 +2427,6 @@ async fn run_linear(
                         goal_round: Some((round.revision(), round.number())),
                     })
                     .await;
-                    if turn_result.is_err() {
-                        goal.pause_after_round_failure(round.revision())
-                            .map_err(|_| InteractiveError::Agent)?;
-                    }
                     match turn_result? {
                         TurnDisposition::Continue => continue,
                         TurnDisposition::Exit(code) => {
@@ -2548,7 +2592,7 @@ async fn run_linear(
                     }
                     IdleInput::Goal(command) => {
                         let mut notice = None;
-                        apply_goal_command(&goal, command, &mut notice);
+                        apply_goal_command(&mut agent, &goal, command, &mut notice).await;
                         let message = format!(
                             "[{}]\n",
                             notice.as_deref().unwrap_or("Goal state unavailable")
@@ -3392,7 +3436,24 @@ async fn wait_active_file_suggestion(
 
 async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, InteractiveError> {
     let prepared = match active.goal_round {
-        Some((_, round)) => prepare_goal_turn(active.agent.session(), &active.prompt, round),
+        Some((revision, round)) => {
+            let goal_id = active
+                .goal
+                .snapshot()
+                .map_err(|_| InteractiveError::Agent)?
+                .ok_or(InteractiveError::Agent)?
+                .to_value()["goalId"]
+                .as_str()
+                .ok_or(InteractiveError::Agent)?
+                .to_owned();
+            prepare_goal_turn(
+                active.agent.session(),
+                &active.prompt,
+                &goal_id,
+                revision,
+                round,
+            )
+        }
         None => prepare_user_turn(active.agent.session(), &active.prompt),
     }
     .map_err(|_| InteractiveError::Agent)?;
@@ -4901,16 +4962,20 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             .finish_turn(active.approvals, ApprovalResetMode::Normal)?;
     }
 
-    if let Some((revision, _)) = active.goal_round {
+    if let Some((revision, round)) = active.goal_round {
         let completed = matches!(
             &result,
             Ok(outcome) if matches!(outcome.reason(), TurnEndReason::Completed)
         );
         if stop.is_some() || !completed {
-            active
-                .goal
-                .pause_after_round_failure(revision)
-                .map_err(|_| InteractiveError::Agent)?;
+            pause_goal_after_round_failure(
+                active.agent,
+                active.goal,
+                revision,
+                round,
+                *active.prompt_committed,
+            )
+            .await?;
         }
     }
 
@@ -5025,7 +5090,7 @@ fn handle_active_input(
                         }
                         CommandId::Goal => {
                             let _ = input.take_draft_for_turn()?;
-                            apply_goal_command(goal, Ok(GoalCommand::Show), notice);
+                            apply_active_goal_command(goal, Ok(GoalCommand::Show), notice);
                         }
                     }
                     return Ok(ActiveInputOutcome::Redraw);
@@ -5042,7 +5107,7 @@ fn handle_active_input(
                 }
                 EnhancedSubmission::Goal(command) => {
                     let _ = input.take_draft_for_turn()?;
-                    apply_goal_command(goal, command, notice);
+                    apply_active_goal_command(goal, command, notice);
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Empty => {
@@ -5115,7 +5180,16 @@ fn process_event(
     mut targets: EventTargets<'_, '_>,
 ) -> Result<(), InteractiveError> {
     if event.seq.get() < expected_start.get() {
-        return Err(InteractiveError::Agent);
+        return if matches!(
+            &event.kind,
+            CommittedUiKind::TypeOnly {
+                event_type: "goal/change"
+            }
+        ) {
+            Ok(())
+        } else {
+            Err(InteractiveError::Agent)
+        };
     }
     let committed_prompt = match &event.kind {
         CommittedUiKind::UserMessage {
@@ -5130,6 +5204,16 @@ fn process_event(
                 .render_committed_prompt
                 .then(|| copy_enhanced_prompt(content))
                 .transpose()?
+        }
+        CommittedUiKind::UserMessage {
+            source: UiUserSource::Other { kind },
+            content,
+        } if kind == "goal" => {
+            if content.as_str() != Some(targets.expected_prompt) {
+                return Err(InteractiveError::Agent);
+            }
+            *targets.prompt_committed = true;
+            None
         }
         _ => None,
     };
@@ -6241,17 +6325,26 @@ fn discard_ready_updates_after_stop(
     let mut skipped = 0_usize;
     while let Ok(event) = events.try_recv() {
         if event.seq.get() < expected_start.get() {
+            if matches!(
+                &event.kind,
+                CommittedUiKind::TypeOnly {
+                    event_type: "goal/change"
+                }
+            ) {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
             return Err(InteractiveError::Agent);
         }
-        if let CommittedUiKind::UserMessage {
-            source: UiUserSource::Human,
-            content,
-        } = &event.kind
-        {
-            if content.as_str() != Some(expected_prompt) {
-                return Err(InteractiveError::Agent);
+        if let CommittedUiKind::UserMessage { source, content } = &event.kind {
+            let is_prompt = matches!(source, UiUserSource::Human)
+                || matches!(source, UiUserSource::Other { kind } if kind == "goal");
+            if is_prompt {
+                if content.as_str() != Some(expected_prompt) {
+                    return Err(InteractiveError::Agent);
+                }
+                *prompt_committed = true;
             }
-            *prompt_committed = true;
         }
         skipped = skipped.saturating_add(1);
     }

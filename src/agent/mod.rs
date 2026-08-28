@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     entropy::EntropySource,
+    goal::PreparedGoalMutation,
     model::{
         CallId, ContentBlock, ContentBlockKind, FinishReasonKind, JsonValue, LlmCallConfig,
         LlmFailure, Message, MessageRole, MessageSource, StreamChunkKind, ToolSchema,
@@ -90,6 +91,7 @@ pub const MAX_AGENT_TOOL_RESULT_BYTES: usize = 256 * 1024;
 pub const MAX_AGENT_ACTION_RESULT_EVENT_BYTES: usize = 128 * 1024;
 /// Session-event capacity protected before an irreversible mutation starts.
 pub const MAX_AGENT_COMMITTED_TOOL_RESULT_EVENT_BYTES: usize = 512 * 1024;
+const MAX_AGENT_GOAL_RESULT_EVENT_BYTES: usize = 16 * 1024;
 pub const MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_AGENT_FIXED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const AGENT_READY_WORK_BUDGET: usize = 32;
@@ -781,6 +783,21 @@ impl AgentLoop {
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// Commit a local Goal command through the same durable Session owner.
+    pub(crate) async fn commit_goal_mutation(
+        &mut self,
+        mutation: PreparedGoalMutation,
+    ) -> Result<String, AgentLoopError> {
+        self.session.materialize_if_needed().await?;
+        let change = mutation.change().clone();
+        self.session
+            .append_settled(NewEvent::log(EventKind::goal_change(change)))
+            .await?;
+        mutation
+            .commit()
+            .map_err(|_| AgentLoopError::Invariant("committed Goal state was not installable"))
     }
 
     /// Stop tool-owned workers, then return the still-active Session.
@@ -2576,23 +2593,30 @@ async fn commit_tool_round(
         });
     }
     for index in 0..planned.len() {
-        let ceiling = match planned[index].claim_profile.action_contract() {
-            Some(ActionContract::Shell) => shell_prestart_claim_ceiling(
-                turn,
-                step,
-                &planned[index].result_message_id,
-                &planned[index].call,
-                maximum_source_seq,
-            )?,
-            Some(ActionContract::Plugin { plugin_id }) => plugin_prestart_claim_ceiling(
-                plugin_id.as_str(),
-                turn,
-                step,
-                &planned[index].result_message_id,
-                &planned[index].call,
-                maximum_source_seq,
-            )?,
-            None => continue,
+        let ceiling = if matches!(
+            planned[index].call.name.as_str(),
+            "create_goal" | "update_goal"
+        ) {
+            MAX_AGENT_GOAL_RESULT_EVENT_BYTES
+        } else {
+            match planned[index].claim_profile.action_contract() {
+                Some(ActionContract::Shell) => shell_prestart_claim_ceiling(
+                    turn,
+                    step,
+                    &planned[index].result_message_id,
+                    &planned[index].call,
+                    maximum_source_seq,
+                )?,
+                Some(ActionContract::Plugin { plugin_id }) => plugin_prestart_claim_ceiling(
+                    plugin_id.as_str(),
+                    turn,
+                    step,
+                    &planned[index].result_message_id,
+                    &planned[index].call,
+                    maximum_source_seq,
+                )?,
+                None => continue,
+            }
         };
         if let Err(error) =
             reservation.reserve_claim_retained_json_bytes(&mut planned[index].result_claim, ceiling)
@@ -2721,6 +2745,53 @@ async fn commit_tool_round(
                         )?);
                     }
                 }
+            }
+            ToolRun::Goal(mutation) => {
+                if cancellation.is_cancelled() || Instant::now() >= driver.deadline {
+                    drop(mutation);
+                    let (code, message) = if cancellation.is_cancelled() {
+                        (
+                            "ABORTED",
+                            "Goal change was cancelled before it was committed",
+                        )
+                    } else {
+                        (
+                            "AGENT_TURN_TIMEOUT",
+                            "Goal change was not committed because the turn timed out",
+                        )
+                    };
+                    settle_model_error(reservation, plan, turn, step, code, message).await?;
+                    if cancellation.is_cancelled() {
+                        cancelled = true;
+                        latched_stop = latch_tool_stop(latched_stop, ToolStop::Cancelled);
+                    } else {
+                        infrastructure_failure = Some(failure_reason(
+                            "AGENT_TURN_TIMEOUT",
+                            "the agent turn timed out",
+                        )?);
+                        latched_stop = latch_tool_stop(latched_stop, ToolStop::TurnTimeout);
+                    }
+                    continue;
+                }
+                let result = goal_tool_result(&mutation)?;
+                let change = mutation.change().clone();
+                if let Err(error) = reservation
+                    .append_settled(NewEvent::log(EventKind::goal_change(change)))
+                    .await
+                {
+                    return Err(error.into());
+                }
+                mutation.commit().map_err(|_| {
+                    AgentLoopError::Invariant("committed Goal state was not installable")
+                })?;
+                let _ = settle_tool_result(
+                    reservation,
+                    driver,
+                    plan,
+                    result,
+                    ResultSettlement::PreferredRequired,
+                )
+                .await?;
             }
             ToolRun::Mutation(mutation) => {
                 let resolved =
@@ -2964,6 +3035,15 @@ async fn commit_tool_round(
     Ok(StepResolution::with_stop(outcome, latched_stop))
 }
 
+fn goal_tool_result(
+    mutation: &PreparedGoalMutation,
+) -> Result<ToolExecutionResult, AgentLoopError> {
+    let text = serde_json::to_string(&mutation.result_value())
+        .map_err(|error| AgentLoopError::Serialization(error.to_string()))?;
+    let block = ContentBlock::text(text)?;
+    ToolExecutionResult::success(vec![block]).map_err(AgentLoopError::Model)
+}
+
 async fn settle_model_error(
     reservation: &mut SessionReservation<'_>,
     plan: &mut PlannedTool,
@@ -3031,6 +3111,7 @@ enum ToolRun {
         settlement: ResultSettlement,
         stop: ToolStop,
     },
+    Goal(PreparedGoalMutation),
     Mutation(PreparedToolMutation),
     Action(PreparedToolActionSetup),
     ModelError {
@@ -3208,6 +3289,15 @@ async fn run_one_tool(
                             settlement: ResultSettlement::FallbackAllowed,
                             stop: ToolStop::None,
                         }
+                    }
+                }
+                Ok(Ok(ToolPreparation::Goal(mutation))) => {
+                    if plan.claim_profile.is_owned_action() {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::Goal(mutation)
                     }
                 }
                 Ok(Ok(ToolPreparation::Mutation(mutation))) => {

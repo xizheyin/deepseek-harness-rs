@@ -1408,6 +1408,31 @@ and cross-restart recovery remain outside this fast slice. The complete scope
 and failure analysis are in
 `docs/design/goal-automation.md`.
 
+## Phase 13 durable Goal inspection — 2026-08-28
+
+The fixed Goal implementation was inspected again down to its event fold and
+tool commit order before replacing the process-local Phase 12 state:
+
+- `packages/goal/goal/src/{types,domain,fold,index}.ts` and
+  `tests/{goal.spec,goal.e2e}.ts` define version-1 full-snapshot
+  `goal/change` events, clear tombstones, exact revision/identity/phase folds,
+  round sources, and disarmed process restart;
+- `packages/goal/tool-goal/src/{index,authority}.ts` and
+  `tests/tool-goal.spec.ts` require a successful Goal mutation to commit before
+  its correlated tool result and constrain which caller may perform each
+  transition;
+- `packages/goal/goal-round-driver/src/{index,prompt}.ts` confirms that
+  activation is process-local even though Goal facts and started rounds are
+  durable.
+
+Rust Phase 13 now records and strictly replays those core Goal facts, preserves
+`tool/call -> goal/change -> tool/result`, and restores every resumed Goal
+disarmed until `/goal resume` records a new revision. Remaining gaps are the
+intentional 32-round cap, caller-sensitive tool authority, per-Goal cap
+configuration, and the image attachments present on latest `master`. Design
+and local evidence are in `docs/design/goal-persistence.md` and
+`docs/validation/phase-13.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

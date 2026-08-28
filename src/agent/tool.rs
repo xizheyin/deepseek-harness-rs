@@ -5,6 +5,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    goal::PreparedGoalMutation,
     model::{CallId, ContentBlock, JsonValue, MAX_MESSAGE_CONTENT_BLOCKS, ModelError},
     session::ToolFailure,
 };
@@ -142,6 +143,7 @@ impl std::fmt::Debug for ToolDispatchBinding {
 /// Result of preparing one durable tool call.
 pub enum ToolPreparation {
     Complete(ToolExecutionResult),
+    Goal(PreparedGoalMutation),
     Mutation(PreparedToolMutation),
     Action(PreparedToolActionSetup),
 }
@@ -150,6 +152,7 @@ impl std::fmt::Debug for ToolPreparation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Complete(result) => formatter.debug_tuple("Complete").field(result).finish(),
+            Self::Goal(mutation) => formatter.debug_tuple("Goal").field(mutation).finish(),
             Self::Mutation(mutation) => formatter.debug_tuple("Mutation").field(mutation).finish(),
             Self::Action(action) => formatter.debug_tuple("Action").field(action).finish(),
         }

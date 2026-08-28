@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::{
+    goal::GoalReplayState,
     model::{CallId, Message, MessageSourceKind, NonNegativeSafeInteger, TokenUsage},
     resident_credit::{ResidentCreditLease, arc_inner_charge},
 };
@@ -296,6 +297,7 @@ pub struct SessionState {
     surface_nodes: Vec<EventSeq>,
     request_header: Option<super::EpochHeader>,
     request_context: Option<super::RequestContext>,
+    goal: GoalReplayState,
 }
 
 impl SessionState {
@@ -346,6 +348,10 @@ impl SessionState {
     pub fn request_context(&self) -> Option<&super::RequestContext> {
         self.request_context.as_ref()
     }
+
+    pub(crate) fn goal_replay(&self) -> &GoalReplayState {
+        &self.goal
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -361,6 +367,7 @@ pub(crate) struct Projection {
     request_header_seq: Option<EventSeq>,
     request_context: Option<super::RequestContext>,
     request_context_seq: Option<EventSeq>,
+    goal: GoalReplayState,
     compaction: CompactionState,
     pending_approvals: Vec<ApprovalRequestId>,
     owned_approval_ids: Arc<BTreeSet<ApprovalRequestId>>,
@@ -602,6 +609,7 @@ impl Projection {
             request_header_seq: None,
             request_context: None,
             request_context_seq: None,
+            goal: GoalReplayState::default(),
             compaction: CompactionState::default(),
             pending_approvals: Vec::new(),
             owned_approval_ids: Arc::new(BTreeSet::new()),
@@ -673,6 +681,7 @@ impl Projection {
         event.kind.validate()?;
         self.reject_unowned_attempt_event(event)?;
         let mut next = self.clone();
+        next.apply_goal_transition(event)?;
         let compaction = next.next_compaction_state(event, ValidationAdmission::Ordinary)?;
         next.reject_unowned_context_overflow_start(event)?;
         let retry_started = matches!(event.kind(), EventKind::LlmRetryStarted { .. });
@@ -701,6 +710,7 @@ impl Projection {
     ) -> Result<Self, EventValidationError> {
         event.kind.validate()?;
         let mut next = self.clone();
+        next.apply_goal_transition(event)?;
         let compaction =
             next.next_compaction_state(event, ValidationAdmission::CompatibilityReplay)?;
         next.apply_transition(event, ValidationAdmission::CompatibilityReplay)?;
@@ -721,6 +731,7 @@ impl Projection {
         event.kind.validate()?;
         self.reject_unowned_attempt_event(event)?;
         let mut next = self.clone();
+        next.apply_goal_transition(event)?;
         let compaction = next.next_compaction_state(event, ValidationAdmission::Ordinary)?;
         next.reject_unowned_context_overflow_start(event)?;
         let retry_started = matches!(event.kind(), EventKind::LlmRetryStarted { .. });
@@ -867,6 +878,7 @@ impl Projection {
             return Ok(());
         }
         let compaction = self.next_compaction_state(event, ValidationAdmission::ColdScan)?;
+        self.apply_goal_transition(event)?;
         let retry_started = matches!(event.kind(), EventKind::LlmRetryStarted { .. });
         if retry_started {
             self.apply_transition(event, ValidationAdmission::ColdScan)?;
@@ -1043,6 +1055,7 @@ impl Projection {
             surface_nodes: self.surface_nodes.iter().map(|node| node.seq).collect(),
             request_header: self.request_header.as_deref().cloned(),
             request_context: self.request_context.clone(),
+            goal: self.goal.clone(),
         }
     }
 
@@ -1874,6 +1887,15 @@ impl Projection {
         .then_some((start, end))
     }
 
+    fn apply_goal_transition(&mut self, event: &SessionEvent) -> Result<(), EventValidationError> {
+        let result = match &event.kind {
+            EventKind::GoalChange { change } => self.goal.apply_change(change),
+            EventKind::UserMessage { message } => self.goal.apply_goal_message(message),
+            _ => Ok(()),
+        };
+        result.map_err(|error| EventValidationError::InvalidGoalEvent(error.to_string()))
+    }
+
     fn apply_transition(
         &mut self,
         event: &SessionEvent,
@@ -2163,6 +2185,7 @@ impl Projection {
             | EventKind::CompactionSummary { .. }
             | EventKind::CompactionEnd { .. }
             | EventKind::CompactionPrune { .. }
+            | EventKind::GoalChange { .. }
             | EventKind::UserMessage { .. }
             | EventKind::EndSeed
             | EventKind::Unknown { .. } => {}
@@ -3193,6 +3216,7 @@ impl EventKind {
             Self::ToolCall { .. } => "tool/call",
             Self::ToolResult { .. } => "tool/result",
             Self::TodoWrite { .. } => "todo/write",
+            Self::GoalChange { .. } => "goal/change",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",

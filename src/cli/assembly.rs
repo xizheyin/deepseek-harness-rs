@@ -27,7 +27,7 @@ use super::{
     identity::new_session_id,
 };
 
-const SYSTEM_PROMPT: &str = "You are dsh, a coding agent working only through the supplied workspace tools. Use tools when they are useful. Never claim a file change or command completed unless its correlated tool result says it completed. When a process-local Goal exists, use get_goal and settle it truthfully with update_goal; leave it active while useful work remains. This session has no sandbox, Skills, Hooks, or background-task feature.";
+const SYSTEM_PROMPT: &str = "You are dsh, a coding agent working only through the supplied workspace tools. Use tools when they are useful. Never claim a file change or command completed unless its correlated tool result says it completed. When a Goal exists, use get_goal and settle it truthfully with update_goal; leave it active while useful work remains. This session has no sandbox, Skills, Hooks, or background-task feature.";
 
 pub(super) enum AgentAssembly {
     Script(AgentLoop),
@@ -164,7 +164,7 @@ pub(super) async fn assemble_session(
     // workspace capability. No later UI path reopens the ambient pathname.
     let file_suggestions =
         interactive.then(|| WorkspaceFileCatalogue::from_authority(authority.clone()));
-    let goal = interactive.then(GoalRuntime::new);
+    let goal = interactive.then(|| GoalRuntime::from_replay(session.state().goal_replay()));
 
     let registry = match plugin_config {
         Some(plugin_config) => {

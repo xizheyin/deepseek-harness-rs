@@ -1319,6 +1319,9 @@ pub enum EventKind {
     TodoWrite {
         todos: Vec<TodoItem>,
     },
+    GoalChange {
+        change: crate::goal::GoalChange,
+    },
     RequestHeader {
         header: EpochHeader,
         reason: RequestHeaderReason,
@@ -1436,6 +1439,12 @@ impl EventKind {
         }
     }
 
+    /// Construct one durable Goal state transition.
+    #[must_use]
+    pub(crate) fn goal_change(change: crate::goal::GoalChange) -> Self {
+        Self::GoalChange { change }
+    }
+
     #[must_use]
     pub fn llm_retry(retry: LlmRetryEvent) -> Self {
         Self::LlmRetry { retry }
@@ -1490,6 +1499,7 @@ impl EventKind {
             Self::ToolCall { .. } => "tool/call",
             Self::ToolResult { .. } => "tool/result",
             Self::TodoWrite { .. } => "todo/write",
+            Self::GoalChange { .. } => "goal/change",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",
@@ -1517,6 +1527,7 @@ impl EventKind {
             Self::ToolCall { .. } => "tool/call",
             Self::ToolResult { .. } => "tool/result",
             Self::TodoWrite { .. } => "todo/write",
+            Self::GoalChange { .. } => "goal/change",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",
@@ -1573,6 +1584,9 @@ impl EventKind {
             }
             Self::ApprovalAsked { asked } => asked.validate()?,
             Self::ApprovalDecided { decided } => validate_approval_id(&decided.id)?,
+            Self::GoalChange { change } => change
+                .validate()
+                .map_err(|error| EventValidationError::InvalidGoalEvent(error.to_string()))?,
             Self::CompactionStart { start } => start.validate()?,
             Self::CompactionSummary { summary } => summary.validate()?,
             Self::CompactionEnd { end } => end.validate()?,

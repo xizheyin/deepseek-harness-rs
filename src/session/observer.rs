@@ -1065,6 +1065,9 @@ impl CommittedUiEvent {
             EventKind::TodoWrite { .. } => CommittedUiKind::TypeOnly {
                 event_type: "todo/write",
             },
+            EventKind::GoalChange { .. } => CommittedUiKind::TypeOnly {
+                event_type: "goal/change",
+            },
             EventKind::RequestHeader { .. } => CommittedUiKind::TypeOnly {
                 event_type: "request/header",
             },

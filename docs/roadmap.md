@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–12 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–13 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -20,6 +20,7 @@ for behavior that users can run today.
 | 10 | Bounded subprocess tool plugins and examples | `complete` | [`validation/phase-10.md`](validation/phase-10.md) |
 | 11 | TUI v2: semantic conversation UI, composer, dock, review, and accessibility | `complete` | [`validation/phase-11.md`](validation/phase-11.md) |
 | 12 | Bounded same-process Goal automation | `complete` | [`validation/phase-12.md`](validation/phase-12.md) |
+| 13 | Durable Goal events and disarmed Session recovery | `complete` | [`validation/phase-13.md`](validation/phase-13.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -113,7 +114,7 @@ tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
 The current green checkpoints implement bounded assistant-message markup,
 source-preserving 2–8-column pipe tables, six closed process-local semantic
-themes with transactional redraw, a closed eight-command completion palette, a
+themes with transactional redraw, a closed nine-command completion palette, a
 generator-provenanced semantic card for the real single-file `apply_patch`
 approval preview, bounded workspace-file suggestions, and bounded primary-screen Inspect/Review panels. Inspect
 shows only current-turn committed metadata and retained reasoning; Review keeps
@@ -177,6 +178,28 @@ interactive auto-continuation journey, cancellation/cap coverage, format,
 all-target compilation, Clippy with warnings denied, and a whitespace check.
 The full repository suite and remote/cross-platform reruns are useful but do not
 block this user-directed fast checkpoint.
+
+## Phase 13 durable Goal boundary (2026-08-28)
+
+Phase 13 continues the active product Goal with the next explicit Phase 12
+gap. Every accepted Goal mutation becomes a typed, versioned, non-surface
+`goal/change` Session event. Session replay validates revision, identity,
+phase, timestamp, round-count, and clear-tombstone transitions. Admitted Goal
+round user messages carry goal ID, revision, and positive round number so the
+round counter is also reconstructible from the log.
+
+New and explicitly resumed Goals may arm automatic continuation. Merely
+reopening a Session restores the durable phase but always starts disarmed;
+`/goal` can inspect it and `/goal resume` records a fresh revision before any
+new automatic model request. This prevents a process restart from silently
+replaying uncertain work.
+
+The local-only acceptance gate covers deterministic event codec/fold fixtures,
+exact tool-call/change/result ordering, corrupt or stale mutation rejection,
+real save/resume/rearm behavior, format, all-target compilation, focused tests,
+Clippy with warnings denied, and the whitespace check. Remote CI and the full
+repository matrix are not repeated unless a focused check exposes a broader
+regression.
 
 ## Still deferred
 

@@ -331,8 +331,7 @@ impl ToolExecutor for LocalToolRegistry {
         let goal = self.goal.clone();
         Box::pin(async move {
             if is_goal_tool(request.name()) {
-                let result = dispatch_goal(goal, &request)?;
-                return Ok(ToolPreparation::Complete(result));
+                return prepare_goal(goal, &request);
             }
             if request.name() == "apply_patch" {
                 return patch::prepare(
@@ -533,6 +532,35 @@ fn dispatch_goal(
     }
 }
 
+fn prepare_goal(
+    goal: Option<GoalRuntime>,
+    request: &ToolExecutionRequest,
+) -> Result<ToolPreparation, ToolExecutorError> {
+    let Some(goal) = goal else {
+        return Ok(ToolPreparation::Complete(
+            ToolCallError::unknown_tool().into_execution_result()?,
+        ));
+    };
+    if request.name() == "get_goal" {
+        return dispatch_goal(Some(goal), request).map(ToolPreparation::Complete);
+    }
+    let prepared = match request.name() {
+        "create_goal" => parse_create_goal_arguments(request.arguments().as_value())
+            .and_then(|objective| goal.prepare_create(objective).map_err(goal_call_error)),
+        "update_goal" => parse_update_goal_arguments(request.arguments().as_value()).and_then(
+            |(revision, operation, objective)| {
+                goal.prepare_update(revision, operation, objective)
+                    .map_err(goal_call_error)
+            },
+        ),
+        _ => Err(ToolCallError::unknown_tool()),
+    };
+    match prepared {
+        Ok(mutation) => Ok(ToolPreparation::Goal(mutation)),
+        Err(error) => Ok(ToolPreparation::Complete(error.into_execution_result()?)),
+    }
+}
+
 fn parse_empty_goal_arguments(arguments: &serde_json::Value) -> ToolCallResult<()> {
     let fields = arguments
         .as_object()
@@ -610,7 +638,10 @@ fn goal_call_error(error: GoalError) -> ToolCallError {
         GoalError::StaleRevision => "GOAL_STALE_REVISION",
         GoalError::InvalidTransition => "GOAL_INVALID_TRANSITION",
         GoalError::BlockThreshold => "GOAL_BLOCK_THRESHOLD",
-        GoalError::Unavailable => "GOAL_UNAVAILABLE",
+        GoalError::Busy => "GOAL_BUSY",
+        GoalError::Unavailable | GoalError::Commit(_) | GoalError::InvalidEvent => {
+            "GOAL_UNAVAILABLE"
+        }
     };
     ToolCallError::model("GoalError", code, error.to_string())
 }
