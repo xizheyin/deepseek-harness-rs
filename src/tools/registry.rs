@@ -8,6 +8,7 @@ use crate::{
         ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
         ToolExecutorError, ToolShutdownFuture,
     },
+    goal::{GoalError, GoalRuntime, GoalUpdate, MAX_GOAL_OBJECTIVE_BYTES},
     model::{ContentBlock, JsonValue, ToolSchema},
     workspace_authority::WorkspaceAuthority,
 };
@@ -144,6 +145,7 @@ pub struct LocalToolRegistry {
     environment: ShellEnvironment,
     runner: Arc<ProcessRunner>,
     plugins: Option<Arc<PluginHost>>,
+    goal: Option<GoalRuntime>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -162,6 +164,7 @@ impl std::fmt::Debug for LocalToolRegistry {
                     .as_ref()
                     .map_or(0, |plugins| plugins.schemas().len()),
             )
+            .field("goal_enabled", &self.goal.is_some())
             .finish()
     }
 }
@@ -182,6 +185,13 @@ impl LocalToolRegistry {
     pub(crate) fn from_authority(
         authority: WorkspaceAuthority,
     ) -> Result<Self, ToolRegistryBuildError> {
+        Self::from_authority_with_goal(authority, None)
+    }
+
+    pub(crate) fn from_authority_with_goal(
+        authority: WorkspaceAuthority,
+        goal: Option<GoalRuntime>,
+    ) -> Result<Self, ToolRegistryBuildError> {
         let workspace = Arc::new(Workspace::from_authority(authority));
         let environment = ShellEnvironment::capture()?;
         let runner = Arc::new(
@@ -190,12 +200,16 @@ impl LocalToolRegistry {
         );
         let mut schemas = build_workspace_schemas()?;
         schemas.push(shell::schema()?);
+        if goal.is_some() {
+            schemas.extend(build_goal_schemas()?);
+        }
         Ok(Self {
             workspace,
             schemas: schemas.into(),
             environment,
             runner,
             plugins: None,
+            goal,
         })
     }
 
@@ -203,8 +217,9 @@ impl LocalToolRegistry {
         authority: WorkspaceAuthority,
         config: PluginConfig,
         cancellation: CancellationToken,
+        goal: Option<GoalRuntime>,
     ) -> Result<Self, ToolRegistryBuildError> {
-        let mut registry = Self::from_authority(authority)?;
+        let mut registry = Self::from_authority_with_goal(authority, goal)?;
         let plugins = Arc::new(
             PluginHost::start(config, &registry.schemas, cancellation)
                 .await
@@ -263,6 +278,10 @@ impl ToolExecutor for LocalToolRegistry {
         request: ToolExecutionRequest,
         cancellation: CancellationToken,
     ) -> ToolExecutionFuture<'_> {
+        if is_goal_tool(request.name()) {
+            let goal = self.goal.clone();
+            return Box::pin(async move { dispatch_goal(goal, &request) });
+        }
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
         }
@@ -309,7 +328,12 @@ impl ToolExecutor for LocalToolRegistry {
         let environment = self.environment.entries();
         let runner = Arc::clone(&self.runner);
         let plugins = self.plugins.clone();
+        let goal = self.goal.clone();
         Box::pin(async move {
+            if is_goal_tool(request.name()) {
+                let result = dispatch_goal(goal, &request)?;
+                return Ok(ToolPreparation::Complete(result));
+            }
             if request.name() == "apply_patch" {
                 return patch::prepare(
                     workspace.as_ref(),
@@ -450,6 +474,147 @@ fn normalize_success(text: String) -> Result<ToolExecutionResult, ToolExecutorEr
         .map_err(|_| ToolExecutorError::new("read-only tool output normalization failed"))
 }
 
+fn is_goal_tool(name: &str) -> bool {
+    matches!(name, "get_goal" | "create_goal" | "update_goal")
+}
+
+fn dispatch_goal(
+    goal: Option<GoalRuntime>,
+    request: &ToolExecutionRequest,
+) -> Result<ToolExecutionResult, ToolExecutorError> {
+    let Some(goal) = goal else {
+        return ToolCallError::unknown_tool().into_execution_result();
+    };
+    let result = match request.name() {
+        "get_goal" => parse_empty_goal_arguments(request.arguments().as_value())
+            .and_then(|()| goal.snapshot().map_err(goal_call_error))
+            .and_then(|snapshot| {
+                serde_json::to_string(&json!({
+                    "goal": snapshot.map(|goal| goal.to_value()),
+                }))
+                .map_err(|_| {
+                    ToolCallError::model(
+                        "GoalError",
+                        "GOAL_UNAVAILABLE",
+                        "Goal state could not be encoded",
+                    )
+                })
+            }),
+        "create_goal" => parse_create_goal_arguments(request.arguments().as_value())
+            .and_then(|objective| goal.create(objective).map_err(goal_call_error))
+            .and_then(|snapshot| {
+                serde_json::to_string(&json!({ "goal": snapshot.to_value() })).map_err(|_| {
+                    ToolCallError::model(
+                        "GoalError",
+                        "GOAL_UNAVAILABLE",
+                        "Goal state could not be encoded",
+                    )
+                })
+            }),
+        "update_goal" => parse_update_goal_arguments(request.arguments().as_value())
+            .and_then(|(revision, operation, objective)| {
+                goal.update(revision, operation, objective)
+                    .map_err(goal_call_error)
+            })
+            .and_then(|snapshot| {
+                serde_json::to_string(&json!({ "goal": snapshot.to_value() })).map_err(|_| {
+                    ToolCallError::model(
+                        "GoalError",
+                        "GOAL_UNAVAILABLE",
+                        "Goal state could not be encoded",
+                    )
+                })
+            }),
+        _ => Err(ToolCallError::unknown_tool()),
+    };
+    match result {
+        Ok(text) => normalize_success(text),
+        Err(error) => error.into_execution_result(),
+    }
+}
+
+fn parse_empty_goal_arguments(arguments: &serde_json::Value) -> ToolCallResult<()> {
+    let fields = arguments
+        .as_object()
+        .ok_or_else(|| ToolCallError::invalid_args("goal tool arguments must be an object"))?;
+    if fields.is_empty() {
+        Ok(())
+    } else {
+        Err(ToolCallError::invalid_args(
+            "get_goal does not accept arguments",
+        ))
+    }
+}
+
+fn parse_create_goal_arguments(arguments: &serde_json::Value) -> ToolCallResult<String> {
+    let fields = arguments
+        .as_object()
+        .ok_or_else(|| ToolCallError::invalid_args("create_goal arguments must be an object"))?;
+    if fields.len() != 1 {
+        return Err(ToolCallError::invalid_args(
+            "create_goal accepts exactly objective",
+        ));
+    }
+    fields
+        .get("objective")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| ToolCallError::invalid_args("objective must be a string"))
+}
+
+fn parse_update_goal_arguments(
+    arguments: &serde_json::Value,
+) -> ToolCallResult<(u64, GoalUpdate, Option<String>)> {
+    let fields = arguments
+        .as_object()
+        .ok_or_else(|| ToolCallError::invalid_args("update_goal arguments must be an object"))?;
+    if fields.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "expected_revision" | "operation" | "objective"
+        )
+    }) {
+        return Err(ToolCallError::invalid_args(
+            "update_goal received an unknown argument",
+        ));
+    }
+    let revision = fields
+        .get("expected_revision")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|revision| *revision != 0)
+        .ok_or_else(|| {
+            ToolCallError::invalid_args("expected_revision must be a positive integer")
+        })?;
+    let operation = fields
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        .and_then(GoalUpdate::parse)
+        .ok_or_else(|| ToolCallError::invalid_args("operation is not supported"))?;
+    let objective = match fields.get("objective") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| ToolCallError::invalid_args("objective must be a string"))?
+                .to_owned(),
+        ),
+        None => None,
+    };
+    Ok((revision, operation, objective))
+}
+
+fn goal_call_error(error: GoalError) -> ToolCallError {
+    let code = match &error {
+        GoalError::Missing => "GOAL_MISSING",
+        GoalError::Unfinished => "GOAL_UNFINISHED",
+        GoalError::EmptyObjective | GoalError::ObjectiveTooLarge => "GOAL_INVALID_OBJECTIVE",
+        GoalError::StaleRevision => "GOAL_STALE_REVISION",
+        GoalError::InvalidTransition => "GOAL_INVALID_TRANSITION",
+        GoalError::BlockThreshold => "GOAL_BLOCK_THRESHOLD",
+        GoalError::Unavailable => "GOAL_UNAVAILABLE",
+    };
+    ToolCallError::model("GoalError", code, error.to_string())
+}
+
 fn build_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> {
     Ok(vec![
         schema(
@@ -581,6 +746,62 @@ fn build_workspace_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> 
     Ok(schemas)
 }
 
+fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
+    Ok([
+        schema(
+            "get_goal",
+            "Read the current process-local Goal, including its revision, phase, activation, and round limits.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )?,
+        schema(
+            "create_goal",
+            "Create and arm one process-local Goal when no unfinished Goal exists.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "objective": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_GOAL_OBJECTIVE_BYTES,
+                        "description": "Concrete nonblank objective for bounded automatic continuation"
+                    }
+                },
+                "required": ["objective"],
+                "additionalProperties": false
+            }),
+        )?,
+        schema(
+            "update_goal",
+            "Edit, pause, resume, complete, or report a repeated blocker for the current Goal using its exact revision.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "expected_revision": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["edit", "pause", "resume", "complete", "blocked"]
+                    },
+                    "objective": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_GOAL_OBJECTIVE_BYTES,
+                        "description": "Required only when operation is edit"
+                    }
+                },
+                "required": ["expected_revision", "operation"],
+                "additionalProperties": false
+            }),
+        )?,
+    ])
+}
+
 fn schema(
     name: &'static str,
     description: &'static str,
@@ -597,8 +818,24 @@ fn schema(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TOOL_CONTENT_BYTES, normalize_success};
-    use crate::tools::EMPTY_TEXT_BLOCK_JSON_BYTES;
+    use super::{MAX_TOOL_CONTENT_BYTES, build_goal_schemas, dispatch_goal, normalize_success};
+    use crate::{
+        agent::{ToolDispatchBinding, ToolExecutionRequest},
+        goal::GoalRuntime,
+        model::{CallId, ContentBlockKind, JsonValue},
+        tools::EMPTY_TEXT_BLOCK_JSON_BYTES,
+    };
+
+    fn goal_request(name: &str, arguments: serde_json::Value) -> ToolExecutionRequest {
+        let raw_arguments = serde_json::to_string(&arguments).unwrap();
+        ToolExecutionRequest::new(
+            CallId::new(format!("call-{name}")),
+            name.to_owned(),
+            raw_arguments,
+            JsonValue::new(arguments).unwrap(),
+            ToolDispatchBinding::new(),
+        )
+    }
 
     #[test]
     fn normalized_content_budget_accepts_the_exact_json_limit_and_rejects_one_more() {
@@ -616,6 +853,57 @@ mod tests {
         assert_eq!(
             rejected.error().map(|error| error.code.as_str()),
             Some("TOOL_OUTPUT_LIMIT")
+        );
+    }
+
+    #[test]
+    fn goal_tool_schemas_and_dispatch_are_closed_and_share_one_runtime() {
+        let schemas = build_goal_schemas().unwrap();
+        assert_eq!(
+            schemas
+                .iter()
+                .map(|schema| schema.name())
+                .collect::<Vec<_>>(),
+            ["get_goal", "create_goal", "update_goal"]
+        );
+        assert!(
+            schemas
+                .iter()
+                .all(|schema| { schema.parameters().as_value()["additionalProperties"] == false })
+        );
+
+        let goal = GoalRuntime::new();
+        let create = goal_request(
+            "create_goal",
+            serde_json::json!({ "objective": "finish the feature" }),
+        );
+        let created = dispatch_goal(Some(goal.clone()), &create).unwrap();
+        assert!(!created.is_error());
+        assert!(matches!(
+            created.content()[0].kind(),
+            ContentBlockKind::Text { text } if text.contains("\"revision\":1")
+        ));
+
+        let update = goal_request(
+            "update_goal",
+            serde_json::json!({
+                "expected_revision": 1,
+                "operation": "complete"
+            }),
+        );
+        let completed = dispatch_goal(Some(goal.clone()), &update).unwrap();
+        assert!(!completed.is_error());
+        assert!(matches!(
+            completed.content()[0].kind(),
+            ContentBlockKind::Text { text } if text.contains("\"phase\":\"complete\"")
+        ));
+
+        let invalid = goal_request("get_goal", serde_json::json!({ "unexpected": true }));
+        let rejected = dispatch_goal(Some(goal), &invalid).unwrap();
+        assert!(rejected.is_error());
+        assert_eq!(
+            rejected.error().map(|error| error.code.as_str()),
+            Some("INVALID_ARGS")
         );
     }
 }

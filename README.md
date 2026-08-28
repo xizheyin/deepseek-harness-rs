@@ -18,7 +18,7 @@
 </div>
 
 > [!WARNING]
-> `dsh` 当前是 `0.1.0-alpha.0` 预发布版本，源码安装候选已通过 Phase 0–10
+> `dsh` 当前是 `0.1.0-alpha.0` 预发布版本，源码安装候选已通过 Phase 0–11
 > 验收，但尚无受支持的稳定发行版、预编译包或 crates.io 发布。
 
 `dsh-rs` 是项目名，安装后的命令是 `dsh`。这是一个独立的社区开源项目，Agent 内核以固定版本的
@@ -73,6 +73,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 文件修改 | 严格的单文件 `apply_patch`，检查实际 diff、路径、符号链接和并发修改；默认审批，也可显式启用进程级 `auto-edit` |
 | 命令执行 | 经审批的前台 `bash`，可显式记住完全相同的本进程调用；限制输出和运行时间，并在正常可观察路径下终止、回收同进程组工作 |
 | 交互控制 | 实验性 Unicode 多行 Composer、忙时下一回合队列、动态 Dock、安全粘贴、6 套内置语义主题、可关闭的工作状态动画、源文本保持的有限表格、每个工具生命周期至多一张最终卡、回合收据、只读 Inspect/Review、审批、Ctrl+C 取消，以及严格线性后备 |
+| Goal 自动续跑（实验性） | `/goal` 设置一个本进程目标；空闲时顺序执行最多 32 个自动回合，模型可读取、编辑、暂停、完成或在连续三轮阻塞后停止 |
 | 脚本模式 | `--prompt` 或管道输入；不会停下来等待审批，并安全拒绝写文件或 Shell 请求 |
 | 长会话 | 有上限的本地 JSONL、会话列表与恢复，以及一次有界的自动上下文摘要 |
 | 本地工具插件（实验性） | 显式配置受信任的子进程工具；协议、队列、输出、超时和清理都有上限，交互调用仍需审批 |
@@ -96,6 +97,7 @@ dsh --workspace .
 | `/focus` | 仅增强界面：从详情返回默认 Focus |
 | `/theme [NAME]` | 查询或选择 `adaptive`、`midnight`、`paper`、`color-blind`、`high-contrast`、`mono`；线性界面始终保持纯文本 |
 | `/motion [full|reduced]` | 查询或切换本进程的增强界面动画；线性界面没有周期动画 |
+| `/goal [OBJECTIVE]` | 显示或创建本进程 Goal；还支持 `edit OBJECTIVE`、`pause`、`resume` 和 `clear` |
 | <kbd>Enter</kbd> | 空闲时发送；当前回合运行时加入下一回合 FIFO |
 | <kbd>Ctrl</kbd> + <kbd>J</kbd> | 在增强 Composer 中插入换行 |
 | 方向键、Home/End、Backspace/Delete | 按 Unicode 字素编辑；上下方向在边界浏览本进程已提交历史 |
@@ -104,6 +106,13 @@ dsh --workspace .
 | <kbd>Ctrl</kbd> + <kbd>C</kbd> | 取消当前回合，清理完成后继续当前会话 |
 | <kbd>Ctrl</kbd> + <kbd>D</kbd> | 安全结束会话 |
 | <kbd>Ctrl</kbd> + <kbd>Z</kbd> | 先清理当前回合再暂停；回到 Shell 后可用 `fg` 恢复 |
+
+Goal 适合“持续修完这一组问题”这类需要多轮推进的任务。创建后，`dsh` 会在没有待发送
+人工输入时自动生成下一轮；模型通过 `get_goal`、`create_goal` 和 `update_goal` 读取或
+更新状态。每轮仍走原有工具、审批、超时、会话和进程清理路径。按 <kbd>Ctrl</kbd>+
+<kbd>C</kbd> 会先取消当前轮并把 Goal 暂停，`/goal resume` 才会继续。首版状态只保留在
+当前进程，重启或 `--resume` 不会恢复或自动重放旧 Goal；目标最多自动运行 32 轮，也不
+支持图片附件或后台并行工作。
 
 默认情况下，文件修改、Shell 或插件执行前会显示完整预览和三项选择器。经过完整准备的
 内置 Shell 还会显示第四项 **Allow exact Shell for this process**。增强界面默认选中
@@ -145,7 +154,7 @@ Focus。首版不会从普通文字猜完整 diff、命令明细或执行时长�
 
 在增强 Focus 中，当整条单行草稿以 `/` 开头且光标位于末尾时，Dock 会显示封闭的
 本地命令面板：`/help`、`/inspect`、`/review`、`/focus`、`/theme`、`/motion`、
-`/exit` 和 `/quit`。方向键或 Tab/Shift+Tab 只移动选择，Enter 先补全；必须再按一次新的 Enter
+`/exit`、`/quit` 和 `/goal`。方向键或 Tab/Shift+Tab 只移动选择，Enter 先补全；必须再按一次新的 Enter
 才会执行。Esc 关闭面板但保留草稿，未知 `/...` 仍可作为普通提示词发送。模型运行时
 这些完整命令也只在本地处理，不进入下一回合队列或 Session；审批出现后则由默认
 Reject 的审批界面取得绝对优先权。线性后备继续使用整行命令，不显示动态面板。

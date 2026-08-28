@@ -1782,6 +1782,77 @@ fn input_typed_during_a_turn_is_queued_and_admitted_only_after_settlement() {
 }
 
 #[test]
+fn goal_command_runs_sequential_rounds_until_the_model_completes_it() {
+    let server = SequenceSseServer::start(vec![
+        text_sse("goal round one finished"),
+        tool_sse(
+            "call-goal-complete",
+            "update_goal",
+            serde_json::json!({
+                "expected_revision": 1,
+                "operation": "complete"
+            }),
+        ),
+        text_sse("goal is complete"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"/goal finish the bounded task\r");
+    dsh.expect(b"goal round one finished");
+    dsh.expect(b"goal is complete");
+    let settled = dsh.checkpoint();
+    dsh.write(b"/goal\r");
+    dsh.expect_after(settled, b"complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 3);
+    assert!(last_user_content(&requests[0]).contains("Round: 1/32"));
+    assert!(last_user_content(&requests[0]).contains("finish the bounded task"));
+    assert!(last_user_content(&requests[1]).contains("Round: 2/32"));
+    assert_eq!(
+        last_user_content(&requests[2]),
+        last_user_content(&requests[1])
+    );
+    let first = request_json(&requests[0]);
+    let names = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(names.ends_with(&["get_goal", "create_goal", "update_goal"]));
+}
+
+#[test]
+fn cancelling_a_goal_round_pauses_automatic_continuation() {
+    let partial =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"goal work started\"}}]}\n\n".to_owned();
+    let server = StalledSseServer::start(partial);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"/goal keep working until cancelled\r");
+    dsh.expect(b"goal work started");
+    dsh.write(b"\x03");
+    dsh.expect(b"stopped");
+    dsh.expect("❯".as_bytes());
+    let paused = dsh.checkpoint();
+    dsh.write(b"/goal\r");
+    dsh.expect_after(paused, b"paused");
+    let (status, _) = dsh.exit_cleanly();
+    let (request, closed) = server.finish();
+
+    assert!(status.success());
+    assert!(closed);
+    assert!(last_user_content(&request).contains("Round: 1/32"));
+}
+
+#[test]
 fn active_turn_paste_fence_requires_a_fresh_enter_before_queueing() {
     let first =
         concat!("data: {\"choices\":[{\"delta\":{\"content\":\"active paste busy\"}}]}\n\n")

@@ -3,6 +3,7 @@
 #![deny(unsafe_code)]
 
 mod entropy;
+mod goal;
 mod json_value;
 mod resident_credit;
 mod tui;

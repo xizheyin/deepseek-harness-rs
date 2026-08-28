@@ -8,6 +8,7 @@ use crate::{
         ShellPolicy, ToolExecutor,
     },
     entropy::EntropySource,
+    goal::GoalRuntime,
     model::LlmCallConfig,
     provider::{
         ModelProvider,
@@ -26,7 +27,7 @@ use super::{
     identity::new_session_id,
 };
 
-const SYSTEM_PROMPT: &str = "You are dsh, a coding agent working only through the supplied workspace tools. Use tools when they are useful. Never claim a file change or command completed unless its correlated tool result says it completed. This session has no sandbox, Skills, Hooks, or background-task feature.";
+const SYSTEM_PROMPT: &str = "You are dsh, a coding agent working only through the supplied workspace tools. Use tools when they are useful. Never claim a file change or command completed unless its correlated tool result says it completed. When a process-local Goal exists, use get_goal and settle it truthfully with update_goal; leave it active while useful work remains. This session has no sandbox, Skills, Hooks, or background-task feature.";
 
 pub(super) enum AgentAssembly {
     Script(AgentLoop),
@@ -41,6 +42,7 @@ pub(super) struct InteractiveAssembly {
     pub(super) session_id: String,
     pub(super) resumed: bool,
     pub(super) file_suggestions: WorkspaceFileCatalogue,
+    pub(super) goal: GoalRuntime,
 }
 
 pub(super) struct AssemblySession {
@@ -162,13 +164,19 @@ pub(super) async fn assemble_session(
     // workspace capability. No later UI path reopens the ambient pathname.
     let file_suggestions =
         interactive.then(|| WorkspaceFileCatalogue::from_authority(authority.clone()));
+    let goal = interactive.then(GoalRuntime::new);
 
     let registry = match plugin_config {
         Some(plugin_config) => {
-            LocalToolRegistry::from_authority_with_plugins(authority, plugin_config, cancellation)
-                .await
+            LocalToolRegistry::from_authority_with_plugins(
+                authority,
+                plugin_config,
+                cancellation,
+                goal.clone(),
+            )
+            .await
         }
-        None => LocalToolRegistry::from_authority(authority),
+        None => LocalToolRegistry::from_authority_with_goal(authority, goal.clone()),
     };
     let registry = match registry {
         Ok(registry) => Arc::new(registry),
@@ -212,6 +220,9 @@ pub(super) async fn assemble_session(
         let Some(file_suggestions) = file_suggestions else {
             return Err(AssemblyFailure::new(AssemblyError::Agent, session));
         };
+        let Some(goal) = goal else {
+            return Err(AssemblyFailure::new(AssemblyError::Agent, session));
+        };
         let (approval, approvals) = TerminalApprovalProvider::new();
         let (file_change_policy, shell_policy, plugin_policy) = interactive_policies(approval_mode);
         let config = config
@@ -234,6 +245,7 @@ pub(super) async fn assemble_session(
             session_id,
             resumed,
             file_suggestions,
+            goal,
         }))
     } else {
         let config = config

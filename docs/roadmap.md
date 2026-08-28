@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–11 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–12 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -18,7 +18,8 @@ for behavior that users can run today.
 | 8 | Local session continuity and one-pass automatic context compaction | `complete` | [`validation/phase-8.md`](validation/phase-8.md) |
 | 9 | v0.1 integration and release candidate | `complete` | [`validation/phase-9.md`](validation/phase-9.md) |
 | 10 | Bounded subprocess tool plugins and examples | `complete` | [`validation/phase-10.md`](validation/phase-10.md) |
-| 11 | TUI v2: semantic conversation UI, composer, dock, review, and accessibility | `in-progress` | [`validation/phase-11.md`](validation/phase-11.md) |
+| 11 | TUI v2: semantic conversation UI, composer, dock, review, and accessibility | `complete` | [`validation/phase-11.md`](validation/phase-11.md) |
+| 12 | Bounded same-process Goal automation | `complete` | [`validation/phase-12.md`](validation/phase-12.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -127,8 +128,13 @@ transaction without changing Session or Provider facts. Bare interactive
 confirmed ID to the existing recovery lifecycle. A local installed-binary
 journey now produces the overview, approval, and Review screenshots from real
 PTY bytes, and the same candidate passes the macOS/Ubuntu CI matrix.
-Real-emulator evidence and final independent review still prevent Phase 11
-completion.
+On 2026-08-28 the user explicitly changed the acceptance scope to local-only
+necessary verification so implementation could move to the next product gap.
+The installed-binary PTY acceptance, deterministic screenshots, 1,138-test
+local regression run, and already-green macOS/Ubuntu candidate matrix close
+Phase 11. Real-emulator capture, the optional remaining exact-limit checks, and
+a second final review stay as non-blocking hardening work; no emulator or
+pixel-compatibility claim is made.
 
 The user also requested less approval friction on 2026-08-26. The resulting
 green checkpoint is frozen in `docs/design/approval-modes.md`: explicit,
@@ -147,7 +153,30 @@ from Session. `Allow once`, default Reject, script Deny, plugin Ask, all
 workdir/process/resource checks, and the no-sandbox warning remain unchanged.
 Real enhanced and linear PTY journeys cover repeated calls, and a same-process
 Shell-then-plugin journey proves the grant cannot authorize a plugin. This is a
-completed checkpoint inside Phase 11, not a Phase 11 completion claim.
+completed checkpoint inside Phase 11.
+
+## Phase 12 Goal automation boundary (2026-08-28)
+
+The user explicitly selected official Goal behavior as the next gap and asked
+for rapid progress with local necessary validation only. Phase 12 adds one
+bounded Goal to the interactive process: `/goal` creates and manages it, the
+model can inspect and settle it through closed tools, and an active armed Goal
+queues sequential same-session rounds until completion, blocking, cancellation,
+or a fixed round cap.
+
+The first slice is deliberately process-local. Goal state is not restored after
+restarting or resuming `dsh`, Goal rounds carry a bounded generated text prompt,
+and image attachments are not supported. `Ctrl+C` cancels the current Goal
+round and pauses automatic continuation. Goal tools remain ordinary validated
+tools and do not gain filesystem, Shell, approval, or Session-writing authority.
+These differences and the fixed upstream evidence are recorded in
+`docs/design/goal-automation.md`.
+
+Acceptance is intentionally local: focused parser/state/tool tests, one real
+interactive auto-continuation journey, cancellation/cap coverage, format,
+all-target compilation, Clippy with warnings denied, and a whitespace check.
+The full repository suite and remote/cross-platform reruns are useful but do not
+block this user-directed fast checkpoint.
 
 ## Still deferred
 

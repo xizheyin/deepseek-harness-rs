@@ -951,21 +951,30 @@ completed successfully in 5 minutes 14 seconds, and Ubuntu job
 [`98853113335`](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/33172586814/job/98853113335)
 completed successfully in 6 minutes 6 seconds. Both ran repository checks,
 Phase 9 release acceptance, Phase 10 plugin acceptance, and the new installed
-Phase 11 journey. This is not yet a Phase 11 completion claim: a real terminal-
-emulator capture, final independent review, and the separate completion-status
-commit remain pending.
+Phase 11 journey. At that checkpoint this was not yet a completion claim: a
+real terminal-emulator capture, final independent review, and the separate
+completion-status commit remained pending.
 
 An attempted automated capture in macOS Terminal.app and iTerm2 was denied by
 the local Computer Use safety policy. No bypass was attempted, and the real-
 emulator item remains explicitly unrun rather than being inferred from PTY or
 deterministic-renderer evidence.
 
-## Evidence pending
+## Completion scope change — 2026-08-28
+
+The user subsequently requested local-only necessary validation and rapid
+progress to the next official feature gap. Phase 11 is therefore complete on
+the installed-binary PTY acceptance, deterministic screenshots, green local
+1,138-test regression run, and already-green macOS/Ubuntu candidate matrix
+recorded above. Real-emulator capture, the optional remaining exact-limit
+checks, and another independent final review are retained as hardening work,
+not completion gates. No real-emulator or pixel-compatibility claim is made.
+
+## Non-blocking hardening
 
 - exact-limit and one-over tests for remaining card/receipt/Dock fields and
   the Review activity/text and reasoning omission-step caps;
 - real terminal-emulator capture and final independent review;
 - final compatibility status and README truth audit.
 
-Phase 11 must remain `in-progress` until all of those fields are supported by a
-green, pushed candidate and a separate green status commit.
+These items do not block the user-approved Phase 11 completion boundary.

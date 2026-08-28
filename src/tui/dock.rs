@@ -762,7 +762,7 @@ fn push_command_lines(
         ));
         return Ok(());
     }
-    let width_cap = if columns < 60 { 3 } else { 8 };
+    let width_cap = if columns < 60 { 3 } else { 9 };
     let visible = count
         .min(width_cap)
         .min(usize::from(terminal_rows).saturating_sub(8));
@@ -1184,17 +1184,18 @@ mod tests {
                 24,
                 80,
                 vec![
-                    "/help", "/inspect", "/review", "/focus", "/theme", "/motion", "/exit", "/quit",
+                    "/help", "/inspect", "/review", "/focus", "/theme", "/motion", "/exit",
+                    "/quit", "/goal",
                 ],
             ),
             (
                 15,
                 80,
                 vec![
-                    "/inspect", "/review", "/focus", "/theme", "/motion", "/exit", "/quit",
+                    "/review", "/focus", "/theme", "/motion", "/exit", "/quit", "/goal",
                 ],
             ),
-            (12, 80, vec!["/theme", "/motion", "/exit", "/quit"]),
+            (12, 80, vec!["/motion", "/exit", "/quit", "/goal"]),
             (12, 44, vec!["/motion", "/exit", "/quit"]),
         ] {
             let frame = DockFrame::layout(

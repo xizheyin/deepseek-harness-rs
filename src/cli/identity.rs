@@ -34,13 +34,40 @@ pub(super) fn prepare_user_turn(
     session: &Session,
     prompt: &str,
 ) -> Result<PreparedUserTurn, IdentityError> {
+    prepare_turn(session, prompt, None)
+}
+
+pub(super) fn prepare_goal_turn(
+    session: &Session,
+    prompt: &str,
+    round: u32,
+) -> Result<PreparedUserTurn, IdentityError> {
+    prepare_turn(session, prompt, Some(round))
+}
+
+fn prepare_turn(
+    session: &Session,
+    prompt: &str,
+    goal_round: Option<u32>,
+) -> Result<PreparedUserTurn, IdentityError> {
     let start_seq = session
         .next_seq()
         .ok_or(IdentityError::SessionSequenceExhausted)?;
     let turn = session.state().next_turn();
     let content = ContentBlock::text(prompt).map_err(|_| IdentityError::InvalidUserMessage)?;
-    let source = MessageSource::user().map_err(|_| IdentityError::InvalidUserMessage)?;
-    let message = Message::user(format!("user-{turn}"), vec![content], source)
+    let source = match goal_round {
+        Some(round) => MessageSource::from_value(serde_json::json!({
+            "kind": "goal",
+            "round": round,
+        })),
+        None => MessageSource::user(),
+    }
+    .map_err(|_| IdentityError::InvalidUserMessage)?;
+    let message_id = goal_round.map_or_else(
+        || format!("user-{turn}"),
+        |round| format!("goal-{turn}-{round}"),
+    );
+    let message = Message::user(message_id, vec![content], source)
         .map_err(|_| IdentityError::InvalidUserMessage)?;
     Ok(PreparedUserTurn {
         start_seq,
@@ -58,7 +85,7 @@ mod tests {
         session::{EventKind, NewEvent, Session, TurnEndReason, TurnId},
     };
 
-    use super::{IdentityError, new_session_id, prepare_user_turn};
+    use super::{IdentityError, new_session_id, prepare_goal_turn, prepare_user_turn};
 
     fn zeroes(bytes: &mut [u8]) -> Result<(), EntropyError> {
         bytes.fill(0);
@@ -116,5 +143,17 @@ mod tests {
             panic!("a user prompt must enter the turn")
         };
         assert_eq!(messages[0].id().as_str(), "user-2");
+    }
+
+    #[test]
+    fn goal_round_has_a_distinct_recorded_source() {
+        let session = Session::new("goal-identity").unwrap();
+        let prepared = prepare_goal_turn(&session, "<goal_round>", 2).unwrap();
+        let TurnProposal::Enter(messages) = prepared.proposal else {
+            panic!("a Goal round must enter the turn")
+        };
+        assert_eq!(messages[0].id().as_str(), "goal-1-2");
+        assert_eq!(messages[0].source().raw().as_value()["kind"], "goal");
+        assert_eq!(messages[0].source().raw().as_value()["round"], 2);
     }
 }

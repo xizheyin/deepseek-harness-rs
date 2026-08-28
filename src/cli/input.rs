@@ -1,4 +1,7 @@
-use crate::tui::{motion::MotionCommand, theme::ThemeCommand};
+use crate::{
+    goal::{GoalCommand, GoalError},
+    tui::{motion::MotionCommand, theme::ThemeCommand},
+};
 
 pub(super) const MAX_INTERACTIVE_PROMPT_BYTES: usize = 1_000;
 pub(super) const MAX_APPROVAL_RECORD_BYTES: usize = 64;
@@ -95,6 +98,7 @@ pub(super) enum IdleInput {
     Review,
     Theme(ThemeCommand),
     Motion(MotionCommand),
+    Goal(Result<GoalCommand, GoalError>),
     Exit,
     Submit(String),
 }
@@ -106,6 +110,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     }
     if let Some(motion) = MotionCommand::parse(command) {
         return IdleInput::Motion(motion);
+    }
+    if let Some(goal) = GoalCommand::parse(command) {
+        return IdleInput::Goal(goal);
     }
     match command {
         "" => IdleInput::Redraw,

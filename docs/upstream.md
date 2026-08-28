@@ -1376,6 +1376,38 @@ difference. It leaves the durable outcome as the truthful first
 approval pair on a cache hit. The sealed identity, failure semantics, resource
 bound, and verification plan are frozen in `docs/design/approval-modes.md`.
 
+## Phase 12 Goal inspection — 2026-08-28
+
+The fixed baseline's Goal stack was inspected directly before designing the
+Rust implementation:
+
+- `packages/goal/command-goal/{README.md,src/index.ts,src/invariant.ts}` and
+  `tests/command-goal.spec.ts` define `/goal` show/create/edit/pause/resume/clear,
+  exact whole-input control-word parsing, refusal to replace an unfinished
+  Goal, and command output that is not model-visible;
+- `packages/goal/goal/{README.md,src/types.ts,src/fold.ts}` defines one durable
+  revisioned Goal with `active`, `paused`, `blocked`, and `complete` phases plus
+  process-local armed/disarmed activation;
+- `packages/goal/goal-round-driver/{README.md,src/index.ts,src/prompt.ts}` queues
+  sequential same-session `<goal_round>` user prompts while an active Goal is
+  armed, caps default continuation at 256 rounds, and stops automatic retry on
+  cancellation/failure;
+- `packages/goal/tool-goal/{README.md,src/index.ts}` exposes `get_goal`,
+  `create_goal`, and `update_goal`, including three-round blocking discipline.
+
+Latest `origin/master` was inspected read-only at
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Relative to the fixed commit, the
+material command/state addition is Goal image attachments. That change is
+recorded as a later gap because Rust currently accepts text terminal input only;
+the pinned compatibility baseline remains unchanged.
+
+Rust Phase 12 intentionally starts with process-local state, a smaller cap, one
+interactive `/goal` command family, `get_goal`/`create_goal`/`update_goal`, and
+the same ordinary Agent path for generated rounds. Durable `goal/change` events
+and cross-restart recovery remain outside this fast slice. The complete scope
+and failure analysis are in
+`docs/design/goal-automation.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:
