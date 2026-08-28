@@ -39,6 +39,7 @@ pub(crate) struct UserQuestionItem {
     header: Option<String>,
     question: String,
     options: Vec<UserQuestionOption>,
+    multi_select: bool,
 }
 
 impl UserQuestionItem {
@@ -53,7 +54,13 @@ impl UserQuestionItem {
             header,
             question,
             options,
+            multi_select: false,
         }
+    }
+
+    pub(crate) fn with_multi_select(mut self, multi_select: bool) -> Self {
+        self.multi_select = multi_select;
+        self
     }
 
     pub(crate) fn id(&self) -> &str {
@@ -70,6 +77,10 @@ impl UserQuestionItem {
 
     pub(crate) fn options(&self) -> &[UserQuestionOption] {
         &self.options
+    }
+
+    pub(crate) fn multi_select(&self) -> bool {
+        self.multi_select
     }
 }
 
@@ -91,7 +102,7 @@ impl UserQuestionRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UserQuestionAnswerItem {
     id: String,
-    selected: Option<String>,
+    selected: Vec<String>,
     custom: Option<String>,
 }
 
@@ -100,8 +111,8 @@ impl UserQuestionAnswerItem {
         &self.id
     }
 
-    pub(crate) fn selected(&self) -> Option<&str> {
-        self.selected.as_deref()
+    pub(crate) fn selected(&self) -> &[String] {
+        &self.selected
     }
 
     pub(crate) fn custom(&self) -> Option<&str> {
@@ -142,7 +153,12 @@ struct UserQuestionResponse {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum UserQuestionResponseItem {
     Selected(usize),
+    MultiSelected(Vec<usize>),
     Custom(String),
+    MultiCustom {
+        selected: Vec<usize>,
+        custom: String,
+    },
 }
 
 #[derive(Debug)]
@@ -217,25 +233,38 @@ impl UserQuestionBroker {
             .try_reserve_exact(questions.len())
             .map_err(|_| UserQuestionError::Unavailable)?;
         for (question, response) in questions.into_iter().zip(response_answers) {
-            let (selected, custom) = match response {
-                UserQuestionResponseItem::Selected(index) => (
-                    Some(
-                        question
-                            .options
-                            .get(index)
-                            .ok_or(UserQuestionError::InvalidResponse)?
-                            .label
-                            .clone(),
-                    ),
-                    None,
-                ),
+            let (selected_indices, custom) = match response {
+                UserQuestionResponseItem::Selected(index) => (vec![index], None),
+                UserQuestionResponseItem::MultiSelected(indices) => (indices, None),
                 UserQuestionResponseItem::Custom(custom) if custom_answer_is_valid(&custom) => {
-                    (None, Some(custom))
+                    (Vec::new(), Some(custom))
+                }
+                UserQuestionResponseItem::MultiCustom { selected, custom }
+                    if custom_answer_is_valid(&custom) =>
+                {
+                    (selected, Some(custom))
                 }
                 UserQuestionResponseItem::Custom(_) => {
                     return Err(UserQuestionError::InvalidResponse);
                 }
+                UserQuestionResponseItem::MultiCustom { .. } => {
+                    return Err(UserQuestionError::InvalidResponse);
+                }
             };
+            let mut selected = Vec::new();
+            selected
+                .try_reserve_exact(selected_indices.len())
+                .map_err(|_| UserQuestionError::Unavailable)?;
+            for index in selected_indices {
+                selected.push(
+                    question
+                        .options
+                        .get(index)
+                        .ok_or(UserQuestionError::InvalidResponse)?
+                        .label
+                        .clone(),
+                );
+            }
             answers.push(UserQuestionAnswerItem {
                 id: question.id,
                 selected,
@@ -248,9 +277,29 @@ impl UserQuestionBroker {
 
 fn response_is_valid(answer: &UserQuestionResponseItem, question: &UserQuestionItem) -> bool {
     match answer {
-        UserQuestionResponseItem::Selected(index) => *index < question.options.len(),
+        UserQuestionResponseItem::Selected(index) => {
+            !question.multi_select && *index < question.options.len()
+        }
+        UserQuestionResponseItem::MultiSelected(indices) => {
+            question.multi_select && indices_are_valid(indices, question)
+        }
         UserQuestionResponseItem::Custom(custom) => custom_answer_is_valid(custom),
+        UserQuestionResponseItem::MultiCustom { selected, custom } => {
+            question.multi_select
+                && custom_answer_is_valid(custom)
+                && indices_are_unique_and_in_range(selected, question)
+        }
     }
+}
+
+fn indices_are_valid(indices: &[usize], question: &UserQuestionItem) -> bool {
+    !indices.is_empty() && indices_are_unique_and_in_range(indices, question)
+}
+
+fn indices_are_unique_and_in_range(indices: &[usize], question: &UserQuestionItem) -> bool {
+    indices.iter().enumerate().all(|(position, index)| {
+        *index < question.options.len() && !indices[..position].contains(index)
+    })
 }
 
 pub(crate) fn custom_answer_is_valid(custom: &str) -> bool {
@@ -304,7 +353,7 @@ mod tests {
             .unwrap();
         let answer = future.await.unwrap();
         assert_eq!(answer.answers()[0].id(), "mode");
-        assert_eq!(answer.answers()[0].selected(), Some("Fast"));
+        assert_eq!(answer.answers()[0].selected(), ["Fast"]);
         assert_eq!(answer.answers()[0].custom(), None);
     }
 
@@ -325,9 +374,9 @@ mod tests {
             .unwrap();
         let answer = future.await.unwrap();
         assert_eq!(answer.answers()[0].id(), "first");
-        assert_eq!(answer.answers()[0].selected(), Some("Fast"));
+        assert_eq!(answer.answers()[0].selected(), ["Fast"]);
         assert_eq!(answer.answers()[1].id(), "second");
-        assert_eq!(answer.answers()[1].selected(), Some("Safe"));
+        assert_eq!(answer.answers()[1].selected(), ["Safe"]);
 
         let future = broker.ask(
             UserQuestionRequest::new(vec![item("first"), item("second")]),
@@ -394,7 +443,7 @@ mod tests {
             )])
             .unwrap();
         let answer = future.await.unwrap();
-        assert_eq!(answer.answers()[0].selected(), None);
+        assert!(answer.answers()[0].selected().is_empty());
         assert_eq!(answer.answers()[0].custom(), Some("只跑必要检查"));
     }
 
@@ -408,6 +457,64 @@ mod tests {
         ] {
             let (broker, mut receiver) = UserQuestionBroker::new();
             let future = broker.ask(request("mode"), CancellationToken::new());
+            tokio::pin!(future);
+            assert!(poll!(&mut future).is_pending());
+            assert_eq!(
+                receiver.try_recv().unwrap().answer(vec![response]),
+                Err(UserQuestionError::InvalidResponse)
+            );
+            assert_eq!(future.await, Err(UserQuestionError::Unavailable));
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_select_preserves_toggle_order_and_supplements_with_custom_text() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let question = item("targets").with_multi_select(true);
+        let future = broker.ask(
+            UserQuestionRequest::new(vec![question]),
+            CancellationToken::new(),
+        );
+        tokio::pin!(future);
+        assert!(poll!(&mut future).is_pending());
+        receiver
+            .try_recv()
+            .unwrap()
+            .answer(vec![UserQuestionResponseItem::MultiCustom {
+                selected: vec![1, 0],
+                custom: "release notes".to_owned(),
+            }])
+            .unwrap();
+        let answer = future.await.unwrap();
+        assert_eq!(answer.answers()[0].selected(), ["Fast", "Safe"]);
+        assert_eq!(answer.answers()[0].custom(), Some("release notes"));
+    }
+
+    #[tokio::test]
+    async fn broker_rejects_duplicate_empty_and_wrong_mode_selection_shapes() {
+        for (question, response) in [
+            (
+                item("multi").with_multi_select(true),
+                UserQuestionResponseItem::MultiSelected(Vec::new()),
+            ),
+            (
+                item("multi").with_multi_select(true),
+                UserQuestionResponseItem::MultiSelected(vec![0, 0]),
+            ),
+            (
+                item("multi").with_multi_select(true),
+                UserQuestionResponseItem::Selected(0),
+            ),
+            (
+                item("single"),
+                UserQuestionResponseItem::MultiSelected(vec![0, 1]),
+            ),
+        ] {
+            let (broker, mut receiver) = UserQuestionBroker::new();
+            let future = broker.ask(
+                UserQuestionRequest::new(vec![question]),
+                CancellationToken::new(),
+            );
             tokio::pin!(future);
             assert!(poll!(&mut future).is_pending());
             assert_eq!(

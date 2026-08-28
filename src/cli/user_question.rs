@@ -1,6 +1,6 @@
 use crate::user_question::{
-    MAX_CUSTOM_ANSWER_BYTES, UserQuestionEnvelope, UserQuestionItem, UserQuestionResponseItem,
-    custom_answer_is_valid,
+    MAX_CUSTOM_ANSWER_BYTES, MAX_QUESTION_OPTIONS, UserQuestionEnvelope, UserQuestionItem,
+    UserQuestionResponseItem, custom_answer_is_valid,
 };
 
 const MAX_SELECTION_RECORD_BYTES: usize = 16;
@@ -17,6 +17,7 @@ enum QuestionPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum QuestionAcceptingMode {
     Selection,
+    MultiSelection,
     Custom,
 }
 
@@ -24,6 +25,8 @@ pub(super) enum QuestionAcceptingMode {
 pub(super) enum QuestionInputUpdate {
     None,
     Selected(usize),
+    Toggled(usize),
+    MultiSubmitted,
     CustomRequested,
     CustomSubmitted(String),
     Cancelled,
@@ -42,6 +45,8 @@ pub(super) struct UserQuestionUiState {
     custom_record_oversized: bool,
     current_question: usize,
     answers: Vec<UserQuestionResponseItem>,
+    multi_selected: Vec<usize>,
+    multi_retry: bool,
 }
 
 impl Default for UserQuestionUiState {
@@ -56,6 +61,8 @@ impl Default for UserQuestionUiState {
             custom_record_oversized: false,
             current_question: 0,
             answers: Vec::new(),
+            multi_selected: Vec::new(),
+            multi_retry: false,
         }
     }
 }
@@ -68,6 +75,10 @@ impl UserQuestionUiState {
         self.answers.clear();
         self.answers
             .try_reserve_exact(envelope.request().questions().len())
+            .map_err(|_| ())?;
+        self.multi_selected.clear();
+        self.multi_selected
+            .try_reserve_exact(MAX_QUESTION_OPTIONS)
             .map_err(|_| ())?;
         self.active = Some(envelope);
         self.phase = QuestionPhase::Received { retry: false };
@@ -93,6 +104,23 @@ impl UserQuestionUiState {
 
     pub(super) fn custom_retry(&self) -> bool {
         matches!(self.phase, QuestionPhase::Custom { retry: true })
+    }
+
+    pub(super) fn is_multi_selecting(&self) -> bool {
+        self.phase == QuestionPhase::Selecting
+            && self
+                .current_item()
+                .is_some_and(UserQuestionItem::multi_select)
+    }
+
+    pub(super) fn multi_selected_mask(&self) -> u8 {
+        self.multi_selected
+            .iter()
+            .fold(0_u8, |mask, index| mask | (1_u8 << *index))
+    }
+
+    pub(super) fn multi_retry(&self) -> bool {
+        self.multi_retry
     }
 
     pub(super) fn frame_request(&self) -> Option<(&UserQuestionItem, bool, usize, usize)> {
@@ -130,14 +158,18 @@ impl UserQuestionUiState {
             return Err(());
         }
         self.clear_records();
-        let has_options = self
-            .active
-            .as_ref()
-            .and_then(|envelope| envelope.request().questions().get(self.current_question))
-            .is_some_and(|question| !question.options().is_empty());
+        let question = self.current_item().ok_or(())?;
+        let has_options = !question.options().is_empty();
+        let multi_select = question.multi_select();
+        self.multi_selected.clear();
+        self.multi_retry = false;
         if has_options {
             self.phase = QuestionPhase::Selecting;
-            Ok(QuestionAcceptingMode::Selection)
+            Ok(if multi_select {
+                QuestionAcceptingMode::MultiSelection
+            } else {
+                QuestionAcceptingMode::Selection
+            })
         } else {
             self.phase = QuestionPhase::Custom { retry: false };
             Ok(QuestionAcceptingMode::Custom)
@@ -174,6 +206,47 @@ impl UserQuestionUiState {
         self.advance_or_finish(UserQuestionResponseItem::Selected(index), question_count);
     }
 
+    pub(super) fn toggle(&mut self, index: usize) {
+        let valid = self.is_multi_selecting()
+            && self
+                .current_item()
+                .is_some_and(|question| index < question.options().len());
+        if !valid {
+            self.retry();
+            return;
+        }
+        if let Some(position) = self
+            .multi_selected
+            .iter()
+            .position(|selected| *selected == index)
+        {
+            self.multi_selected.remove(position);
+        } else {
+            self.multi_selected.push(index);
+        }
+        self.multi_retry = false;
+    }
+
+    pub(super) fn submit_multi(&mut self) -> bool {
+        if !self.is_multi_selecting()
+            || self.answers.len() != self.current_question
+            || self.multi_selected.is_empty()
+        {
+            self.multi_retry = true;
+            return false;
+        }
+        let question_count = self
+            .active
+            .as_ref()
+            .map_or(0, |envelope| envelope.request().questions().len());
+        let selected = std::mem::take(&mut self.multi_selected);
+        self.advance_or_finish(
+            UserQuestionResponseItem::MultiSelected(selected),
+            question_count,
+        );
+        true
+    }
+
     pub(super) fn begin_custom(&mut self) -> Result<(), ()> {
         if self.phase != QuestionPhase::Selecting {
             return Err(());
@@ -190,7 +263,22 @@ impl UserQuestionUiState {
             self.retry_custom();
             return false;
         }
+        let multi_select = self
+            .current_item()
+            .is_some_and(UserQuestionItem::multi_select);
         let trimmed = custom.trim();
+        if trimmed.is_empty() && multi_select && !self.multi_selected.is_empty() {
+            let question_count = self
+                .active
+                .as_ref()
+                .map_or(0, |envelope| envelope.request().questions().len());
+            let selected = std::mem::take(&mut self.multi_selected);
+            self.advance_or_finish(
+                UserQuestionResponseItem::MultiSelected(selected),
+                question_count,
+            );
+            return true;
+        }
         if !custom_answer_is_valid(trimmed) {
             self.retry_custom();
             return false;
@@ -205,12 +293,22 @@ impl UserQuestionUiState {
             .active
             .as_ref()
             .map_or(0, |envelope| envelope.request().questions().len());
-        self.advance_or_finish(UserQuestionResponseItem::Custom(retained), question_count);
+        let response = if multi_select && !self.multi_selected.is_empty() {
+            UserQuestionResponseItem::MultiCustom {
+                selected: std::mem::take(&mut self.multi_selected),
+                custom: retained,
+            }
+        } else {
+            UserQuestionResponseItem::Custom(retained)
+        };
+        self.advance_or_finish(response, question_count);
         true
     }
 
     fn advance_or_finish(&mut self, answer: UserQuestionResponseItem, question_count: usize) {
         self.answers.push(answer);
+        self.multi_selected.clear();
+        self.multi_retry = false;
         if self.answers.len() < question_count {
             self.current_question += 1;
             self.phase = QuestionPhase::Received { retry: false };
@@ -238,6 +336,9 @@ impl UserQuestionUiState {
     pub(super) fn retry(&mut self) {
         if self.is_custom() {
             self.retry_custom();
+        } else if self.is_multi_selecting() {
+            self.multi_retry = true;
+            self.clear_records();
         } else if self.active.is_some() {
             self.phase = QuestionPhase::Received { retry: true };
             self.clear_records();
@@ -262,15 +363,21 @@ impl UserQuestionUiState {
         if bytes.contains(&0x1b) {
             return QuestionInputUpdate::Cancelled;
         }
-        let option_count = self
-            .active
-            .as_ref()
-            .and_then(|envelope| envelope.request().questions().get(self.current_question))
-            .map_or(0, |question| question.options().len());
+        let Some(question) = self.current_item() else {
+            return QuestionInputUpdate::Invalid;
+        };
+        let option_count = question.options().len();
         for byte in bytes {
             if (b'1'..=b'5').contains(byte) {
                 let index = usize::from(*byte - b'1');
-                return classify_selection(index, option_count);
+                return classify_selection(index, option_count, question.multi_select());
+            }
+            if matches!(*byte, b'\r' | b'\n') && question.multi_select() {
+                return if self.multi_selected.is_empty() {
+                    QuestionInputUpdate::Invalid
+                } else {
+                    QuestionInputUpdate::MultiSubmitted
+                };
             }
             if !matches!(*byte, b'\r' | b'\n' | b' ' | b'\t') {
                 return QuestionInputUpdate::Invalid;
@@ -299,18 +406,25 @@ impl UserQuestionUiState {
                         .filter(|byte| !byte.is_ascii_whitespace())
                         .count()
                         == 1;
+                let blank = record.iter().all(u8::is_ascii_whitespace);
                 self.selection_record_len = 0;
+                let Some(question) = self.current_item() else {
+                    return QuestionInputUpdate::Invalid;
+                };
+                if blank && question.multi_select() {
+                    return if self.multi_selected.is_empty() {
+                        QuestionInputUpdate::Invalid
+                    } else {
+                        QuestionInputUpdate::MultiSubmitted
+                    };
+                }
                 let Some(digit) = digit.filter(|_| only_one) else {
                     return QuestionInputUpdate::Invalid;
                 };
-                let option_count = self
-                    .active
-                    .as_ref()
-                    .and_then(|envelope| envelope.request().questions().get(self.current_question))
-                    .map_or(0, |question| question.options().len());
+                let option_count = question.options().len();
                 if (b'1'..=b'5').contains(&digit) {
                     let index = usize::from(digit - b'1');
-                    return classify_selection(index, option_count);
+                    return classify_selection(index, option_count, question.multi_select());
                 }
                 return QuestionInputUpdate::Invalid;
             }
@@ -378,11 +492,26 @@ impl UserQuestionUiState {
         self.clear_records();
         self.current_question = 0;
         self.answers.clear();
+        self.multi_selected.clear();
+        self.multi_retry = false;
+    }
+
+    fn current_item(&self) -> Option<&UserQuestionItem> {
+        self.active
+            .as_ref()?
+            .request()
+            .questions()
+            .get(self.current_question)
     }
 }
 
-fn classify_selection(index: usize, option_count: usize) -> QuestionInputUpdate {
+fn classify_selection(
+    index: usize,
+    option_count: usize,
+    multi_select: bool,
+) -> QuestionInputUpdate {
     match index.cmp(&option_count) {
+        std::cmp::Ordering::Less if multi_select => QuestionInputUpdate::Toggled(index),
         std::cmp::Ordering::Less => QuestionInputUpdate::Selected(index),
         std::cmp::Ordering::Equal => QuestionInputUpdate::CustomRequested,
         std::cmp::Ordering::Greater => QuestionInputUpdate::Invalid,
@@ -433,7 +562,7 @@ mod tests {
         );
         assert_eq!(ui.feed(b"2", true), QuestionInputUpdate::Selected(1));
         ui.select(1);
-        assert_eq!(answer.await.unwrap().answers()[0].selected(), Some("Fast"));
+        assert_eq!(answer.await.unwrap().answers()[0].selected(), ["Fast"]);
     }
 
     #[tokio::test]
@@ -449,7 +578,7 @@ mod tests {
         assert_eq!(ui.feed(b"1", false), QuestionInputUpdate::None);
         assert_eq!(ui.feed(b"\n", false), QuestionInputUpdate::Selected(0));
         ui.select(0);
-        assert_eq!(answer.await.unwrap().answers()[0].selected(), Some("Safe"));
+        assert_eq!(answer.await.unwrap().answers()[0].selected(), ["Safe"]);
 
         let answer = broker.ask(request(), CancellationToken::new());
         tokio::pin!(answer);
@@ -492,9 +621,9 @@ mod tests {
 
         let answer = answer.await.unwrap();
         assert_eq!(answer.answers()[0].id(), "mode");
-        assert_eq!(answer.answers()[0].selected(), Some("Fast"));
+        assert_eq!(answer.answers()[0].selected(), ["Fast"]);
         assert_eq!(answer.answers()[1].id(), "tests");
-        assert_eq!(answer.answers()[1].selected(), Some("Safe"));
+        assert_eq!(answer.answers()[1].selected(), ["Safe"]);
 
         let answer = broker.ask(
             UserQuestionRequest::new(vec![
@@ -542,7 +671,7 @@ mod tests {
         );
         assert!(ui.submit_custom(" 只跑必要检查 ".to_owned()));
         let answer = answer.await.unwrap();
-        assert_eq!(answer.answers()[0].selected(), None);
+        assert!(answer.answers()[0].selected().is_empty());
         assert_eq!(answer.answers()[0].custom(), Some("只跑必要检查"));
 
         let answer = broker.ask(request(), CancellationToken::new());
@@ -591,5 +720,68 @@ mod tests {
             answer.await,
             Err(crate::user_question::UserQuestionError::Cancelled)
         );
+    }
+
+    #[tokio::test]
+    async fn multi_select_toggles_in_user_order_and_requires_a_nonempty_submit() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let answer = broker.ask(
+            UserQuestionRequest::new(vec![
+                item("targets", "What should I update?").with_multi_select(true),
+            ]),
+            CancellationToken::new(),
+        );
+        tokio::pin!(answer);
+        assert!(poll!(&mut answer).is_pending());
+        let mut ui = UserQuestionUiState::default();
+        ui.receive(receiver.try_recv().unwrap()).unwrap();
+        ui.mark_rendering().unwrap();
+        assert_eq!(
+            ui.begin_accepting().unwrap(),
+            QuestionAcceptingMode::MultiSelection
+        );
+        assert_eq!(ui.feed(b"\r", true), QuestionInputUpdate::Invalid);
+        ui.retry();
+        assert!(ui.multi_retry());
+        assert!(poll!(&mut answer).is_pending());
+
+        for index in [0, 1, 0, 0] {
+            assert_eq!(
+                ui.feed(&[b'1' + u8::try_from(index).unwrap()], true),
+                QuestionInputUpdate::Toggled(index)
+            );
+            ui.toggle(index);
+        }
+        assert_eq!(ui.multi_selected_mask(), 0b11);
+        assert_eq!(ui.feed(b"\r", true), QuestionInputUpdate::MultiSubmitted);
+        assert!(ui.submit_multi());
+        let answer = answer.await.unwrap();
+        assert_eq!(answer.answers()[0].selected(), ["Fast", "Safe"]);
+        assert_eq!(answer.answers()[0].custom(), None);
+    }
+
+    #[tokio::test]
+    async fn multi_select_custom_supplements_choices_and_blank_custom_keeps_them() {
+        for (custom, expected_custom) in [("release notes", Some("release notes")), ("  ", None)] {
+            let (broker, mut receiver) = UserQuestionBroker::new();
+            let answer = broker.ask(
+                UserQuestionRequest::new(vec![
+                    item("targets", "What should I update?").with_multi_select(true),
+                ]),
+                CancellationToken::new(),
+            );
+            tokio::pin!(answer);
+            assert!(poll!(&mut answer).is_pending());
+            let mut ui = UserQuestionUiState::default();
+            ui.receive(receiver.try_recv().unwrap()).unwrap();
+            ui.mark_rendering().unwrap();
+            ui.begin_accepting().unwrap();
+            ui.toggle(1);
+            ui.begin_custom().unwrap();
+            assert!(ui.submit_custom(custom.to_owned()));
+            let answer = answer.await.unwrap();
+            assert_eq!(answer.answers()[0].selected(), ["Fast"]);
+            assert_eq!(answer.answers()[0].custom(), expected_custom);
+        }
     }
 }

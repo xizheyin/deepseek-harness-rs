@@ -1542,6 +1542,26 @@ Rust Phase 19 retains one terminal answerer plus explicit count and byte limits;
 the exact implementation boundary is in
 `docs/design/user-question-custom.md`.
 
+## Phase 20 multi-select inspection — 2026-08-28
+
+The fixed `packages/interaction/tool-ask-user/src/index.ts` and
+`tests/tool-ask-user.spec.ts` were rechecked for `multi_select` forwarding and
+the exact compact projection of several selected labels plus optional custom
+text. The fixed `packages/interaction/user-questions/src/types.ts` permits both
+fields in one answer item.
+
+The fixed Web `QuestionComposer.tsx` toggles a selected label off when chosen
+again and appends it when reselected, so output order follows the current draft
+array. Multi-select custom input retains that array; a question is answerable
+when it has at least one selected label or nonblank custom text. The matching
+client test performs toggle-on/off/on, submits three labels plus custom text,
+and asserts one ordered batch envelope.
+
+Latest `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc` with the same model-facing result.
+Rust Phase 20 maps this behavior onto bounded terminal keys as specified in
+`docs/design/user-question-multi-select.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

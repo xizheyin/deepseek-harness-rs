@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–19 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–20 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -27,6 +27,7 @@ for behavior that users can run today.
 | 17 | Bounded interactive model-to-human question | `complete` | [`validation/phase-17.md`](validation/phase-17.md) |
 | 18 | Sequential bounded user-question batches | `complete` | [`validation/phase-18.md`](validation/phase-18.md) |
 | 19 | Bounded custom and option-free user answers | `complete` | [`validation/phase-19.md`](validation/phase-19.md) |
+| 20 | Bounded multi-select user questions | `complete` | [`validation/phase-20.md`](validation/phase-20.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -266,6 +267,25 @@ Multi-select, skip, plan-review presentation, product subagent routing, and a
 general answerer waterfall remain outside this phase. Design and local evidence
 live in `docs/design/user-question-custom.md` and
 `docs/validation/phase-19.md`.
+
+## Phase 20 multi-select boundary (2026-08-28)
+
+Phase 20 adds the official `multi_select: true` form to the existing bounded
+question batch. A numbered option toggles on or off without advancing; Enter
+submits after at least one choice. Choosing the custom entry opens the same
+bounded editor, and nonblank custom text supplements rather than replaces the
+selected labels.
+
+The terminal displays the selected option numbers in the active Dock, retains
+click order in the model-visible `selected` array, rejects duplicates and
+foreign indices at the broker boundary, and restores any next-turn draft after
+submit or cancellation. Linear mode uses one number per line to toggle and a
+blank line to submit.
+
+Skip, backward page navigation, plan-review presentation, product subagent
+routing, and a general answerer waterfall remain outside this phase. Design
+and local evidence live in `docs/design/user-question-multi-select.md` and
+`docs/validation/phase-20.md`.
 
 ## Still deferred
 

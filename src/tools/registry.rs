@@ -526,7 +526,7 @@ async fn prepare_user_question(
             "answers": answer.answers().iter().map(|answer| {
                 let mut value = json!({
                     "id": answer.id(),
-                    "selected": answer.selected().into_iter().collect::<Vec<_>>(),
+                    "selected": answer.selected(),
                 });
                 if let Some(custom) = answer.custom() {
                     value["custom"] = json!(custom);
@@ -592,14 +592,15 @@ fn parse_user_question_item(value: &serde_json::Value) -> ToolCallResult<UserQue
             "question received an unknown argument",
         ));
     }
-    if question
+    let multi_select = question
         .get("multi_select")
-        .is_some_and(|value| value.as_bool() != Some(false))
-    {
-        return Err(ToolCallError::invalid_args(
-            "multi_select must be false in this terminal version",
-        ));
-    }
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| ToolCallError::invalid_args("multi_select must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
     let id = bounded_question_text(question.get("id"), "id", MAX_QUESTION_ID_BYTES)?;
     let text = bounded_question_text(
         question.get("question"),
@@ -665,7 +666,7 @@ fn parse_user_question_item(value: &serde_json::Value) -> ToolCallResult<UserQue
             .transpose()?;
         options.push(UserQuestionOption::new(label, description));
     }
-    Ok(UserQuestionItem::new(id, header, text, options))
+    Ok(UserQuestionItem::new(id, header, text, options).with_multi_select(multi_select))
 }
 
 fn bounded_question_text(
@@ -1296,8 +1297,7 @@ fn build_user_question_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
                             },
                             "multi_select": {
                                 "type": "boolean",
-                                "enum": [false],
-                                "description": "This terminal version supports single-select only"
+                                "description": "When true, number keys toggle several choices and Enter submits them"
                             }
                         },
                         "required": ["id", "question"],
@@ -1406,9 +1406,10 @@ mod tests {
                 .iter()
                 .any(|field| field == "options")
         );
-        assert_eq!(
-            parameters["properties"]["questions"]["items"]["properties"]["multi_select"]["enum"],
-            serde_json::json!([false])
+        assert!(
+            parameters["properties"]["questions"]["items"]["properties"]["multi_select"]
+                .get("enum")
+                .is_none()
         );
 
         let valid = serde_json::json!({
@@ -1426,6 +1427,15 @@ mod tests {
         let parsed = parse_user_question_arguments(&valid).unwrap();
         assert_eq!(parsed.questions()[0].header(), Some("Choose mode"));
         assert_eq!(parsed.questions()[0].options()[1].label(), "Fast");
+        let multi = serde_json::json!({
+            "questions": [{
+                "id":"targets",
+                "question":"What should I update?",
+                "options":[{"label":"tests"},{"label":"docs"}],
+                "multi_select":true
+            }]
+        });
+        assert!(parse_user_question_arguments(&multi).unwrap().questions()[0].multi_select());
         for free_text in [
             serde_json::json!({ "questions": [{ "id": "detail", "question": "What should I do?" }] }),
             serde_json::json!({ "questions": [{ "id": "detail", "question": "What should I do?", "options": [] }] }),
@@ -1453,7 +1463,7 @@ mod tests {
             ] }),
             serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"Only"}] }] }),
             serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"Same"},{"label":"Same"}] }] }),
-            serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"A"},{"label":"B"}], "multi_select": true }] }),
+            serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"A"},{"label":"B"}], "multi_select": "yes" }] }),
             serde_json::json!({ "questions": [{ "id": " mode ", "question": "Choose?", "options": [{"label":"A"},{"label":"B"}] }] }),
             serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?\n", "options": [{"label":"A"},{"label":"B"}] }] }),
             serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"A"},{"label":"B","extra":true}] }] }),
@@ -1526,6 +1536,43 @@ mod tests {
         assert_eq!(
             text,
             r#"{"answers":[{"custom":"只跑必要检查","id":"detail","selected":[]}]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn user_question_returns_ordered_multi_select_labels_plus_custom_text() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let request = goal_request(
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{
+                    "id":"targets",
+                    "question":"What should I update?",
+                    "options":[{"label":"tests"},{"label":"docs"}],
+                    "multi_select":true
+                }]
+            }),
+        );
+        let future = prepare_user_question(Some(broker), &request, CancellationToken::new());
+        tokio::pin!(future);
+        assert!(poll!(&mut future).is_pending());
+        receiver
+            .try_recv()
+            .unwrap()
+            .answer(vec![UserQuestionResponseItem::MultiCustom {
+                selected: vec![1, 0],
+                custom: "release notes".to_owned(),
+            }])
+            .unwrap();
+        let ToolPreparation::Complete(result) = future.await.unwrap() else {
+            panic!("user question should settle as an ordinary result")
+        };
+        let ContentBlockKind::Text { text } = result.content()[0].kind() else {
+            panic!("user question should render compact JSON text")
+        };
+        assert_eq!(
+            text,
+            r#"{"answers":[{"custom":"release notes","id":"targets","selected":["docs","tests"]}]}"#
         );
     }
 

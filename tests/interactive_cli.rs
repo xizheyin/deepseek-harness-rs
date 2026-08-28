@@ -2430,6 +2430,136 @@ fn user_question_mixed_batch_keeps_choice_and_custom_answers_in_order() {
 }
 
 #[test]
+fn user_question_multi_select_toggles_and_returns_current_user_order() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-multi",
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{
+                    "id":"targets",
+                    "question":"What should I update?",
+                    "options":[
+                        {"label":"tests"},
+                        {"label":"docs"},
+                        {"label":"examples"}
+                    ],
+                    "multi_select":true
+                }]
+            }),
+        ),
+        text_sse("I received the selected targets."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask which targets to update\r");
+    dsh.expect(b"Press 1-3 to toggle");
+    dsh.expect(b"No options selected");
+    dsh.write(b"1");
+    dsh.expect(b"Selected options \xc2\xb7 1");
+    dsh.write(b"2");
+    dsh.expect(b"Selected options \xc2\xb7 1,2");
+    dsh.write(b"1");
+    dsh.expect(b"Selected options \xc2\xb7 2");
+    dsh.write(b"1");
+    dsh.expect(b"Selected options \xc2\xb7 1,2");
+    dsh.write(b"\r");
+    dsh.expect(b"I received the selected targets.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-multi"),
+        r#"{"answers":[{"id":"targets","selected":["docs","tests"]}]}"#
+    );
+}
+
+#[test]
+fn user_question_multi_select_custom_supplements_selected_labels() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-multi-custom",
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{
+                    "id":"targets",
+                    "question":"What should I update?",
+                    "options":[{"label":"tests"},{"label":"docs"}],
+                    "multi_select":true
+                }]
+            }),
+        ),
+        text_sse("I received labels and custom text."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask for targets and a custom addition\r");
+    dsh.expect(b"Press 1-2 to toggle");
+    dsh.write(b"1");
+    dsh.expect(b"Selected options \xc2\xb7 1");
+    dsh.write(b"3");
+    dsh.expect(b"Enter answer | Ctrl+J newline");
+    dsh.write(b"release notes\r");
+    dsh.expect(b"I received labels and custom text.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-multi-custom"),
+        r#"{"answers":[{"custom":"release notes","id":"targets","selected":["tests"]}]}"#
+    );
+}
+
+#[test]
+fn user_question_multi_select_escape_cancels_the_whole_question() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-multi-cancel",
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{
+                    "id":"targets",
+                    "question":"What should I update?",
+                    "options":[{"label":"tests"},{"label":"docs"}],
+                    "multi_select":true
+                }]
+            }),
+        ),
+        text_sse("The multi-select question was cancelled."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask for targets then cancel\r");
+    dsh.expect(b"Press 1-2 to toggle");
+    dsh.write(b"1");
+    dsh.expect(b"Selected options \xc2\xb7 1");
+    dsh.write(&[0x1b]);
+    dsh.expect(b"The multi-select question was cancelled.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-multi-cancel"),
+        "Error: ask_user_question was cancelled before the user answered"
+    );
+}
+
+#[test]
 fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
     let first_server = SequenceSseServer::start(vec![

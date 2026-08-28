@@ -1741,6 +1741,7 @@ async fn render_enhanced_dock(
             && !matches!(
                 model.interaction,
                 DockInteraction::QuestionCustom { .. }
+                    | DockInteraction::QuestionMulti { .. }
                     | DockInteraction::Approval(_)
                     | DockInteraction::ExactShellApproval(_)
             );
@@ -1836,6 +1837,7 @@ async fn render_active_dock(
             && !matches!(
                 interaction,
                 DockInteraction::QuestionCustom { .. }
+                    | DockInteraction::QuestionMulti { .. }
                     | DockInteraction::Approval(_)
                     | DockInteraction::ExactShellApproval(_)
             );
@@ -1967,6 +1969,7 @@ fn command_palette_interaction(
         && !matches!(
             interaction,
             DockInteraction::QuestionCustom { .. }
+                | DockInteraction::QuestionMulti { .. }
                 | DockInteraction::Approval(_)
                 | DockInteraction::ExactShellApproval(_)
         )
@@ -3359,6 +3362,11 @@ fn question_dock_interaction(
         DockInteraction::QuestionCustom {
             retry: question.custom_retry(),
         }
+    } else if question.is_multi_selecting() {
+        DockInteraction::QuestionMulti {
+            selected_mask: question.multi_selected_mask(),
+            retry: question.multi_retry(),
+        }
     } else {
         approval.dock_interaction()
     }
@@ -3738,7 +3746,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 let mode = question_ui
                     .begin_accepting()
                     .map_err(|_| InteractiveError::Agent)?;
-                if mode == QuestionAcceptingMode::Custom && active.enhanced {
+                if mode != QuestionAcceptingMode::Selection && active.enhanced {
                     active
                         .queued_input
                         .as_deref_mut()
@@ -4387,16 +4395,46 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
                                         dock_redraw_requested = active.enhanced;
                                     }
+                                    QuestionInputUpdate::Toggled(index) => {
+                                        question_ui.toggle(index);
+                                        active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                        if active.enhanced {
+                                            dock_redraw_requested = true;
+                                        } else {
+                                            enqueue_frame(
+                                                LiveFrame::user_question_multi_status(
+                                                    question_ui.multi_selected_mask(),
+                                                    false,
+                                                )
+                                                .map_err(|_| InteractiveError::Output)?,
+                                                AfterFrame::None,
+                                                &mut pending,
+                                                &mut frame_deadline,
+                                                &mut after_frame,
+                                            )?;
+                                        }
+                                    }
+                                    QuestionInputUpdate::MultiSubmitted => {
+                                        if question_ui.submit_multi() && active.enhanced {
+                                            restore_question_overlay(
+                                                active.queued_input.as_deref_mut(),
+                                            )?;
+                                        }
+                                        active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                        dock_redraw_requested = active.enhanced;
+                                    }
                                     QuestionInputUpdate::CustomRequested => {
                                         question_ui
                                             .begin_custom()
                                             .map_err(|_| InteractiveError::Agent)?;
                                         if active.enhanced {
-                                            active
+                                            let input = active
                                                 .queued_input
                                                 .as_deref_mut()
-                                                .ok_or(InteractiveError::Agent)?
-                                                .begin_question_overlay()?;
+                                                .ok_or(InteractiveError::Agent)?;
+                                            if !input.question_overlay_active() {
+                                                input.begin_question_overlay()?;
+                                            }
                                             active
                                                 .enhanced_decoder
                                                 .as_deref_mut()
@@ -4430,12 +4468,16 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
                                     }
                                     QuestionInputUpdate::Cancelled => {
+                                        restore_question_overlay(
+                                            active.queued_input.as_deref_mut(),
+                                        )?;
                                         question_ui.cancel();
                                         active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
                                         dock_redraw_requested = active.enhanced;
                                     }
                                     QuestionInputUpdate::Invalid => {
                                         let custom = question_ui.is_custom();
+                                        let multi = question_ui.is_multi_selecting();
                                         question_ui.retry();
                                         if custom && !active.enhanced {
                                             enqueue_frame(
@@ -4446,9 +4488,26 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                                 &mut frame_deadline,
                                                 &mut after_frame,
                                             )?;
+                                        } else if multi && !active.enhanced {
+                                            enqueue_frame(
+                                                LiveFrame::user_question_multi_status(
+                                                    question_ui.multi_selected_mask(),
+                                                    true,
+                                                )
+                                                .map_err(|_| InteractiveError::Output)?,
+                                                AfterFrame::None,
+                                                &mut pending,
+                                                &mut frame_deadline,
+                                                &mut after_frame,
+                                            )?;
+                                        } else if multi {
+                                            dock_redraw_requested = true;
                                         }
                                     }
                                     QuestionInputUpdate::Eof => {
+                                        restore_question_overlay(
+                                            active.queued_input.as_deref_mut(),
+                                        )?;
                                         question_ui.cancel();
                                         stop = Some(StopIntent::Eof);
                                         cancellation.cancel();
@@ -6090,6 +6149,7 @@ fn complete_ready_frame(
             && !matches!(
                 interaction,
                 DockInteraction::QuestionCustom { .. }
+                    | DockInteraction::QuestionMulti { .. }
                     | DockInteraction::Approval(_)
                     | DockInteraction::ExactShellApproval(_)
             );
@@ -6658,6 +6718,7 @@ async fn write_enhanced_terminal_frame(
             && !matches!(
                 model.interaction,
                 DockInteraction::QuestionCustom { .. }
+                    | DockInteraction::QuestionMulti { .. }
                     | DockInteraction::Approval(_)
                     | DockInteraction::ExactShellApproval(_)
             );

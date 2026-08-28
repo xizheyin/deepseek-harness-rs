@@ -35,6 +35,10 @@ pub(crate) enum DockInteraction {
     QuestionCustom {
         retry: bool,
     },
+    QuestionMulti {
+        selected_mask: u8,
+        retry: bool,
+    },
     Approval(DockApprovalSelection),
     ExactShellApproval(DockApprovalSelection),
 }
@@ -270,6 +274,7 @@ impl DockFrame {
                 DockInteraction::Idle
                 | DockInteraction::Running
                 | DockInteraction::QuestionCustom { .. }
+                | DockInteraction::QuestionMulti { .. }
                 | DockInteraction::Approval(_)
                 | DockInteraction::ExactShellApproval(_) => None,
             };
@@ -307,6 +312,15 @@ impl DockFrame {
                         width_usize,
                     ),
                 ));
+            } else if let DockInteraction::QuestionMulti {
+                selected_mask,
+                retry,
+            } = model.interaction
+            {
+                lines.push(line(
+                    DockRole::Queue,
+                    fit_ascii(&multi_select_status(selected_mask, retry), width_usize),
+                ));
             } else if let Some(notice) = model.notice {
                 let notice = render_visible_owned(notice, false)?;
                 lines.push(line(DockRole::Notice, truncate_cells(&notice, width_usize)));
@@ -336,6 +350,10 @@ impl DockFrame {
                     DockInteraction::QuestionCustom { retry: true } => {
                         "Answer required · 4 KiB maximum".to_owned()
                     }
+                    DockInteraction::QuestionMulti {
+                        selected_mask,
+                        retry,
+                    } => multi_select_status(selected_mask, retry),
                     DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_) => {
                         "Approval required".to_owned()
                     }
@@ -390,6 +408,10 @@ impl DockFrame {
                     DockInteraction::QuestionCustom { .. } if compact => "Enter · Esc",
                     DockInteraction::QuestionCustom { .. } => {
                         "Enter answer | Ctrl+J newline | Esc cancels question"
+                    }
+                    DockInteraction::QuestionMulti { .. } if compact => "Digits · Enter · Esc",
+                    DockInteraction::QuestionMulti { .. } => {
+                        "Number toggles | Enter submits | custom number opens text | Esc cancels"
                     }
                     DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_) => {
                         "Arrow keys move | Enter confirms | Esc stops"
@@ -594,6 +616,27 @@ impl DockFrame {
         }
         Ok(())
     }
+}
+
+fn multi_select_status(mask: u8, retry: bool) -> String {
+    if mask == 0 {
+        return if retry {
+            "Choose at least one option".to_owned()
+        } else {
+            "No options selected".to_owned()
+        };
+    }
+    let mut selected = String::from("Selected options · ");
+    for index in 0..4_u8 {
+        if mask & (1 << index) == 0 {
+            continue;
+        }
+        if !selected.ends_with(' ') {
+            selected.push(',');
+        }
+        selected.push(char::from(b'1' + index));
+    }
+    selected
 }
 
 fn working_status(presentation: WorkingPresentation) -> String {

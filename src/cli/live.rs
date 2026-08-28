@@ -410,14 +410,28 @@ impl LiveFrame {
         } else if enhanced {
             let mut hint = String::new();
             hint.try_reserve_exact(64).map_err(|_| LiveRenderError)?;
-            writeln!(
-                &mut hint,
-                "Press 1-{} to choose · {} opens custom text · Esc cancels",
-                request.options().len(),
-                request.options().len() + 1
-            )
-            .map_err(|_| LiveRenderError)?;
+            if request.multi_select() {
+                writeln!(
+                    &mut hint,
+                    "Press 1-{} to toggle · Enter submits · {} custom · Esc cancels",
+                    request.options().len(),
+                    request.options().len() + 1
+                )
+                .map_err(|_| LiveRenderError)?;
+            } else {
+                writeln!(
+                    &mut hint,
+                    "Press 1-{} to choose · {} opens custom text · Esc cancels",
+                    request.options().len(),
+                    request.options().len() + 1
+                )
+                .map_err(|_| LiveRenderError)?;
+            }
             parts.push(LivePart::TrustedOwned(hint));
+        } else if request.multi_select() {
+            parts.push(LivePart::TrustedLine(
+                "Type one option number per line to toggle; press Enter on an empty line to submit\n",
+            ));
         } else {
             parts.push(LivePart::TrustedLine(
                 "Type the option number and press Enter\n",
@@ -438,6 +452,29 @@ impl LiveFrame {
         } else {
             "Type your answer and press Enter\n"
         }));
+        Ok(Self { parts })
+    }
+
+    pub(super) fn user_question_multi_status(
+        selected_mask: u8,
+        retry: bool,
+    ) -> Result<Self, LiveRenderError> {
+        let mut text = if retry && selected_mask == 0 {
+            "[choose at least one option]\n".to_owned()
+        } else {
+            "[multi-select updated]\nSelected option numbers:".to_owned()
+        };
+        if selected_mask != 0 {
+            for index in 0..4_u8 {
+                if selected_mask & (1 << index) != 0 {
+                    write!(&mut text, " {}", index + 1).map_err(|_| LiveRenderError)?;
+                }
+            }
+            text.push('\n');
+        }
+        text.push_str("Toggle another number, or press Enter on an empty line to submit\n");
+        let mut parts = try_parts(1)?;
+        parts.push(LivePart::TrustedOwned(text));
         Ok(Self { parts })
     }
 }
