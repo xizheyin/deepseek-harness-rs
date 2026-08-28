@@ -5695,6 +5695,57 @@ fn foreground_shell_runs_only_after_the_confirmed_terminal_approval() {
 }
 
 #[test]
+fn background_shell_is_approved_started_and_collected_through_real_terminal_tools() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-background-shell",
+            "bash",
+            serde_json::json!({
+                "command": "sleep 0.05; printf terminal-background-ok",
+                "description": "produce delayed terminal background output",
+                "timeoutMs": 2000,
+                "run_in_background": true
+            }),
+        ),
+        tool_sse(
+            "call-background-output",
+            "job_output",
+            serde_json::json!({
+                "job_id": "bash-1",
+                "wait": true,
+                "timeout_ms": 2000
+            }),
+        ),
+        text_sse("background shell collected"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"run and collect the background command\r");
+    dsh.expect(b"tool | bash");
+    dsh.approval_ready();
+    dsh.write(b"y\r");
+    dsh.expect(b"[approval: allowed once]");
+    dsh.expect(b"[tool result: success]");
+    dsh.expect(b"tool | job_output");
+    dsh.expect(b"assistant | background shell collected");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-background-shell"),
+        "started background job bash-1"
+    );
+    let output = tool_message_content(&requests[2], "call-background-output");
+    assert!(output.contains("terminal-background-ok"));
+    assert!(output.contains("[status: completed, exit code: 0]"));
+}
+
+#[test]
 fn foreground_shell_spills_full_output_and_returns_its_private_locator_to_the_model() {
     let server = SequenceSseServer::start(vec![
         tool_sse(
@@ -5820,6 +5871,54 @@ fn exact_shell_process_choice_runs_a_normalized_repeat_without_a_second_prompt()
             .count(),
         2
     );
+}
+
+#[test]
+fn exact_background_shell_choice_reuses_only_the_same_detached_shape() {
+    let command = "printf x >> background-exact.txt";
+    let server = SequenceSseServer::start(vec![
+        two_tool_sse(
+            (
+                "call-background-exact-1",
+                "bash",
+                serde_json::json!({
+                    "command": command,
+                    "description": "first background display reason",
+                    "timeoutMs": 2000,
+                    "run_in_background": true
+                }),
+            ),
+            (
+                "call-background-exact-2",
+                "bash",
+                serde_json::json!({
+                    "command": command,
+                    "description": "second background display reason",
+                    "timeoutMs": 2000,
+                    "run_in_background": true
+                }),
+            ),
+        ),
+        text_sse("both background starts accepted"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("background-exact.txt");
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"start the exact background command twice\r");
+    dsh.approval_ready();
+    dsh.expect(b"Allow exact Shell");
+    dsh.write(b"\x1b[B");
+    dsh.expect(b"> Allow exact Shell");
+    dsh.write(b"\r");
+    dsh.expect(b"both background starts accepted");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "xx");
+    assert_eq!(server.finish().len(), 2);
 }
 
 #[test]

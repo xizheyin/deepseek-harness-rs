@@ -2283,3 +2283,43 @@ explicit prior-Session event targets and normally closed persisted journals.
 It accepts live-only availability as an empty search and adds finite array and
 string caps. Exact timestamp ordering is retained, then projected onto the
 integer-millisecond Session clock without widening the selected interval.
+
+## Phase 42 bounded background Shell jobs — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The following fixed-commit sources
+and tests were inspected before design or implementation:
+
+- `packages/jobs/jobs/src/{index,types}.ts` for registry ownership, monotonic
+  states, first settlement, non-consuming snapshots, consuming output reads,
+  wait and teardown contracts;
+- `packages/jobs/jobs-local/src/index.ts` and `tests/jobs.spec.ts` for
+  `<kind>-N` ids, ten-active default admission, owner-session fencing,
+  `running → stopping → terminal`, wait behavior and cancel/await cleanup;
+- `packages/jobs/tool-jobs/src/index.ts` and
+  `tests/tool-jobs.spec.ts` for `job_output`, `job_list`, `job_kill`, public
+  snapshots, status lines, 30-second default/ten-minute maximum wait and
+  completion delivery;
+- `packages/shell/tool-bash/src/{index,background}.ts` and
+  `tests/{tools,integration}.spec.ts` for `run_in_background`, approval before
+  start, cancellation before ownership handoff, background acknowledgement,
+  nonzero-exit classification, output reading, kill and full Agent-loop order;
+- the shipped base/CLI composition for the fact that the job runtime,
+  controller and Bash producer are ordinary first-party capabilities.
+
+The official Bash tool starts only after job admission and approval, returns
+`started background job bash-N`, detaches tool-call cancellation after the id
+is returned, and routes later list/read/kill operations through the owning
+Agent. Wait timeout leaves a job alive; owner/service teardown cancels and
+awaits it. Completed Shell work remains `completed` even with a nonzero exit.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Direct production diffs in
+`tool-jobs` and `tool-bash` only replace numeric prompt-section order with
+`FIRST_PARTY_SECTION_ORDER`; the schemas and job lifecycle are unchanged.
+
+Rust Phase 42 intentionally narrows the first delivery to one process-local
+Bash producer, eight active/64 retained jobs, the existing 295-second Shell
+timeout, final idempotent output and explicit collection. It does not yet
+reproduce incremental read cursors, idle wakeups/busy injection, multi-Agent
+owner fencing, persistence or other job producers.

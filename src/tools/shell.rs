@@ -22,6 +22,7 @@ use crate::{
 use super::{
     MAX_TOOL_CONTENT_BYTES,
     error::{ToolCallError, ToolCallResult, ToolRegistryBuildError},
+    jobs::BackgroundJobRuntime,
     json_string_content_bytes,
     process::{
         ProcessControl, ProcessLaunchPermit, ProcessOutcome, ProcessPrecheckError,
@@ -81,6 +82,8 @@ struct ShellArgumentsWire {
     timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_present")]
     workdir: Option<String>,
+    #[serde(rename = "run_in_background", default)]
+    run_in_background: bool,
 }
 
 /// Fully validated model-supplied shell arguments.
@@ -90,6 +93,7 @@ pub(crate) struct ShellArguments {
     description: String,
     timeout_ms: u64,
     workdir: String,
+    run_in_background: bool,
 }
 
 impl std::fmt::Debug for ShellArguments {
@@ -100,6 +104,7 @@ impl std::fmt::Debug for ShellArguments {
             .field("description_bytes", &self.description.len())
             .field("timeout_ms", &self.timeout_ms)
             .field("workdir_bytes", &self.workdir.len())
+            .field("run_in_background", &self.run_in_background)
             .finish()
     }
 }
@@ -123,6 +128,10 @@ impl ShellArguments {
 
     pub(crate) fn workdir(&self) -> &str {
         &self.workdir
+    }
+
+    pub(crate) fn run_in_background(&self) -> bool {
+        self.run_in_background
     }
 
     pub(crate) fn into_command(self) -> String {
@@ -176,6 +185,7 @@ pub(crate) fn parse_arguments(value: &Value) -> ToolCallResult<ShellArguments> {
         description: wire.description,
         timeout_ms,
         workdir,
+        run_in_background: wire.run_in_background,
     })
 }
 
@@ -312,6 +322,10 @@ pub(crate) fn schema() -> Result<ToolSchema, ToolRegistryBuildError> {
                 "minLength": 1,
                 "maxLength": 4096,
                 "description": "Workspace-contained directory; runtime maximum is 4096 UTF-8 bytes"
+            },
+            "run_in_background": {
+                "type": "boolean",
+                "description": "Run as a process-local background job and return a bash-N id immediately; collect it with job_output and stop it with job_kill"
             }
         },
         "required": ["command", "description"],
@@ -323,7 +337,7 @@ pub(crate) fn schema() -> Result<ToolSchema, ToolRegistryBuildError> {
     })?;
     ToolSchema::new(
         "bash",
-        "Run one bounded foreground Bash command in the retained workspace.",
+        "Run one bounded Bash command in the retained workspace. Set run_in_background for long work, then use job_output or job_kill with the returned id.",
         parameters,
     )
     .map_err(|source| ToolRegistryBuildError::InvalidSchema {
@@ -336,8 +350,13 @@ pub(crate) fn approval_prompt(
     arguments: &ShellArguments,
     workdir: &str,
 ) -> Result<ApprovalPrompt, ToolExecutorError> {
+    let mode = if arguments.run_in_background() {
+        "background (process-local; collected with job_output)"
+    } else {
+        "foreground"
+    };
     let preview = format!(
-        "Command:\n{}\n\nWorking directory: {workdir}\nTimeout: {}ms\nEnvironment: cleared; copied when present: {}; fixed overrides: {}",
+        "Command:\n{}\n\nMode: {mode}\nWorking directory: {workdir}\nTimeout: {}ms\nEnvironment: cleared; copied when present: {}; fixed overrides: {}",
         arguments.command(),
         arguments.timeout_ms(),
         COPIED_ENVIRONMENT_NAMES.join(", "),
@@ -719,6 +738,7 @@ pub(crate) fn finish_action(
     invocation: PreparedShellInvocation,
     environment: Arc<[(OsString, OsString)]>,
     runner: Arc<ProcessRunner>,
+    jobs: BackgroundJobRuntime,
 ) -> Result<PreparedToolAction, ToolExecutorError> {
     let prompt = approval_prompt(invocation.arguments(), invocation.workdir().display())?;
     let exact_shell_identity = build_exact_shell_identity(&invocation, &environment);
@@ -732,6 +752,7 @@ pub(crate) fn finish_action(
             invocation,
             environment,
             runner,
+            jobs,
             run_workdir,
             control,
         ))
@@ -757,6 +778,7 @@ fn build_exact_shell_identity(
 ) -> Option<ExactShellGrantIdentity> {
     build_exact_shell_identity_parts(
         invocation.arguments().command(),
+        invocation.arguments().run_in_background(),
         invocation.arguments().timeout_ms(),
         invocation.workdir().exact_shell_identity_fields(),
         environment,
@@ -765,6 +787,7 @@ fn build_exact_shell_identity(
 
 fn build_exact_shell_identity_parts(
     command: &str,
+    run_in_background: bool,
     timeout_ms: u64,
     workdir_identity: (&str, u64, u64, u64, u64),
     environment: &[(OsString, OsString)],
@@ -784,6 +807,7 @@ fn build_exact_shell_identity_parts(
     let mut encoded = Vec::new();
     push_identity_field(&mut encoded, DOMAIN)?;
     push_identity_field(&mut encoded, command.as_bytes())?;
+    push_identity_field(&mut encoded, &[u8::from(run_in_background)])?;
     push_identity_field(&mut encoded, &timeout_ms.to_be_bytes())?;
     let (workdir, root_dev, root_ino, workdir_dev, workdir_ino) = workdir_identity;
     push_identity_field(&mut encoded, workdir.as_bytes())?;
@@ -847,6 +871,7 @@ async fn run_prepared_action(
     invocation: PreparedShellInvocation,
     environment: Arc<[(OsString, OsString)]>,
     runner: Arc<ProcessRunner>,
+    jobs: BackgroundJobRuntime,
     workdir_display: String,
     control: crate::agent::ToolActionControl,
 ) -> crate::agent::ToolActionOutcome {
@@ -953,8 +978,10 @@ async fn run_prepared_action(
             return crate::agent::ToolActionOutcome::NotStarted { turn_stop, result };
         }
     };
+    let background = arguments.run_in_background();
+    let command = arguments.into_command();
     let request = match ProcessRequest::new(
-        arguments.into_command(),
+        command.clone(),
         ready.workdir,
         environment,
         command_timeout,
@@ -963,6 +990,55 @@ async fn run_prepared_action(
         Ok(request) => request,
         Err(_) => return crate::agent::ToolActionOutcome::Infrastructure { turn_stop },
     };
+    if background {
+        if outer_cancellation.is_cancelled() || tokio::time::Instant::now() >= turn_deadline {
+            let result = match pre_spawn_stop_result(
+                if outer_cancellation.is_cancelled() {
+                    ActionStop::Caller
+                } else {
+                    ActionStop::Turn
+                },
+                timeout_ms,
+                &workdir_display,
+            ) {
+                Ok(result) => result,
+                Err(_) => return crate::agent::ToolActionOutcome::Infrastructure { turn_stop },
+            };
+            return crate::agent::ToolActionOutcome::NotStarted { turn_stop, result };
+        }
+        let id = match jobs
+            .start_shell(
+                &command,
+                timeout_ms,
+                workdir_display.clone(),
+                request,
+                runner,
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(_) => {
+                let result = match shell_error_result(
+                    "JobError",
+                    "JOB_LIMIT",
+                    "the background job runtime could not accept this command",
+                    Some(timeout_ms),
+                    Some(&workdir_display),
+                ) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return crate::agent::ToolActionOutcome::Infrastructure { turn_stop };
+                    }
+                };
+                return crate::agent::ToolActionOutcome::NotStarted { turn_stop, result };
+            }
+        };
+        let result = match background_started_result(id, timeout_ms, workdir_display) {
+            Ok(result) => result,
+            Err(_) => return crate::agent::ToolActionOutcome::Infrastructure { turn_stop },
+        };
+        return crate::agent::ToolActionOutcome::StartedAndDetached { result };
+    }
     let process_control = ProcessControl::new(outer_cancellation, turn_deadline, action_deadline);
     map_process_outcome(
         runner.run(request, process_control).await,
@@ -1094,7 +1170,7 @@ fn process_start_failure_result(
     shell_error_result(name, code, message, Some(timeout_ms), Some(workdir))
 }
 
-fn process_report_result(
+pub(crate) fn process_report_result(
     report: ProcessReport,
     timeout_ms: u64,
     workdir: String,
@@ -1135,6 +1211,25 @@ fn process_report_result(
         stdout_truncated: report.stdout().truncated(),
         stderr_truncated: report.stderr().truncated(),
     })
+}
+
+fn background_started_result(
+    job_id: String,
+    timeout_ms: u64,
+    workdir: String,
+) -> Result<ToolExecutionResult, ToolExecutorError> {
+    let content = ContentBlock::text(format!("started background job {job_id}"))
+        .map_err(|_| ToolExecutorError::new("background shell acknowledgement failed"))?;
+    let meta = JsonValue::new(json!({
+        "kind": "background",
+        "started": true,
+        "jobId": job_id,
+        "timeoutMs": timeout_ms,
+        "workdir": workdir
+    }))
+    .map_err(|_| ToolExecutorError::new("background shell metadata failed"))?;
+    ToolExecutionResult::new(vec![content], false, None, Some(meta), false)
+        .map_err(|_| ToolExecutorError::new("background shell acknowledgement failed"))
 }
 
 fn map_primary(primary: ProcessPrimaryCause) -> ShellPrimary {
@@ -1637,7 +1732,7 @@ mod tests {
     };
     use crate::{
         agent::ToolDispatchBinding,
-        tools::{process::ProcessRunner, workspace::Workspace},
+        tools::{jobs::BackgroundJobRuntime, process::ProcessRunner, workspace::Workspace},
     };
 
     fn result_with(
@@ -1688,9 +1783,24 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.timeout_ms(), DEFAULT_SHELL_TIMEOUT_MS);
         assert_eq!(parsed.workdir(), ".");
+        assert!(!parsed.run_in_background());
         let prompt = approval_prompt(&parsed, ".").unwrap();
         assert!(prompt.preview().contains("PATH, HOME"));
         assert!(prompt.preview().contains("NO_COLOR, TERM, PAGER"));
+        assert!(prompt.preview().contains("Mode: foreground"));
+        let background = parse_arguments(&json!({
+            "command": "printf ok",
+            "description": "print one value",
+            "run_in_background": true
+        }))
+        .unwrap();
+        assert!(background.run_in_background());
+        assert!(
+            approval_prompt(&background, ".")
+                .unwrap()
+                .preview()
+                .contains("Mode: background")
+        );
 
         for invalid in [
             json!({"command": "printf bad"}),
@@ -1709,26 +1819,36 @@ mod tests {
     fn exact_shell_identity_covers_every_execution_field_and_not_display_reason() {
         let environment = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
         let build = |command: &str,
+                     background: bool,
                      timeout_ms: u64,
                      workdir: (&str, u64, u64, u64, u64),
                      environment: &[(OsString, OsString)]| {
-            build_exact_shell_identity_parts(command, timeout_ms, workdir, environment).unwrap()
+            build_exact_shell_identity_parts(command, background, timeout_ms, workdir, environment)
+                .unwrap()
         };
-        let baseline = build("printf ok", 25_000, (".", 1, 2, 1, 2), &environment);
+        let baseline = build("printf ok", false, 25_000, (".", 1, 2, 1, 2), &environment);
         assert_eq!(
             baseline,
-            build("printf ok", 25_000, (".", 1, 2, 1, 2), &environment)
+            build("printf ok", false, 25_000, (".", 1, 2, 1, 2), &environment)
         );
         for changed in [
-            build("printf  ok", 25_000, (".", 1, 2, 1, 2), &environment),
-            build("printf ok", 24_999, (".", 1, 2, 1, 2), &environment),
-            build("printf ok", 25_000, ("nested", 1, 2, 1, 2), &environment),
-            build("printf ok", 25_000, (".", 9, 2, 1, 2), &environment),
-            build("printf ok", 25_000, (".", 1, 9, 1, 2), &environment),
-            build("printf ok", 25_000, (".", 1, 2, 9, 2), &environment),
-            build("printf ok", 25_000, (".", 1, 2, 1, 9), &environment),
+            build("printf ok", true, 25_000, (".", 1, 2, 1, 2), &environment),
+            build("printf  ok", false, 25_000, (".", 1, 2, 1, 2), &environment),
+            build("printf ok", false, 24_999, (".", 1, 2, 1, 2), &environment),
             build(
                 "printf ok",
+                false,
+                25_000,
+                ("nested", 1, 2, 1, 2),
+                &environment,
+            ),
+            build("printf ok", false, 25_000, (".", 9, 2, 1, 2), &environment),
+            build("printf ok", false, 25_000, (".", 1, 9, 1, 2), &environment),
+            build("printf ok", false, 25_000, (".", 1, 2, 9, 2), &environment),
+            build("printf ok", false, 25_000, (".", 1, 2, 1, 9), &environment),
+            build(
+                "printf ok",
+                false,
                 25_000,
                 (".", 1, 2, 1, 2),
                 &[(OsString::from("PATH"), OsString::from("/different"))],
@@ -1741,7 +1861,7 @@ mod tests {
         // the process invocation. The real PTY test varies it and still hits.
         assert_eq!(
             baseline,
-            build("printf ok", 25_000, (".", 1, 2, 1, 2), &environment)
+            build("printf ok", false, 25_000, (".", 1, 2, 1, 2), &environment)
         );
     }
 
@@ -1769,6 +1889,7 @@ mod tests {
             super::PreparedShellInvocation { arguments, workdir },
             Arc::from([(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))]),
             Arc::new(ProcessRunner::open().unwrap()),
+            BackgroundJobRuntime::new(),
         )
         .unwrap();
 

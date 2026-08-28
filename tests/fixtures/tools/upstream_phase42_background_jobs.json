@@ -1,0 +1,41 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "paths": [
+      "packages/jobs/jobs/src/types.ts",
+      "packages/jobs/jobs-local/src/index.ts",
+      "packages/jobs/jobs-local/tests/jobs.spec.ts",
+      "packages/jobs/tool-jobs/src/index.ts",
+      "packages/jobs/tool-jobs/tests/tool-jobs.spec.ts",
+      "packages/shell/tool-bash/src/index.ts",
+      "packages/shell/tool-bash/src/background.ts",
+      "packages/shell/tool-bash/tests/tools.spec.ts",
+      "packages/shell/tool-bash/tests/integration.spec.ts"
+    ]
+  },
+  "tools": {
+    "bashBackgroundArgument": "run_in_background",
+    "startText": "started background job bash-1",
+    "controllers": ["job_output", "job_list", "job_kill"]
+  },
+  "lifecycle": {
+    "statuses": ["running", "stopping", "completed", "killed", "failed"],
+    "jobIdPattern": "<kind>-N",
+    "waitDoesNotCancel": true,
+    "killReturnsBeforeSettlement": true,
+    "nonzeroShellExitIsCompleted": true,
+    "ownerCleanupCancelsAndWaits": true
+  },
+  "rustBoundary": {
+    "producers": ["bash"],
+    "maximumActiveJobs": 8,
+    "maximumRetainedJobs": 64,
+    "maximumCommandTimeoutMs": 295000,
+    "defaultWaitMs": 30000,
+    "maximumWaitMs": 295000,
+    "incrementalOutput": false,
+    "completionWakeup": false,
+    "persistence": false
+  }
+}

@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–41 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–42 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -49,6 +49,7 @@ for behavior that users can run today.
 | 39 | Bounded exact navigation inside prior Session events | `complete` | [`validation/phase-39.md`](validation/phase-39.md) |
 | 40 | Bounded prior-Session lineage and event relationship traces | `complete` | [`validation/phase-40.md`](validation/phase-40.md) |
 | 41 | Bounded filters for prior-Session and event search | `complete` | [`validation/phase-41.md`](validation/phase-41.md) |
+| 42 | Bounded process-local background Shell jobs | `complete` | [`validation/phase-42.md`](validation/phase-42.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -880,11 +881,43 @@ live-preferred SQLite, indexes and Session export stay deferred. Acceptance is
 local-only: source fixture, parser/filter/rank/authorization/cancellation tests,
 one real filtered two-process CLI journey and the normal local Rust gates.
 
+## Phase 42 bounded background Shell job boundary (2026-08-29)
+
+Phase 42 adds the fixed upstream's `run_in_background`, `job_list`,
+`job_output` and `job_kill` names to the real CLI. A background Bash command
+still passes the existing closed parser, workspace preparation, Shell policy,
+human approval and final process preflight. Only then does ownership move to a
+process-local job registry and the ordinary correlated result returns a
+`bash-N` id.
+
+The registry admits at most eight live jobs and retains at most 64 records.
+Commands keep the existing 295-second maximum, fixed environment, 8 MiB
+observed-output stop, private spill and 64 KiB model-output bounds. Reads can
+wait up to 295 seconds without killing the job; cancellation of the read leaves
+work alive. `job_kill` requests process-group cancellation without another
+approval. Registry shutdown cancels and joins every live job before the CLI
+exits.
+
+Background mode is part of the sealed exact-Shell grant identity. A user who
+explicitly selects process-local exact reuse can therefore avoid a second
+prompt for the exact same detached shape after the first ownership ack is
+recorded, while foreground and background calls never share that authority.
+
+Rust intentionally supports final idempotent output only after settlement and
+does not implement upstream completion injection/idle wakeups. Jobs are not
+persisted or replayed, support only Bash in the one CLI process, and old ids
+become unknown after resume. Acceptance is local-only: fixed-source fixture;
+schema, parsing, approval, exact-grant mode, completion, wait cancellation,
+kill and shutdown cleanup tests; two real terminal journeys; and the normal
+local Rust gates. No real DeepSeek request, remote CI, public network or extra
+platform/stress matrix is required.
+
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
-- MCP, Hooks, ambient/remote Skills, subagents, and background jobs
+- MCP, Hooks, ambient/remote Skills, and subagents
+- Background-job completion wakeups, live incremental output, persistence, and non-Shell producers
 - LSP diagnostics, rename/symbol/call-hierarchy operations, session-query cursors and a persistent derived search index
 - Ambient/browser-derived time zones and configurable time-context refresh intervals
 - Multiple model providers

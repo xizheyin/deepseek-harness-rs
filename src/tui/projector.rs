@@ -1127,6 +1127,12 @@ fn summarize_arguments(
             .and_then(Value::as_str)
             .unwrap_or("command")
             .to_owned(),
+        "job_output" | "job_kill" => fields
+            .get("job_id")
+            .and_then(Value::as_str)
+            .unwrap_or("job")
+            .to_owned(),
+        "job_list" => "background jobs".to_owned(),
         "apply_patch" => "single-file patch".to_owned(),
         "str_replace_editor" => {
             let command = fields

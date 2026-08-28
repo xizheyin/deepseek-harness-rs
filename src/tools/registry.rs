@@ -37,6 +37,8 @@ use super::{
 };
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::jobs::{self, BackgroundJobRuntime};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::lsp::{self, LSP_TOOL_NAME, LspConfig, LspHost};
 #[cfg(unix)]
 use super::patch;
@@ -239,6 +241,7 @@ pub struct LocalToolRegistry {
     schemas: Arc<[ToolSchema]>,
     environment: ShellEnvironment,
     runner: Arc<ProcessRunner>,
+    jobs: BackgroundJobRuntime,
     plugins: Option<Arc<PluginHost>>,
     goal: Option<GoalRuntime>,
     plan_mode: Option<PlanModeRuntime>,
@@ -259,6 +262,7 @@ impl std::fmt::Debug for LocalToolRegistry {
             .field("schema_count", &self.schemas.len())
             .field("environment", &self.environment)
             .field("process_runner", &self.runner)
+            .field("background_jobs", &self.jobs)
             .field(
                 "plugin_count",
                 &self
@@ -331,6 +335,8 @@ impl LocalToolRegistry {
         );
         let mut schemas = build_workspace_schemas()?;
         schemas.push(shell::schema()?);
+        schemas.extend(jobs::schemas()?);
+        let jobs = BackgroundJobRuntime::new();
         if goal.is_some() {
             schemas.extend(build_goal_schemas()?);
         }
@@ -410,6 +416,7 @@ impl LocalToolRegistry {
             schemas: schemas.into(),
             environment,
             runner,
+            jobs,
             plugins: None,
             goal,
             plan_mode,
@@ -485,7 +492,13 @@ impl ToolExecutor for LocalToolRegistry {
     fn execution_mode(&self, tool_name: &str) -> ToolExecutionMode {
         if matches!(
             tool_name,
-            "read" | SKILL_TOOL_NAME | "web_search" | "web_fetch" | LSP_TOOL_NAME
+            "read"
+                | SKILL_TOOL_NAME
+                | "web_search"
+                | "web_fetch"
+                | LSP_TOOL_NAME
+                | jobs::JOB_LIST_TOOL_NAME
+                | jobs::JOB_OUTPUT_TOOL_NAME
         ) {
             ToolExecutionMode::Parallel
         } else {
@@ -580,6 +593,13 @@ impl ToolExecutor for LocalToolRegistry {
                     .await
             });
         }
+        if jobs::is_tool(request.name()) {
+            let jobs = self.jobs.clone();
+            return Box::pin(async move {
+                jobs.execute(request.name(), request.arguments().as_value(), cancellation)
+                    .await
+            });
+        }
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
         }
@@ -639,6 +659,7 @@ impl ToolExecutor for LocalToolRegistry {
         let workspace = Arc::clone(&self.workspace);
         let environment = self.environment.entries();
         let runner = Arc::clone(&self.runner);
+        let jobs = self.jobs.clone();
         let plugins = self.plugins.clone();
         let goal = self.goal.clone();
         let plan_mode = self.plan_mode.clone();
@@ -694,6 +715,12 @@ impl ToolExecutor for LocalToolRegistry {
                 };
                 return Ok(ToolPreparation::Complete(result));
             }
+            if jobs::is_tool(request.name()) {
+                let result = jobs
+                    .execute(request.name(), request.arguments().as_value(), cancellation)
+                    .await?;
+                return Ok(ToolPreparation::Complete(result));
+            }
             if request.name() == "apply_patch" {
                 return patch::prepare(
                     workspace.as_ref(),
@@ -724,7 +751,7 @@ impl ToolExecutor for LocalToolRegistry {
                     request,
                     workspace,
                     Box::new(move |dispatch, invocation| {
-                        shell::finish_action(dispatch, invocation, environment, runner)
+                        shell::finish_action(dispatch, invocation, environment, runner, jobs)
                     }),
                 );
             }
@@ -749,8 +776,10 @@ impl ToolExecutor for LocalToolRegistry {
     fn shutdown(&self) -> ToolShutdownFuture<'_> {
         let plugins = self.plugins.clone();
         let lsp = self.lsp.clone();
+        let jobs = self.jobs.clone();
         Box::pin(async move {
             let mut failed = false;
+            failed |= jobs.shutdown().await.is_err();
             if let Some(lsp) = lsp {
                 failed |= lsp.shutdown().await.is_err();
             }

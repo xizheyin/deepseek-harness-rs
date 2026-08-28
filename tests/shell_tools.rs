@@ -82,12 +82,15 @@ impl ScriptedProvider {
     }
 
     fn for_tool(tool_name: &str, arguments: &Value) -> Self {
+        Self::for_attempts(vec![
+            named_tool_response(tool_name, arguments),
+            text_response(),
+        ])
+    }
+
+    fn for_attempts(attempts: Vec<Vec<StreamChunk>>) -> Self {
         Self {
-            attempts: Mutex::new(
-                vec![named_tool_response(tool_name, arguments), text_response()]
-                    .into_iter()
-                    .collect(),
-            ),
+            attempts: Mutex::new(attempts.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
             dispatches: AtomicU64::new(0),
         }
@@ -416,7 +419,7 @@ fn assert_result_cites_call(session: &Session) {
 }
 
 #[test]
-fn local_registry_exposes_a_closed_foreground_bash_schema() {
+fn local_registry_exposes_background_bash_and_closed_job_schemas() {
     let workspace = TempWorkspace::new("schema");
     let registry = LocalToolRegistry::open(workspace.path()).unwrap();
     let oracle = phase6_oracle();
@@ -437,10 +440,19 @@ fn local_registry_exposes_a_closed_foreground_bash_schema() {
             "apply_patch",
             "todo_write",
             "skill",
-            "bash"
+            "bash",
+            "job_output",
+            "job_list",
+            "job_kill"
         ]
     );
-    let parameters = registry.schemas().last().unwrap().parameters().as_value();
+    let parameters = registry
+        .schemas()
+        .iter()
+        .find(|schema| schema.name() == "bash")
+        .unwrap()
+        .parameters()
+        .as_value();
     assert_eq!(parameters["type"], "object");
     assert_eq!(parameters["required"], json!(["command", "description"]));
     assert_eq!(parameters["additionalProperties"], false);
@@ -451,7 +463,13 @@ fn local_registry_exposes_a_closed_foreground_bash_schema() {
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        ["command", "description", "timeoutMs", "workdir"]
+        [
+            "command",
+            "description",
+            "run_in_background",
+            "timeoutMs",
+            "workdir"
+        ]
     );
     assert_eq!(
         parameters["properties"]["timeoutMs"],
@@ -465,6 +483,229 @@ fn local_registry_exposes_a_closed_foreground_bash_schema() {
     let upstream = &oracle["schemaSurface"]["foregroundOnly"]["modelSchema"]["parameters"];
     assert_eq!(upstream["properties"]["timeoutMs"]["type"], "number");
     assert!(upstream.get("additionalProperties").is_none());
+    let phase42: Value = serde_json::from_str(include_str!(
+        "fixtures/tools/upstream_phase42_background_jobs.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        phase42["tools"]["startText"],
+        "started background job bash-1"
+    );
+    assert_eq!(phase42["rustBoundary"]["maximumActiveJobs"], 8);
+}
+
+#[test]
+fn real_agent_starts_waits_for_and_collects_a_background_shell_job() {
+    let workspace = TempWorkspace::new("background-complete");
+    let registry = Arc::new(LocalToolRegistry::open(workspace.path()).unwrap());
+    let provider = Arc::new(ScriptedProvider::for_attempts(vec![
+        named_tool_response(
+            "bash",
+            &json!({
+                "command": "sleep 0.05; printf background-ok",
+                "description": "produce delayed background output",
+                "timeoutMs": 2000,
+                "run_in_background": true
+            }),
+        ),
+        named_tool_response(
+            "job_output",
+            &json!({ "job_id": "bash-1", "wait": true, "timeout_ms": 2000 }),
+        ),
+        text_response(),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(registry.schemas().to_vec())
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::new(
+        Session::new("shell-background-complete").unwrap(),
+        provider.clone(),
+        registry,
+        config,
+    )
+    .unwrap();
+
+    let session = runtime().block_on(async {
+        agent
+            .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+            .await
+            .unwrap();
+        agent.shutdown_into_session().await.unwrap()
+    });
+
+    assert_eq!(provider.dispatch_count(), 3);
+    let calls = session
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::ToolCall { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls, ["bash", "job_output"]);
+    let results = session
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::ToolResult { message, meta, .. } => {
+                let text = message.content().iter().find_map(|block| {
+                    block.tool_result_content()?.iter().find_map(|inner| {
+                        (inner["type"] == "text")
+                            .then(|| inner["text"].as_str().unwrap_or_default().to_owned())
+                    })
+                })?;
+                Some((text, meta.as_ref()?.as_value().clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results[0].0, "started background job bash-1");
+    assert_eq!(results[0].1["kind"], "background");
+    assert!(results[1].0.contains("background-ok"));
+    assert!(results[1].0.contains("[status: completed, exit code: 0]"));
+    assert_eq!(results[1].1["job"]["status"], "completed");
+}
+
+#[test]
+fn rejected_background_shell_never_creates_a_job_or_process() {
+    let workspace = TempWorkspace::new("background-rejected");
+    let registry = Arc::new(LocalToolRegistry::open(workspace.path()).unwrap());
+    let approval = Arc::new(RecordingApproval::new(ApprovalOutcome::Rejected));
+    let (session, _) = runtime().block_on(run_shell(
+        registry,
+        json!({
+            "command": "printf should-not-run > rejected-background",
+            "description": "reject one background command",
+            "run_in_background": true
+        }),
+        Some(ShellPolicy::Ask),
+        Some(approval.clone()),
+    ));
+
+    assert!(!workspace.path().join("rejected-background").exists());
+    assert_eq!(approval.requests().len(), 1);
+    assert!(
+        approval.requests()[0]
+            .preview()
+            .contains("Mode: background")
+    );
+    let result = result_facts(&session);
+    assert!(result.is_error);
+    assert_eq!(result.error_code.as_deref(), Some("APPROVAL_REJECTED"));
+}
+
+#[test]
+fn job_kill_stops_and_reaps_the_approved_process_group() {
+    let workspace = TempWorkspace::new("background-kill");
+    let registry = Arc::new(LocalToolRegistry::open(workspace.path()).unwrap());
+    let provider = Arc::new(ScriptedProvider::for_attempts(vec![
+        named_tool_response(
+            "bash",
+            &json!({
+                "command": "printf started > bg-started; trap 'printf cleaned > bg-cleaned; exit 0' TERM; while :; do sleep 0.05; done",
+                "description": "run one cancellable background process",
+                "timeoutMs": 5000,
+                "run_in_background": true
+            }),
+        ),
+        named_tool_response(
+            "job_output",
+            &json!({ "job_id": "bash-1", "wait": true, "timeout_ms": 200 }),
+        ),
+        named_tool_response(
+            "job_kill",
+            &json!({ "job_id": "bash-1", "reason": "test cleanup" }),
+        ),
+        named_tool_response(
+            "job_output",
+            &json!({ "job_id": "bash-1", "wait": true, "timeout_ms": 5000 }),
+        ),
+        text_response(),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(registry.schemas().to_vec())
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::new(
+        Session::new("shell-background-kill").unwrap(),
+        provider,
+        registry,
+        config,
+    )
+    .unwrap();
+
+    let session = runtime().block_on(async {
+        agent
+            .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+            .await
+            .unwrap();
+        agent.shutdown_into_session().await.unwrap()
+    });
+
+    assert!(workspace.path().join("bg-started").exists());
+    assert!(workspace.path().join("bg-cleaned").exists());
+    let texts = session
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::ToolResult { message, .. } => message.content().iter().find_map(|block| {
+                block.tool_result_content()?.iter().find_map(|inner| {
+                    (inner["type"] == "text")
+                        .then(|| inner["text"].as_str().unwrap_or_default().to_owned())
+                })
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts[0], "started background job bash-1");
+    assert!(texts[1].contains("[status: running]"));
+    assert_eq!(texts[2], "requested cancellation of job bash-1");
+    assert!(texts[3].contains("[status: killed"));
+}
+
+#[test]
+fn registry_shutdown_cancels_and_joins_a_live_background_job() {
+    let workspace = TempWorkspace::new("background-shutdown");
+    let registry = Arc::new(LocalToolRegistry::open(workspace.path()).unwrap());
+    let provider = Arc::new(ScriptedProvider::for_attempts(vec![
+        named_tool_response(
+            "bash",
+            &json!({
+                "command": "printf started > shutdown-started; trap 'printf cleaned > shutdown-cleaned; exit 0' TERM; while :; do sleep 0.05; done",
+                "description": "run until registry shutdown",
+                "timeoutMs": 5000,
+                "run_in_background": true
+            }),
+        ),
+        named_tool_response(
+            "job_output",
+            &json!({ "job_id": "bash-1", "wait": true, "timeout_ms": 200 }),
+        ),
+        text_response(),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(registry.schemas().to_vec())
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::new(
+        Session::new("shell-background-shutdown").unwrap(),
+        provider,
+        registry,
+        config,
+    )
+    .unwrap();
+
+    runtime().block_on(async {
+        agent
+            .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+            .await
+            .unwrap();
+        agent.shutdown_into_session().await.unwrap();
+    });
+
+    assert!(workspace.path().join("shutdown-started").exists());
+    assert!(workspace.path().join("shutdown-cleaned").exists());
 }
 
 #[test]
@@ -479,7 +720,7 @@ fn runtime_argument_parser_is_closed_and_never_starts_an_invalid_call() {
         json!({"command": command, "description": null}),
         json!({"command": command, "description": "invalid", "timeoutMs": null}),
         json!({"command": command, "description": "invalid", "timeoutMs": 1.5}),
-        json!({"command": command, "description": "invalid", "run_in_background": true}),
+        json!({"command": command, "description": "invalid", "run_in_background": "yes"}),
         json!({"command": "   ", "description": "invalid"}),
     ];
     for arguments in cases {

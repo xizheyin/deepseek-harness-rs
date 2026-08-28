@@ -560,7 +560,7 @@ impl PreparedToolAction {
     }
 }
 
-/// Definite lifecycle outcome of a sealed foreground action.
+/// Definite lifecycle outcome of a sealed action.
 pub(crate) enum ToolActionOutcome {
     NotStarted {
         turn_stop: ToolActionTurnStop,
@@ -571,6 +571,10 @@ pub(crate) enum ToolActionOutcome {
     },
     StartedAndQuiescent {
         turn_stop: ToolActionTurnStop,
+        result: ToolExecutionResult,
+    },
+    /// The action handed a live resource to another runtime that owns cleanup.
+    StartedAndDetached {
         result: ToolExecutionResult,
     },
     StartedOwnershipLost {
@@ -592,6 +596,44 @@ pub(crate) fn validate_action_started_result(
     validate_action_result(result, contract, true, false)
 }
 
+pub(crate) fn validate_action_detached_result(
+    result: &ToolExecutionResult,
+    contract: &ActionContract,
+) -> Result<(), ToolExecutorError> {
+    if contract != &ActionContract::Shell || result.is_error() {
+        return Err(ToolExecutorError::new(
+            "only a successful shell action may detach into the job runtime",
+        ));
+    }
+    let fields = result
+        .meta()
+        .and_then(|meta| meta.as_value().as_object())
+        .ok_or_else(|| ToolExecutorError::new("a detached action requires object metadata"))?;
+    let valid = fields.get("kind").and_then(serde_json::Value::as_str) == Some("background")
+        && fields.get("started").and_then(serde_json::Value::as_bool) == Some(true)
+        && fields
+            .get("jobId")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && fields
+            .get("timeoutMs")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|value| value > 0)
+        && fields
+            .get("workdir")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && !fields.contains_key("exitCode")
+        && !fields.contains_key("signal")
+        && !fields.contains_key("committed");
+    if !valid {
+        return Err(ToolExecutorError::new(
+            "a detached shell result has inconsistent ownership metadata",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn is_clean_exact_shell_result(result: &ToolExecutionResult) -> bool {
     if result.is_error() {
         return false;
@@ -604,6 +646,21 @@ pub(crate) fn is_clean_exact_shell_result(result: &ToolExecutionResult) -> bool 
         && fields.get("signal").is_some_and(serde_json::Value::is_null)
         && fields.get("timedOut").and_then(serde_json::Value::as_bool) == Some(false)
         && fields.get("aborted").and_then(serde_json::Value::as_bool) == Some(false)
+}
+
+pub(crate) fn is_owned_detached_shell_result(result: &ToolExecutionResult) -> bool {
+    if result.is_error() {
+        return false;
+    }
+    let Some(fields) = result.meta().and_then(|meta| meta.as_value().as_object()) else {
+        return false;
+    };
+    fields.get("kind").and_then(serde_json::Value::as_str) == Some("background")
+        && fields.get("started").and_then(serde_json::Value::as_bool) == Some(true)
+        && fields
+            .get("jobId")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
 }
 
 fn validate_action_result(

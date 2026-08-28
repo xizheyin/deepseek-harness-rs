@@ -2182,6 +2182,9 @@ fn tool_activity_notice(
         "edit" => "Requested  Edit",
         "str_replace_editor" => "Requested  Edit",
         "bash" => "Requested  Command",
+        "job_output" => "Requested  Job output",
+        "job_list" => "Requested  Jobs",
+        "job_kill" => "Requested  Stop job",
         "todo_write" => "Requested  Tasks",
         _ => "Tool requested",
     };
@@ -2221,6 +2224,9 @@ fn tool_approved_notice(
         "edit" => "Edit",
         "str_replace_editor" => "Edit",
         "bash" => "Command",
+        "job_output" => "Job output",
+        "job_list" => "Jobs",
+        "job_kill" => "Stop job",
         "todo_write" => "Tasks",
         _ => "Tool",
     };

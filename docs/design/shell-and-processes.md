@@ -1,5 +1,9 @@
 # Phase 6 shell and process-lifecycle design
 
+> Historical Phase 6 boundary: Phase 42 later adds a bounded process-local
+> background mode without weakening this document's foreground cleanup rules.
+> See `docs/design/background-shell-jobs.md` for the current extension.
+
 This document fixes the Phase 6 contract before production implementation.
 The goal is one foreground-only `bash` tool that is bounded and approval-gated.
 While the documented host ownership and observer contract remains valid, its

@@ -454,6 +454,9 @@ fn display_tool_name(tool: &ToolActivity) -> &str {
         "edit" => "Edit",
         "str_replace_editor" => "Edit",
         "bash" => "Command",
+        "job_output" => "Job output",
+        "job_list" => "Jobs",
+        "job_kill" => "Stop job",
         "todo_write" => "Tasks",
         name => name,
     }

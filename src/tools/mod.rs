@@ -4,6 +4,8 @@ mod arguments;
 mod error;
 mod glob;
 mod grep;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod jobs;
 mod list;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod lsp;

@@ -5035,6 +5035,27 @@ async fn resolve_action(
                 }
             }
         }
+        ToolActionOutcome::StartedAndDetached { result } => {
+            let stop = preserve_or_sample_tool_stop(latched_stop, cancellation, driver.deadline);
+            let result_fits_declared_bound = action_result_event_bytes(reservation, plan, &result)
+                .is_ok_and(|size| size <= maximum_result_bytes);
+            if tool::validate_action_detached_result(&result, &action_contract).is_err()
+                || !result_fits_declared_bound
+            {
+                ToolRun::ActionUnresolved { stop }
+            } else {
+                if stop == ToolStop::None && tool::is_owned_detached_shell_result(&result) {
+                    if let Some(digest) = shell_grant_candidate {
+                        driver.pending_shell_grant = Some(digest);
+                    }
+                }
+                ToolRun::Completed {
+                    result,
+                    settlement: ResultSettlement::PreferredRequired,
+                    stop,
+                }
+            }
+        }
     })
 }
 
