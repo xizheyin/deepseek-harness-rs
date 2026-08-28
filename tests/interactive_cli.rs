@@ -2268,6 +2268,56 @@ fn literal_editor_uses_the_normal_semantic_diff_approval_when_ask_is_active() {
 }
 
 #[test]
+fn official_edit_replace_all_uses_the_normal_semantic_diff_approval() {
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old and old\n").expect("test file should be created");
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-edit-all",
+            "edit",
+            serde_json::json!({
+                "file_path": "note.txt",
+                "old_string": "old",
+                "new_string": "new",
+                "replace_all": true
+            }),
+        ),
+        text_sse("approved edit finished"),
+    ]);
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"replace every exact match\r");
+    dsh.approval_ready();
+    dsh.expect(b"Proposed update");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old and old\n");
+    dsh.write(b"\x1b[A");
+    dsh.expect(b"> Allow once");
+    dsh.write(b"\r");
+    dsh.expect(b"Updated  note.txt");
+    dsh.expect(b"approved edit finished");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new and new\n");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-edit-all"),
+        "The file note.txt has been updated. All occurrences were successfully replaced."
+    );
+    let tools = request_json(&requests[0])["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for name in ["write", "edit"] {
+        assert!(tools.iter().any(|tool| tool["function"]["name"] == name));
+    }
+}
+
+#[test]
 fn user_question_selection_returns_the_displayed_label_and_continues_the_turn() {
     let server = SequenceSseServer::start(vec![
         tool_sse(

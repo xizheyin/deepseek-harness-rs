@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–33 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–34 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -41,6 +41,7 @@ for behavior that users can run today.
 | 31 | Advisory repeated-tool-call reminder | `complete` | [`validation/phase-31.md`](validation/phase-31.md) |
 | 32 | Fixed-upstream `str_replace_editor` file editing | `complete` | [`validation/phase-32.md`](validation/phase-32.md) |
 | 33 | Bounded private Shell output spill files | `complete` | [`validation/phase-33.md`](validation/phase-33.md) |
+| 34 | Fixed-upstream `write` and `edit` file tools | `complete` | [`validation/phase-34.md`](validation/phase-34.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -594,6 +595,39 @@ renderer/UI tests, real approved-Shell CLI output, cancellation/output-limit/
 failure cleanup cases, and the normal local Rust gates. No public network, real
 model call, remote CI, additional platform matrix, or large stress run is
 required.
+
+## Phase 34 fixed-upstream `write` and `edit` boundary (2026-08-29)
+
+Phase 34 adds the two remaining ordinary text-mutation names from the fixed
+official filesystem tool package. `write` creates or completely replaces one
+UTF-8 workspace file. `edit` performs one literal replacement by default and
+can replace every non-overlapping occurrence only when `replace_all: true` is
+explicit. Both schemas are closed and accept workspace-relative or
+inside-workspace absolute paths.
+
+Both tools reuse the existing prepared-mutation owner rather than introducing a
+second writer: retained workspace capability, safe text and size limits,
+complete canonical diff, default Ask or explicit process-local `auto-edit`,
+call-before-side-effect Session order, late conflict detection, atomic
+publication, truthful committed metadata, cancellation and trusted workspace-
+instruction refresh all remain unchanged. Direct executor calls cannot bypass
+preparation.
+
+The fixed official default observation policy refuses an overwrite or edit
+until that session has read the file. Rust intentionally does not add a second
+hidden read-version cache: it reads the complete bounded baseline while
+preparing the exact diff, asks the human by default, and revalidates that exact
+baseline immediately before publication. This keeps one authority owner and is
+stronger against changes during approval, but allows a human-approved blind
+overwrite that the official default policy rejects. Rust also keeps its
+workspace confinement, no-symlink/no-hardlink mutation rules and 16 MiB safe-
+text limit.
+
+Acceptance is local-only: a fixed source-attributed fixture, closed schema and
+parser tests, real Agent create/update/unique/replace-all journeys, rejection,
+stale/cancel/invalid/no-match/ambiguous cases, one real CLI approval journey,
+and the normal local Rust gates. No public network, real model call, remote CI,
+additional platform matrix or unrelated stress run is required.
 
 ## Still deferred
 

@@ -1901,6 +1901,32 @@ combined stop, workspace-only `read`, per-run directory, and captured-prefix
 wording at forced-stop boundaries are specified in
 `docs/design/shell-output-spill.md`.
 
+## Phase 34 `write` and `edit` inspection — 2026-08-29
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/fs/tool-fs/src/{write,edit,diff,error,session-cwd}.ts` for the two
+  closed schemas, argument defaults, exact success strings, canonical values,
+  contextual diff metadata, session-workspace resolution and error remedies;
+- `packages/fs/tool-fs/tests/{tools,integration}.spec.ts` for create, complete
+  overwrite, unique edit, deletion, explicit `replace_all`, no-match,
+  ambiguity, invalid arguments, observation policy, stale versions,
+  cancellation, per-session cwd and presentation behavior;
+- `packages/fs/{fs,fs-local,fs-observation-policy}` sources and tests for
+  literal non-overlapping matching, LF-normalized diff bases, line-ending
+  restoration, atomic publication, read-before-mutation policy and
+  current-version guards;
+- `apps/cli/config/agent-presets/code/agent.cordis.yml` and
+  `packages/bundle/base/cordis.patch.yml` for shipped code-preset registration.
+
+Latest inspected master `cd5ef8148158c3a752a658978873241fdf8e2bbc`
+retains both model-facing schemas, validation and result wording. Its relevant
+changes replace numeric prompt orders with named constants and rename tool-call
+IDs; they do not alter the file mutation contract. Phase 34 maps the tools onto
+Rust's existing capability-confined approval and atomic publication path, with
+the observation-policy and resource differences specified in
+`docs/design/write-edit-tools.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

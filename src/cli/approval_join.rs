@@ -314,7 +314,7 @@ impl ApprovalJoin {
                 ApprovalPreviewKind::CanonicalPatch(_)
             ) && !matches!(
                 asked.tool_name.as_str(),
-                "apply_patch" | "str_replace_editor"
+                "apply_patch" | "write" | "edit" | "str_replace_editor"
             ))
         {
             drop(envelope);

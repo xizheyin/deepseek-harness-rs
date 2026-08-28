@@ -317,6 +317,23 @@ async fn run_patch_with_provider(
     approval: Arc<dyn ApprovalProvider>,
     provider: Arc<ScriptedProvider>,
 ) -> Session {
+    run_patch_with_provider_and_cancellation(
+        workspace,
+        policy,
+        approval,
+        provider,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+async fn run_patch_with_provider_and_cancellation(
+    workspace: &Path,
+    policy: FileChangePolicy,
+    approval: Arc<dyn ApprovalProvider>,
+    provider: Arc<ScriptedProvider>,
+    cancellation: CancellationToken,
+) -> Session {
     let registry = Arc::new(WorkspaceToolRegistry::open(workspace).unwrap());
     let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
         .with_tools(registry.schemas().to_vec())
@@ -330,7 +347,7 @@ async fn run_patch_with_provider(
     )
     .unwrap();
     agent
-        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .run_turn(TurnProposal::Enter(vec![user()]), cancellation)
         .await
         .unwrap();
     agent.shutdown_into_session().await.unwrap()
@@ -343,11 +360,30 @@ async fn run_editor(
     policy: FileChangePolicy,
     approval: Arc<dyn ApprovalProvider>,
 ) -> Session {
-    let provider = Arc::new(ScriptedProvider::with_tool_response(
+    run_named_mutation(
+        workspace,
         call_id,
         "str_replace_editor",
         arguments,
-        "editor step finished",
+        policy,
+        approval,
+    )
+    .await
+}
+
+async fn run_named_mutation(
+    workspace: &Path,
+    call_id: &str,
+    tool_name: &str,
+    arguments: Value,
+    policy: FileChangePolicy,
+    approval: Arc<dyn ApprovalProvider>,
+) -> Session {
+    let provider = Arc::new(ScriptedProvider::with_tool_response(
+        call_id,
+        tool_name,
+        arguments,
+        "file mutation step finished",
     ));
     run_patch_with_provider(workspace, policy, approval, provider).await
 }
@@ -513,19 +549,30 @@ fn workspace_registry_keeps_the_fixed_editor_and_patch_schemas_before_todo_write
             "glob",
             "grep",
             "read",
+            "write",
+            "edit",
             "str_replace_editor",
             "apply_patch",
             "todo_write"
         ]
     );
-    let editor = registry.schemas()[4].parameters().as_value();
+    let write = registry.schemas()[4].parameters().as_value();
+    assert_eq!(write["required"], json!(["file_path", "content"]));
+    assert_eq!(write["additionalProperties"], false);
+    let edit = registry.schemas()[5].parameters().as_value();
+    assert_eq!(
+        edit["required"],
+        json!(["file_path", "old_string", "new_string"])
+    );
+    assert_eq!(edit["additionalProperties"], false);
+    let editor = registry.schemas()[6].parameters().as_value();
     assert_eq!(
         editor["properties"]["command"]["enum"],
         json!(["view", "create", "str_replace", "insert"])
     );
     assert_eq!(editor["required"], json!(["command", "path"]));
     assert_eq!(editor["additionalProperties"], false);
-    let parameters = registry.schemas()[5].parameters().as_value();
+    let parameters = registry.schemas()[7].parameters().as_value();
     assert_eq!(parameters["required"], json!(["patch"]));
     assert_eq!(parameters["additionalProperties"], false);
     assert_eq!(
@@ -536,6 +583,239 @@ fn workspace_registry_keeps_the_fixed_editor_and_patch_schemas_before_todo_write
             .collect::<Vec<_>>(),
         ["patch"]
     );
+}
+
+#[tokio::test]
+async fn fixed_write_edit_fixture_runs_create_overwrite_unique_and_all_through_the_agent() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/tools/upstream_phase34_write_edit.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture["schemaVersion"], 1);
+    assert_eq!(
+        fixture["upstream"]["commit"],
+        "47f943859bef60e4160492346772ded9b24f765a"
+    );
+    let workspace = TempWorkspace::new("write-edit-canonical");
+    let unavailable = || {
+        Arc::new(FixedApproval {
+            outcome: ApprovalOutcome::Unavailable,
+            mutate_before_answer: None,
+        }) as Arc<dyn ApprovalProvider>
+    };
+    let expected = |name: &str| {
+        fixture["canonical"][name]
+            .as_str()
+            .unwrap()
+            .replace("{path}", "sample.txt")
+    };
+
+    let create = run_named_mutation(
+        workspace.path(),
+        "write-create",
+        "write",
+        json!({ "file_path": "sample.txt", "content": "alpha one alpha two\n" }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_facts(&create).2, expected("writeCreated"));
+    assert_eq!(
+        rust_first_mutation_step_types(&create),
+        ["assistant/message", "tool/call", "tool/result", "step/end"]
+    );
+
+    let overwrite = run_named_mutation(
+        workspace.path(),
+        "write-update",
+        "write",
+        json!({ "file_path": "sample.txt", "content": "alpha one beta two\n" }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_facts(&overwrite).2, expected("writeUpdated"));
+
+    let unique = run_named_mutation(
+        workspace.path(),
+        "edit-one",
+        "edit",
+        json!({
+            "file_path": "sample.txt",
+            "old_string": "beta two",
+            "new_string": "alpha two"
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_facts(&unique).2, expected("editSingle"));
+
+    let all = run_named_mutation(
+        workspace.path(),
+        "edit-all",
+        "edit",
+        json!({
+            "file_path": "sample.txt",
+            "old_string": "alpha",
+            "new_string": "BETA",
+            "replace_all": true
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_facts(&all).2, expected("editAll"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("sample.txt")).unwrap(),
+        fixture["canonical"]["after"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn write_edit_failures_leave_the_workspace_unchanged_and_cancellation_settles() {
+    let workspace = TempWorkspace::new("write-edit-failures");
+    workspace.write("sample.txt", "same other same\n");
+    let unavailable = || {
+        Arc::new(FixedApproval {
+            outcome: ApprovalOutcome::Unavailable,
+            mutate_before_answer: None,
+        }) as Arc<dyn ApprovalProvider>
+    };
+
+    let missing = run_named_mutation(
+        workspace.path(),
+        "edit-missing",
+        "edit",
+        json!({
+            "file_path": "sample.txt",
+            "old_string": "absent",
+            "new_string": "new"
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_code(&missing), Some("FS_EDIT_NOT_FOUND"));
+
+    let ambiguous = run_named_mutation(
+        workspace.path(),
+        "edit-ambiguous",
+        "edit",
+        json!({
+            "file_path": "sample.txt",
+            "old_string": "same",
+            "new_string": "new"
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_code(&ambiguous), Some("FS_AMBIGUOUS_EDIT"));
+
+    let expansion_path = workspace.path().join("expansion.txt");
+    let expansion_before = "a".repeat(200);
+    fs::write(&expansion_path, &expansion_before).unwrap();
+    let expansion = run_named_mutation(
+        workspace.path(),
+        "edit-expansion",
+        "edit",
+        json!({
+            "file_path": "expansion.txt",
+            "old_string": "a",
+            "new_string": "x".repeat(100_000),
+            "replace_all": true
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_code(&expansion), Some("PATCH_TOO_LARGE"));
+    assert_eq!(
+        fs::read_to_string(expansion_path).unwrap(),
+        expansion_before
+    );
+
+    let denied_path = workspace.path().join("denied.txt");
+    let denied = run_named_mutation(
+        workspace.path(),
+        "write-denied",
+        "write",
+        json!({ "file_path": "denied.txt", "content": "blocked" }),
+        FileChangePolicy::Deny,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_code(&denied), Some("POLICY_DENIED"));
+    assert!(!denied_path.exists());
+
+    let rejected_path = workspace.path().join("rejected.txt");
+    let rejected = run_named_mutation(
+        workspace.path(),
+        "write-rejected",
+        "write",
+        json!({ "file_path": "rejected.txt", "content": "blocked" }),
+        FileChangePolicy::Ask,
+        Arc::new(FixedApproval {
+            outcome: ApprovalOutcome::Rejected,
+            mutate_before_answer: None,
+        }),
+    )
+    .await;
+    assert_eq!(result_code(&rejected), Some("APPROVAL_REJECTED"));
+    assert!(!rejected_path.exists());
+
+    let empty_path = workspace.path().join("empty.txt");
+    let empty = run_named_mutation(
+        workspace.path(),
+        "write-empty",
+        "write",
+        json!({ "file_path": "empty.txt", "content": "" }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert!(result_code(&empty).is_none());
+    assert_eq!(fs::read(&empty_path).unwrap(), b"");
+
+    let target = workspace.path().join("sample.txt");
+    let stale = run_named_mutation(
+        workspace.path(),
+        "edit-stale",
+        "edit",
+        json!({
+            "file_path": "sample.txt",
+            "old_string": "other",
+            "new_string": "changed"
+        }),
+        FileChangePolicy::Ask,
+        Arc::new(FixedApproval {
+            outcome: ApprovalOutcome::AllowedOnce,
+            mutate_before_answer: Some((target.clone(), "external\n".to_owned())),
+        }),
+    )
+    .await;
+    assert_eq!(result_code(&stale), Some("FILE_CONFLICT"));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "external\n");
+
+    let cancellation = CancellationToken::new();
+    let cancel_from_approval = cancellation.clone();
+    let provider = Arc::new(ScriptedProvider::with_tool_response(
+        "write-cancelled",
+        "write",
+        json!({ "file_path": "cancelled.txt", "content": "never" }),
+        "cancelled write finished",
+    ));
+    let cancelled = run_patch_with_provider_and_cancellation(
+        workspace.path(),
+        FileChangePolicy::Ask,
+        Arc::new(ActionApproval::new(move || cancel_from_approval.cancel())),
+        provider,
+        cancellation,
+    )
+    .await;
+    assert_eq!(result_code(&cancelled), Some("APPROVAL_CANCELLED"));
+    assert!(!workspace.path().join("cancelled.txt").exists());
 }
 
 #[tokio::test]

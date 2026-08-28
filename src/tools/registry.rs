@@ -44,6 +44,8 @@ use super::process::ProcessRunner;
 use super::shell::{self, ShellEnvironment};
 #[cfg(unix)]
 use super::str_replace_editor;
+#[cfg(unix)]
+use super::write_edit;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::agent::ToolClaimProfile;
 #[cfg(unix)]
@@ -117,8 +119,8 @@ impl ToolExecutor for ReadOnlyToolRegistry {
     }
 }
 
-/// Capability-bound catalogue containing the four read tools plus one
-/// approval-gated, two-stage `apply_patch` mutation tool.
+/// Capability-bound catalogue containing four read tools plus the closed
+/// approval-gated built-in text mutation tools.
 #[cfg(unix)]
 pub struct WorkspaceToolRegistry {
     workspace: Workspace,
@@ -438,6 +440,9 @@ impl ToolExecutor for LocalToolRegistry {
                 .into_execution_result()
             });
         }
+        if write_edit::is_tool(request.name()) {
+            return Box::pin(async move { write_edit::approval_required_result(request.name()) });
+        }
         if request.name() == str_replace_editor::TOOL_NAME {
             let workspace = Arc::clone(&self.workspace);
             return Box::pin(async move {
@@ -504,6 +509,15 @@ impl ToolExecutor for LocalToolRegistry {
             if request.name() == "apply_patch" {
                 return patch::prepare(
                     workspace.as_ref(),
+                    request.arguments().as_value(),
+                    &cancellation,
+                )
+                .await;
+            }
+            if write_edit::is_tool(request.name()) {
+                return write_edit::prepare(
+                    workspace.as_ref(),
+                    request.name(),
                     request.arguments().as_value(),
                     &cancellation,
                 )
@@ -619,6 +633,9 @@ impl ToolExecutor for WorkspaceToolRegistry {
                 .into_execution_result()
             });
         }
+        if write_edit::is_tool(request.name()) {
+            return Box::pin(async move { write_edit::approval_required_result(request.name()) });
+        }
         if request.name() == str_replace_editor::TOOL_NAME {
             let workspace = self.workspace.clone();
             return Box::pin(async move {
@@ -656,6 +673,15 @@ impl ToolExecutor for WorkspaceToolRegistry {
             if request.name() == "apply_patch" {
                 return patch::prepare(&workspace, request.arguments().as_value(), &cancellation)
                     .await;
+            }
+            if write_edit::is_tool(request.name()) {
+                return write_edit::prepare(
+                    &workspace,
+                    request.name(),
+                    request.arguments().as_value(),
+                    &cancellation,
+                )
+                .await;
             }
             if request.name() == str_replace_editor::TOOL_NAME {
                 return str_replace_editor::prepare(
@@ -1655,6 +1681,57 @@ fn build_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> {
 #[cfg(unix)]
 fn build_workspace_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> {
     let mut schemas = build_schemas()?;
+    schemas.push(schema(
+        write_edit::WRITE_TOOL_NAME,
+        "Create or fully replace one UTF-8 text file inside the workspace.",
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "Workspace-relative or inside-workspace absolute path."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Complete UTF-8 text content; an empty string writes an empty file."
+                }
+            },
+            "required": ["file_path", "content"],
+            "additionalProperties": false
+        }),
+    )?);
+    schemas.push(schema(
+        write_edit::EDIT_TOOL_NAME,
+        "Edit one existing UTF-8 workspace file by replacing literal text.",
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "Workspace-relative or inside-workspace absolute regular file path."
+                },
+                "old_string": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Non-empty literal text to replace."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Literal replacement text; use an empty string to delete the match."
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace every non-overlapping match; defaults to false, which requires exactly one match."
+                }
+            },
+            "required": ["file_path", "old_string", "new_string"],
+            "additionalProperties": false
+        }),
+    )?);
     schemas.push(schema(
         "str_replace_editor",
         "View, create, or edit one UTF-8 workspace file using an exact literal replacement or line insertion.",

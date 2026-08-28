@@ -96,7 +96,10 @@ impl ToolCardView {
             );
         }
 
-        if matches!(tool.name.as_str(), "apply_patch" | "str_replace_editor") {
+        if matches!(
+            tool.name.as_str(),
+            "apply_patch" | "write" | "edit" | "str_replace_editor"
+        ) {
             if let (Some(path), Some(operation), Some(committed)) = (
                 tool.patch_path.as_deref(),
                 tool.patch_operation,
@@ -446,6 +449,8 @@ fn display_tool_name(tool: &ToolActivity) -> &str {
         "grep" => "Search",
         "read" => "Read",
         "apply_patch" => "Patch",
+        "write" => "Write",
+        "edit" => "Edit",
         "str_replace_editor" => "Edit",
         "bash" => "Command",
         "todo_write" => "Tasks",

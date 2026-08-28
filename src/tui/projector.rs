@@ -788,7 +788,10 @@ impl UiProjector {
             .as_str()
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
         {
-            if matches!(tool.name.as_str(), "apply_patch" | "str_replace_editor") {
+            if matches!(
+                tool.name.as_str(),
+                "apply_patch" | "write" | "edit" | "str_replace_editor"
+            ) {
                 if let Some(facts) = patch_facts(&meta) {
                     tool.committed_effect = Some(facts.committed);
                     tool.patch_path = Some(bounded_summary(facts.path)?);
@@ -1105,6 +1108,11 @@ fn summarize_arguments(
             .unwrap_or(name)
             .to_owned(),
         "read" => fields
+            .get("file_path")
+            .and_then(Value::as_str)
+            .unwrap_or("file")
+            .to_owned(),
+        "write" | "edit" => fields
             .get("file_path")
             .and_then(Value::as_str)
             .unwrap_or("file")

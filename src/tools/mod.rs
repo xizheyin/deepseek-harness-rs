@@ -20,6 +20,8 @@ mod str_replace_editor;
 mod web_fetch;
 mod web_search;
 mod workspace;
+#[cfg(unix)]
+mod write_edit;
 
 pub use error::ToolRegistryBuildError;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -26,7 +26,7 @@ pub(crate) const MAX_PATCH_BYTES: usize = 256 * 1024;
 const MAX_PATCH_HUNKS: usize = 1_024;
 const MAX_PATCH_LINES: usize = 100_000;
 const MAX_PATCH_LINE_BYTES: usize = 64 * 1024;
-const MAX_MUTATION_FILE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MUTATION_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MUTATION_FILE_LINES: usize = 100_000;
 const MAX_MUTATION_FILE_LINE_BYTES: usize = 1024 * 1024;
 const MAX_CANONICAL_DIFF_JSON_BYTES: usize = 64 * 1024;
@@ -154,6 +154,93 @@ where
         Ok(generated) => generated,
         Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
     };
+    finish_generated_text_mutation(
+        target,
+        before,
+        generated,
+        display_path,
+        operation,
+        cancellation,
+    )
+}
+
+/// Prepare a full-file write by selecting create or update from one retained
+/// workspace capability, then reuse the ordinary mutation finalizer.
+pub(crate) async fn prepare_text_write(
+    workspace: &Workspace,
+    path: &str,
+    candidate: String,
+    create_success_message: String,
+    update_success_message: String,
+    cancellation: &CancellationToken,
+) -> Result<ToolPreparation, ToolExecutorError> {
+    if cancellation.is_cancelled() {
+        return ToolCallError::aborted()
+            .into_execution_result()
+            .map(ToolPreparation::Complete);
+    }
+    let resolved = match workspace.resolve(path) {
+        Ok(path) => path,
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    let display_path = resolved.display.clone();
+    let (target, operation) = match workspace
+        .prepare_mutation(
+            resolved.clone(),
+            WorkspaceMutationOperation::Update,
+            MAX_MUTATION_FILE_BYTES,
+            cancellation,
+        )
+        .await
+    {
+        Ok(target) => (target, WorkspaceMutationOperation::Update),
+        Err(error) if error.has_code("FILE_NOT_FOUND") => {
+            match workspace
+                .prepare_mutation(
+                    resolved,
+                    WorkspaceMutationOperation::Create,
+                    MAX_MUTATION_FILE_BYTES,
+                    cancellation,
+                )
+                .await
+            {
+                Ok(target) => (target, WorkspaceMutationOperation::Create),
+                Err(error) => {
+                    return error.into_execution_result().map(ToolPreparation::Complete);
+                }
+            }
+        }
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    let before = match normalize_existing_text(target.baseline().unwrap_or_default()) {
+        Ok(value) => value,
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    let success_message = match operation {
+        WorkspaceMutationOperation::Create => create_success_message,
+        WorkspaceMutationOperation::Update => update_success_message,
+    };
+    finish_generated_text_mutation(
+        target,
+        before,
+        GeneratedTextMutation {
+            candidate,
+            success_message,
+        },
+        display_path,
+        operation,
+        cancellation,
+    )
+}
+
+fn finish_generated_text_mutation(
+    target: PreparedWorkspaceMutation,
+    before: NormalizedText,
+    generated: GeneratedTextMutation,
+    display_path: String,
+    operation: WorkspaceMutationOperation,
+    cancellation: &CancellationToken,
+) -> Result<ToolPreparation, ToolExecutorError> {
     if let Err(error) = validate_file_text(&generated.candidate) {
         return error.into_execution_result().map(ToolPreparation::Complete);
     }

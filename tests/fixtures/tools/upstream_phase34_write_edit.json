@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "sources": [
+      "packages/fs/tool-fs/src/write.ts",
+      "packages/fs/tool-fs/src/edit.ts",
+      "packages/fs/tool-fs/tests/tools.spec.ts",
+      "packages/fs/tool-fs/tests/integration.spec.ts"
+    ]
+  },
+  "schemas": {
+    "writeRequired": ["file_path", "content"],
+    "editRequired": ["file_path", "old_string", "new_string"],
+    "replaceAllDefault": false
+  },
+  "canonical": {
+    "writeCreated": "<path>{path}</path>\n<type>file</type>\n<content>\nCreated file\n</content>",
+    "writeUpdated": "<path>{path}</path>\n<type>file</type>\n<content>\nUpdated file\n</content>",
+    "editSingle": "The file {path} has been updated successfully.",
+    "editAll": "The file {path} has been updated. All occurrences were successfully replaced.",
+    "after": "BETA one BETA two\n"
+  },
+  "errors": {
+    "invalidArgs": "INVALID_ARGS",
+    "noMatch": "FS_EDIT_NOT_FOUND",
+    "ambiguous": "FS_AMBIGUOUS_EDIT"
+  }
+}
