@@ -2,6 +2,7 @@
 
 use std::{
     collections::VecDeque,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -16,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{BackgroundJobNotice, JobNoticeInbox, ToolExecutionResult, ToolExecutorError},
-    model::{ContentBlock, ContentBlockKind, JsonValue, ToolSchema},
+    model::{ContentBlock, JsonValue, ToolSchema},
 };
 
 use super::{
@@ -24,10 +25,11 @@ use super::{
     error::{ToolCallError, ToolCallResult, ToolRegistryBuildError},
     json_string_content_bytes,
     process::{
-        ProcessControl, ProcessOutcome, ProcessPrimaryCause, ProcessRequest, ProcessRunner,
-        ProcessStartFailure, ProcessTermination,
+        ProcessControl, ProcessOutcome, ProcessOutputCursor, ProcessOutputRead, ProcessOutputTap,
+        ProcessPrimaryCause, ProcessRequest, ProcessRunner, ProcessStartFailure,
+        ProcessTermination, RETAINED_TAIL_BYTES,
     },
-    shell, text_block_encoded_bytes,
+    text_block_encoded_bytes,
 };
 
 pub(crate) const JOB_OUTPUT_TOOL_NAME: &str = "job_output";
@@ -73,7 +75,9 @@ struct JobRecord {
     label: String,
     status: JobStatus,
     detail: Option<String>,
-    output: String,
+    output_tap: ProcessOutputTap,
+    output_cursor: ProcessOutputCursor,
+    fallback_output: Option<String>,
     started_at: u64,
     finished_at: Option<u64>,
     cancellation: CancellationToken,
@@ -88,7 +92,6 @@ struct JobSnapshot {
     label: String,
     status: JobStatus,
     detail: Option<String>,
-    output: String,
     started_at: u64,
     finished_at: Option<u64>,
 }
@@ -170,10 +173,11 @@ impl BackgroundJobRuntime {
         &self,
         command: &str,
         timeout_ms: u64,
-        workdir: String,
         request: ProcessRequest,
         runner: Arc<ProcessRunner>,
     ) -> Result<String, ToolExecutorError> {
+        let output_tap = ProcessOutputTap::new(RETAINED_TAIL_BYTES);
+        let request = request.with_output_tap(output_tap.clone());
         let mut state = self.inner.state.lock().await;
         if state.closed {
             return Err(ToolExecutorError::new(
@@ -211,7 +215,9 @@ impl BackgroundJobRuntime {
             label: bounded_label(command),
             status: JobStatus::Running,
             detail: None,
-            output: String::new(),
+            output_tap,
+            output_cursor: ProcessOutputCursor::default(),
+            fallback_output: None,
             started_at: epoch_millis(),
             finished_at: None,
             cancellation: cancellation.clone(),
@@ -234,7 +240,7 @@ impl BackgroundJobRuntime {
                     .await
             });
             let completion = match worker.await {
-                Ok(outcome) => completion_from_process(outcome, timeout_ms, workdir),
+                Ok(outcome) => completion_from_process(outcome, timeout_ms),
                 Err(_) => JobCompletion::failed(
                     "background process monitor failed",
                     "Error: background process monitor failed",
@@ -257,7 +263,7 @@ impl BackgroundJobRuntime {
         }
         job.status = completion.status;
         job.detail = Some(completion.detail);
-        job.output = completion.output;
+        job.fallback_output = completion.fallback_output;
         job.finished_at = Some(epoch_millis());
         job.changed.send_replace(job.status);
         let notice =
@@ -325,27 +331,23 @@ impl BackgroundJobRuntime {
             Ok(args) => args,
             Err(error) => return error.into_execution_result(),
         };
-        let snapshot = if args.wait {
+        if args.wait {
             match self
                 .wait(&args.job_id, args.timeout_ms, &cancellation)
                 .await
             {
-                Ok(snapshot) => snapshot,
+                Ok(_) => {}
                 Err(error) => return error.into_execution_result(),
             }
-        } else {
-            match self.get(&args.job_id).await {
-                Ok(snapshot) => snapshot,
-                Err(error) => return error.into_execution_result(),
-            }
-        };
-        if snapshot.status.is_terminal() {
-            self.mark_reported(&snapshot.id).await;
         }
-        let body = if snapshot.output.is_empty() {
+        let (snapshot, delta) = match self.read(&args.job_id).await {
+            Ok(read) => read,
+            Err(error) => return error.into_execution_result(),
+        };
+        let body = if delta.is_empty() {
             "(no new output)"
         } else {
-            snapshot.output.as_str()
+            delta.as_str()
         };
         let separator = if body.ends_with('\n') { "" } else { "\n" };
         let suffix = format!("{separator}{}", snapshot.status_line());
@@ -413,13 +415,32 @@ impl BackgroundJobRuntime {
         expect_job(&state, id).map(snapshot)
     }
 
-    async fn mark_reported(&self, id: &str) {
+    async fn read(&self, id: &str) -> ToolCallResult<(JobSnapshot, String)> {
+        validate_job_id(id)?;
         let mut state = self.inner.state.lock().await;
-        if let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) {
+        let job = state
+            .jobs
+            .iter_mut()
+            .find(|job| job.id == id)
+            .ok_or_else(|| unknown_job(id))?;
+        let read = job.output_tap.read(&mut job.output_cursor);
+        let mut text = render_process_read(&read);
+        if let Some(fallback) = job.fallback_output.take() {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&fallback);
+        }
+        let terminal = job.status.is_terminal();
+        if terminal {
             job.reported = true;
         }
+        let snapshot = snapshot(job);
         drop(state);
-        self.inner.notices.suppress_job(id);
+        if terminal {
+            self.inner.notices.suppress_job(id);
+        }
+        Ok((snapshot, text))
     }
 
     async fn kill(&self, arguments: &Value) -> Result<ToolExecutionResult, ToolExecutorError> {
@@ -512,7 +533,6 @@ fn snapshot(job: &JobRecord) -> JobSnapshot {
         label: job.label.clone(),
         status: job.status,
         detail: job.detail.clone(),
-        output: job.output.clone(),
         started_at: job.started_at,
         finished_at: job.finished_at,
     }
@@ -530,7 +550,7 @@ fn expect_job<'a>(state: &'a JobState, id: &str) -> ToolCallResult<&'a JobRecord
 struct JobCompletion {
     status: JobStatus,
     detail: String,
-    output: String,
+    fallback_output: Option<String>,
 }
 
 impl JobCompletion {
@@ -538,24 +558,21 @@ impl JobCompletion {
         Self {
             status: JobStatus::Failed,
             detail: detail.into(),
-            output: output.into(),
+            fallback_output: Some(output.into()),
         }
     }
 }
 
-fn completion_from_process(
-    outcome: ProcessOutcome,
-    timeout_ms: u64,
-    workdir: String,
-) -> JobCompletion {
+fn completion_from_process(outcome: ProcessOutcome, timeout_ms: u64) -> JobCompletion {
     match outcome {
         ProcessOutcome::NotStarted { cause, .. } => {
             if cause == ProcessStartFailure::CallerCancelled {
                 return JobCompletion {
                     status: JobStatus::Killed,
                     detail: "cancelled before process creation".to_owned(),
-                    output: "Error: background shell was cancelled before process creation"
-                        .to_owned(),
+                    fallback_output: Some(
+                        "Error: background shell was cancelled before process creation".to_owned(),
+                    ),
                 };
             }
             JobCompletion::failed(
@@ -589,24 +606,50 @@ fn completion_from_process(
                 }
                 other => (JobStatus::Failed, primary_detail(other).to_owned()),
             };
-            let output = match shell::process_report_result(report, timeout_ms, workdir) {
-                Ok(result) => result
-                    .content()
-                    .iter()
-                    .find_map(|block| match block.kind() {
-                        ContentBlockKind::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "(no output)".to_owned()),
-                Err(_) => "Error: background shell result could not be normalized".to_owned(),
-            };
             JobCompletion {
                 status,
                 detail,
-                output,
+                fallback_output: None,
             }
         }
     }
+}
+
+fn render_process_read(read: &ProcessOutputRead) -> String {
+    let stdout = String::from_utf8_lossy(read.stdout());
+    let stderr = String::from_utf8_lossy(read.stderr());
+    let mut output = stdout.into_owned();
+    if !stderr.is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str("[stderr]\n");
+        output.push_str(&stderr);
+    }
+    if read.lossy() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        let paths = [read.stdout_spill(), read.stderr_spill()]
+            .into_iter()
+            .flatten()
+            .filter_map(Path::to_str)
+            .collect::<Vec<_>>();
+        let availability = if paths.is_empty() {
+            "(unavailable)".to_owned()
+        } else {
+            paths.join(", ")
+        };
+        let kind = if read.spill_is_full() {
+            "full output"
+        } else {
+            "captured output"
+        };
+        output.push_str(&format!(
+            "[some output was dropped from memory; {kind}: {availability}]"
+        ));
+    }
+    output
 }
 
 fn termination_detail(termination: ProcessTermination) -> String {
@@ -821,7 +864,7 @@ pub(crate) fn schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
     Ok([
         schema(
             JOB_OUTPUT_TOOL_NAME,
-            "Read a background job. Set wait to block until it settles or the bounded wait expires; waiting never cancels the job.",
+            "Read output produced by a background job since the previous read. Set wait to block until it settles or the bounded wait expires; waiting never cancels the job.",
             json!({
                 "type": "object",
                 "properties": {
@@ -890,9 +933,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        BackgroundJobRuntime, JobCompletion, JobRecord, JobStatus, MAX_JOB_WAIT_MS, bounded_label,
-        epoch_millis, fit_with_suffix, parse_empty, parse_kill, parse_output, schemas,
-        validate_job_id,
+        BackgroundJobRuntime, JobCompletion, JobRecord, JobStatus, MAX_JOB_WAIT_MS,
+        ProcessOutputCursor, ProcessOutputTap, RETAINED_TAIL_BYTES, ToolExecutionResult,
+        bounded_label, epoch_millis, fit_with_suffix, parse_empty, parse_kill, parse_output,
+        render_process_read, schemas, validate_job_id,
     };
     use crate::model::ContentBlock;
 
@@ -945,7 +989,9 @@ mod tests {
                 label: "test job".to_owned(),
                 status: JobStatus::Running,
                 detail: None,
-                output: String::new(),
+                output_tap: ProcessOutputTap::new(RETAINED_TAIL_BYTES),
+                output_cursor: ProcessOutputCursor::default(),
+                fallback_output: None,
                 started_at: epoch_millis(),
                 finished_at: None,
                 cancellation: job_cancellation.clone(),
@@ -993,14 +1039,17 @@ mod tests {
         );
     }
 
-    async fn insert_running(runtime: &BackgroundJobRuntime, id: &str) {
+    async fn insert_running(runtime: &BackgroundJobRuntime, id: &str) -> ProcessOutputTap {
+        let output_tap = ProcessOutputTap::new(RETAINED_TAIL_BYTES);
         let mut state = runtime.inner.state.lock().await;
         state.jobs.push_back(JobRecord {
             id: id.to_owned(),
             label: "pnpm test".to_owned(),
             status: JobStatus::Running,
             detail: None,
-            output: String::new(),
+            output_tap: output_tap.clone(),
+            output_cursor: ProcessOutputCursor::default(),
+            fallback_output: None,
             started_at: epoch_millis(),
             finished_at: None,
             cancellation: CancellationToken::new(),
@@ -1008,14 +1057,128 @@ mod tests {
             waiters: Arc::new(AtomicUsize::new(0)),
             reported: false,
         });
+        output_tap
     }
 
     fn completion() -> JobCompletion {
         JobCompletion {
             status: JobStatus::Completed,
             detail: "exit code: 0".to_owned(),
-            output: "ok".to_owned(),
+            fallback_output: None,
         }
+    }
+
+    fn result_text(result: &ToolExecutionResult) -> &str {
+        result
+            .content()
+            .iter()
+            .find_map(|block| match block.kind() {
+                crate::model::ContentBlockKind::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stream_reads_are_consuming_while_running_and_after_settlement() {
+        let runtime = BackgroundJobRuntime::new();
+        let output = insert_running(&runtime, "bash-1").await;
+        output.push_stdout(b"line one\n");
+
+        let first = runtime
+            .execute(
+                "job_output",
+                &json!({ "job_id": "bash-1" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result_text(&first), "line one\n[status: running]");
+        let empty = runtime
+            .execute(
+                "job_output",
+                &json!({ "job_id": "bash-1" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result_text(&empty), "(no new output)\n[status: running]");
+
+        output.push_stdout(b"tail");
+        output.push_stderr(b"problem\n");
+        runtime.finish("bash-1", completion()).await;
+        let terminal = runtime
+            .execute(
+                "job_output",
+                &json!({ "job_id": "bash-1" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result_text(&terminal),
+            "tail\n[stderr]\nproblem\n[status: completed, exit code: 0]"
+        );
+        let repeated = runtime
+            .execute(
+                "job_output",
+                &json!({ "job_id": "bash-1" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result_text(&repeated),
+            "(no new output)\n[status: completed, exit code: 0]"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_diagnostic_is_consumed_once() {
+        let runtime = BackgroundJobRuntime::new();
+        insert_running(&runtime, "bash-1").await;
+        runtime
+            .finish(
+                "bash-1",
+                JobCompletion::failed("spawn failed", "Error: background shell could not start"),
+            )
+            .await;
+
+        let first = runtime
+            .execute(
+                "job_output",
+                &json!({ "job_id": "bash-1" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result_text(&first),
+            "Error: background shell could not start\n[status: failed, spawn failed]"
+        );
+        let repeated = runtime
+            .execute(
+                "job_output",
+                &json!({ "job_id": "bash-1" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result_text(&repeated),
+            "(no new output)\n[status: failed, spawn failed]"
+        );
+    }
+
+    #[test]
+    fn lossy_split_utf8_tail_is_safe_and_explicit() {
+        let output = ProcessOutputTap::new(2);
+        let mut cursor = ProcessOutputCursor::default();
+        output.push_stdout("界".as_bytes());
+        let rendered = render_process_read(&output.read(&mut cursor));
+        assert!(rendered.contains('\u{fffd}'));
+        assert!(rendered.contains("some output was dropped from memory"));
+        assert!(rendered.contains("full output: (unavailable)"));
     }
 
     #[tokio::test]

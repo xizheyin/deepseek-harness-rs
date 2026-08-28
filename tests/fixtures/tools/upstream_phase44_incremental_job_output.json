@@ -1,0 +1,39 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "paths": [
+      "packages/jobs/jobs/src/types.ts",
+      "packages/jobs/jobs/src/index.ts",
+      "packages/jobs/jobs-local/src/index.ts",
+      "packages/jobs/jobs-local/tests/jobs.spec.ts",
+      "packages/jobs/tool-jobs/src/index.ts",
+      "packages/jobs/tool-jobs/tests/tool-jobs.spec.ts",
+      "packages/shell/shell/src/types.ts",
+      "packages/shell/bash-local/src/index.ts",
+      "packages/shell/bash-local/tests/executor.spec.ts",
+      "packages/shell/tool-bash/src/render.ts"
+    ]
+  },
+  "streamRead": {
+    "first": "line one\n[status: running]",
+    "repeatWithoutNewBytes": "(no new output)\n[status: running]",
+    "stdoutThenStderr": "out\n[stderr]\nerr\n",
+    "terminalUnreadDeliveredOnce": true,
+    "terminalReadMarksReported": true,
+    "listConsumesOutput": false,
+    "lossyReadHasExplicitNotice": true
+  },
+  "finalOutputJob": {
+    "liveText": "",
+    "terminalOutputIsIdempotent": true
+  },
+  "rustBoundary": {
+    "producers": ["bash"],
+    "streamTailBytesPerPipe": 64000,
+    "maximumObservedBytes": 8388608,
+    "maximumCommandTimeoutMs": 295000,
+    "spillPathVisibleWhileRunning": false,
+    "persistence": false
+  }
+}

@@ -2355,3 +2355,47 @@ Rust Phase 43 keeps the default wake behavior and exact small notice shape for
 the one process-local Agent. It deliberately fixes rather than configures the
 delivery mode/budget, caps pending notices at 64 with a bounded overflow fact,
 and has no cross-Agent owner replacement or persistence.
+
+## Phase 44 incremental background-job output — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. Before design or implementation,
+the following fixed-commit sources and tests were inspected:
+
+- `packages/jobs/jobs/src/{types,index}.ts` for `JobHooks.readOutput`, the one
+  consuming stream cursor, terminal reported state, non-consuming snapshots
+  and final-output-only job distinction;
+- `packages/jobs/jobs-local/src/index.ts` and
+  `tests/jobs.spec.ts` for live delta reads, offset advancement, terminal
+  remaining output, idempotent final-output jobs, unknown/access failures and
+  wait-before-read order;
+- `packages/jobs/tool-jobs/src/index.ts` and
+  `tests/tool-jobs.spec.ts` for the unchanged public schema, stdout body plus
+  status rendering, `(no new output)`, producer-wide result bounds, wait
+  timeout and terminal report behavior;
+- `packages/shell/shell/src/types.ts`,
+  `packages/shell/bash-local/src/index.ts` and focused executor tests for
+  separate stdout/stderr offsets, `[stderr]` rendering, consuming reads after
+  exit, lossy windows and spill locators;
+- `packages/shell/tool-bash/src/render.ts` for the exact lossy-read notice and
+  stdout/stderr section formatting.
+
+Official stream jobs invoke producer `readOutput()` on every controller read.
+The Bash producer tracks independent whole-stream byte offsets, returns stdout
+then a marked stderr section, advances both cursors and leaves remaining
+buffered output readable once after exit. If the retained window slid past an
+offset, it returns the tail with `lossy=true` and any safe spill paths. A
+terminal read marks the job reported. `list` and `get` never consume. Jobs
+without `readOutput` instead return empty while live and their final outcome
+output idempotently after settlement.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Its direct relevant production
+diff only centralizes first-party system-prompt section order in `tool-jobs`
+and `tool-bash`; the cursor, read and rendering semantics are unchanged.
+
+Rust Phase 44 targets the observable Bash stream path over the existing bounded
+process runner. It retains one cursor, exact per-stream 64,000-byte tails,
+explicit loss, finalized spill locators and the existing total process/output
+caps. It does not add generic producer registration, live spill locator
+publication, persistence or multi-Agent routing.

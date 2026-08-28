@@ -5716,6 +5716,11 @@ fn background_shell_is_approved_started_and_collected_through_real_terminal_tool
                 "timeout_ms": 2000
             }),
         ),
+        tool_sse(
+            "call-background-output-repeat",
+            "job_output",
+            serde_json::json!({ "job_id": "bash-1" }),
+        ),
         text_sse("background shell collected"),
     ]);
     let workspace = TestWorkspace::new();
@@ -5735,7 +5740,7 @@ fn background_shell_is_approved_started_and_collected_through_real_terminal_tool
     let requests = server.finish();
 
     assert!(status.success());
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert_eq!(
         tool_message_content(&requests[1], "call-background-shell"),
         "started background job bash-1"
@@ -5743,6 +5748,10 @@ fn background_shell_is_approved_started_and_collected_through_real_terminal_tool
     let output = tool_message_content(&requests[2], "call-background-output");
     assert!(output.contains("terminal-background-ok"));
     assert!(output.contains("[status: completed, exit code: 0]"));
+    assert_eq!(
+        tool_message_content(&requests[3], "call-background-output-repeat"),
+        "(no new output)\n[status: completed, exit code: 0]"
+    );
 }
 
 #[test]
@@ -5911,7 +5920,10 @@ fn exact_shell_process_choice_runs_a_normalized_repeat_without_a_second_prompt()
 
 #[test]
 fn exact_background_shell_choice_reuses_only_the_same_detached_shape() {
-    let command = "printf x >> background-exact.txt";
+    // Keep both jobs live until the test exits. An instant command races the
+    // separate completion-notice contract and makes this approval-scope test
+    // depend on scheduler timing instead of the exact detached identity.
+    let command = "printf x >> background-exact.txt; sleep 2";
     let server = SequenceSseServer::start(vec![
         two_tool_sse(
             (
@@ -5920,7 +5932,7 @@ fn exact_background_shell_choice_reuses_only_the_same_detached_shape() {
                 serde_json::json!({
                     "command": command,
                     "description": "first background display reason",
-                    "timeoutMs": 2000,
+                    "timeoutMs": 5000,
                     "run_in_background": true
                 }),
             ),
@@ -5930,7 +5942,7 @@ fn exact_background_shell_choice_reuses_only_the_same_detached_shape() {
                 serde_json::json!({
                     "command": command,
                     "description": "second background display reason",
-                    "timeoutMs": 2000,
+                    "timeoutMs": 5000,
                     "run_in_background": true
                 }),
             ),

@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 mod capture;
 mod host;
+mod incremental;
 #[cfg(any(target_os = "linux", test))]
 mod mountinfo;
 mod plugin;
@@ -39,6 +40,7 @@ mod proc_stat;
 mod spawn;
 mod spill;
 
+pub(crate) use incremental::{ProcessOutputCursor, ProcessOutputRead, ProcessOutputTap};
 pub(crate) use plugin::{
     PluginCleanup, PluginCleanupReport, PluginEmergencyHandle, PluginIo, PluginLeaderState,
     PluginProcess, PluginProcessError,
@@ -53,7 +55,7 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const OBSERVER_INTERVAL: Duration = Duration::from_millis(10);
 const READ_CHUNK_BYTES: usize = 8 * 1_024;
 const MAX_OBSERVED_BYTES: usize = 8 * 1_024 * 1_024;
-const RETAINED_TAIL_BYTES: usize = 64_000;
+pub(crate) const RETAINED_TAIL_BYTES: usize = 64_000;
 
 #[derive(Clone)]
 pub(crate) struct ProcessRunner {
@@ -139,6 +141,7 @@ pub(crate) struct ProcessRequest {
     environment: Arc<[(OsString, OsString)]>,
     timeout: Duration,
     permit: ProcessLaunchPermit,
+    output_tap: Option<ProcessOutputTap>,
     #[cfg(test)]
     test_hooks: ProcessTestHooks,
 }
@@ -188,9 +191,15 @@ impl ProcessRequest {
             environment,
             timeout,
             permit,
+            output_tap: None,
             #[cfg(test)]
             test_hooks: ProcessTestHooks::default(),
         })
+    }
+
+    pub(crate) fn with_output_tap(mut self, output_tap: ProcessOutputTap) -> Self {
+        self.output_tap = Some(output_tap);
+        self
     }
 
     #[cfg(test)]
@@ -499,6 +508,7 @@ async fn run_process(
         environment,
         timeout,
         permit,
+        output_tap,
         #[cfg(test)]
         test_hooks,
     } = request;
@@ -553,6 +563,7 @@ async fn run_process(
         #[cfg(test)]
         test_hooks,
     );
+    state.output_tap = output_tap;
     if let Some(stop) = boundary_stop {
         state.observe_stop(stop);
     }
@@ -677,6 +688,7 @@ struct RunningProcess {
     stderr: Option<AsyncFd<ChildStderr>>,
     stdout_capture: spill::SpillCapture,
     stderr_capture: spill::SpillCapture,
+    output_tap: Option<ProcessOutputTap>,
     spill_directory: Option<Arc<spill::SpillDirectory>>,
     spill_disabled: bool,
     observed: capture::ObservedBudget,
@@ -725,6 +737,7 @@ impl RunningProcess {
             stderr: None,
             stdout_capture: spill::SpillCapture::new("stdout", RETAINED_TAIL_BYTES),
             stderr_capture: spill::SpillCapture::new("stderr", RETAINED_TAIL_BYTES),
+            output_tap: None,
             spill_directory: None,
             spill_disabled: false,
             observed: capture::ObservedBudget::new(MAX_OBSERVED_BYTES),
@@ -989,12 +1002,25 @@ impl RunningProcess {
 
     async fn finish_report(self) -> ProcessOutcome {
         let Some(termination) = self.final_termination else {
+            if let Some(output_tap) = &self.output_tap {
+                output_tap.finish(None, None, true);
+            }
             return ProcessOutcome::StartedOwnershipLost {
                 turn_stop: self.turn_stop,
             };
         };
         let stdout = self.stdout_capture.finish().await;
         let stderr = self.stderr_capture.finish().await;
+        if let Some(output_tap) = &self.output_tap {
+            output_tap.finish(
+                stdout.spill_path.clone(),
+                stderr.spill_path.clone(),
+                self.flags.output_limit_exceeded
+                    || self.flags.pipe_setup_failed
+                    || self.flags.pipe_read_failed
+                    || self.flags.pipe_drain_timed_out,
+            );
+        }
         ProcessOutcome::StartedAndQuiescent(ProcessReport {
             termination,
             primary: self.primary.unwrap_or(ProcessPrimaryCause::Natural),
@@ -1371,8 +1397,18 @@ async fn handle_pipe_result(
                 .then(|| state.spill_directory.clone())
                 .flatten();
             match stream {
-                StreamKind::Stdout => state.stdout_capture.push(&bytes, directory).await,
-                StreamKind::Stderr => state.stderr_capture.push(&bytes, directory).await,
+                StreamKind::Stdout => {
+                    if let Some(output_tap) = &state.output_tap {
+                        output_tap.push_stdout(&bytes);
+                    }
+                    state.stdout_capture.push(&bytes, directory).await;
+                }
+                StreamKind::Stderr => {
+                    if let Some(output_tap) = &state.output_tap {
+                        output_tap.push_stderr(&bytes);
+                    }
+                    state.stderr_capture.push(&bytes, directory).await;
+                }
             }
             if state.observed.record(bytes.len()) {
                 state.flags.output_limit_exceeded = true;
@@ -1573,6 +1609,9 @@ async fn finish_ownership_lost(
         }
     }
     state.disarm();
+    if let Some(output_tap) = &state.output_tap {
+        output_tap.finish(None, None, true);
+    }
 
     if let Some(mut child) = state.child.take() {
         let mut wait = tokio::task::spawn_blocking(move || child.wait());
@@ -1729,6 +1768,46 @@ mod api_tests {
         assert_eq!(report.stderr().bytes(), b"stderr");
         assert!(!report.stdout().truncated());
         assert!(!report.stderr().truncated());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_tap_exposes_consuming_output_before_and_after_exit() {
+        let runner = tokio::task::spawn_blocking(ProcessRunner::open)
+            .await
+            .unwrap()
+            .unwrap();
+        let (request, control) = runner_request(
+            &runner,
+            "printf first; sleep 0.5; printf second; printf problem >&2",
+            Duration::from_secs(2),
+        )
+        .await;
+        let tap = ProcessOutputTap::new(RETAINED_TAIL_BYTES);
+        let request = request.with_output_tap(tap.clone());
+        let running = tokio::spawn({
+            let runner = runner.clone();
+            async move { runner.run(request, control).await }
+        });
+        let mut cursor = ProcessOutputCursor::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let read = tap.read(&mut cursor);
+            if read.stdout() == b"first" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "live stdout was not published");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!running.is_finished());
+        let ProcessOutcome::StartedAndQuiescent(_) = running.await.unwrap() else {
+            panic!("background process did not settle cleanly");
+        };
+        let final_read = tap.read(&mut cursor);
+        assert_eq!(final_read.stdout(), b"second");
+        assert_eq!(final_read.stderr(), b"problem");
+        let repeated = tap.read(&mut cursor);
+        assert!(repeated.stdout().is_empty());
+        assert!(repeated.stderr().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

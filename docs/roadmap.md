@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–43 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–44 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -51,6 +51,7 @@ for behavior that users can run today.
 | 41 | Bounded filters for prior-Session and event search | `complete` | [`validation/phase-41.md`](validation/phase-41.md) |
 | 42 | Bounded process-local background Shell jobs | `complete` | [`validation/phase-42.md`](validation/phase-42.md) |
 | 43 | Background-job completion notices and bounded idle wakeups | `complete` | [`validation/phase-43.md`](validation/phase-43.md) |
+| 44 | Consuming incremental output for background Shell jobs | `complete` | [`validation/phase-44.md`](validation/phase-44.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -941,12 +942,36 @@ one real linear-terminal wake journey; and the normal local Rust gates. No
 real DeepSeek request, remote CI, public-network product run or extra platform
 matrix is required.
 
+## Phase 44 incremental background-job output boundary (2026-08-29)
+
+Phase 44 closes the final-output-only usability gap for the existing Bash
+producer. `job_output` now owns one consuming cursor with independent stdout
+and stderr offsets. A live read returns bytes observed since the prior read; a
+repeat without new bytes says `(no new output)`. Unread terminal bytes remain
+available once, while `job_list` and internal status reads do not move the
+cursor.
+
+The process runner is the only output writer. It publishes exact bounded tails
+to a small shared tap before updating the existing spill capture. Falling
+behind returns the retained tail plus an explicit loss notice; safe spill paths
+are revealed only after final flush. A terminal read still suppresses an
+unclaimed completion notice. Wait timeout/cancellation, process-group cleanup,
+approval and append-only tool call/result ordering are unchanged.
+
+Rust keeps one process-local Bash producer, a 64,000-byte tail per stream, the
+8 MiB observed-output cap and 295-second command cap. It does not add job
+persistence, terminal input, PTY sessions, multi-Agent routing or other job
+producers. Acceptance is local-only: fixed-source fixture, bounded cursor and
+real-process tests, one real terminal journey, one all-target run and the
+normal local formatting/compiler/Clippy/diff gates. No real DeepSeek request,
+remote CI or extra platform/stress matrix is required.
+
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
 - MCP, Hooks, ambient/remote Skills, and subagents
-- Background-job live incremental output, persistence, and non-Shell producers
+- Background-job persistence, terminal input, PTY sessions, and non-Shell producers
 - LSP diagnostics, rename/symbol/call-hierarchy operations, session-query cursors and a persistent derived search index
 - Ambient/browser-derived time zones and configurable time-context refresh intervals
 - Multiple model providers

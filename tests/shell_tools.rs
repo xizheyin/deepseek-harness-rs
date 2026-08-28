@@ -499,6 +499,13 @@ fn local_registry_exposes_background_bash_and_closed_job_schemas() {
     assert_eq!(phase43["delivery"]["maximumConsecutiveWakes"], 3);
     assert_eq!(phase43["notice"]["source"]["plugin"], "tool-jobs");
     assert_eq!(phase43["suppression"]["ownerTeardown"], true);
+    let phase44: Value = serde_json::from_str(include_str!(
+        "fixtures/tools/upstream_phase44_incremental_job_output.json"
+    ))
+    .unwrap();
+    assert_eq!(phase44["streamRead"]["terminalUnreadDeliveredOnce"], true);
+    assert_eq!(phase44["streamRead"]["listConsumesOutput"], false);
+    assert_eq!(phase44["rustBoundary"]["streamTailBytesPerPipe"], 64_000);
 }
 
 #[test]

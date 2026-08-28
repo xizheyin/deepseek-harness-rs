@@ -1007,13 +1007,7 @@ async fn run_prepared_action(
             return crate::agent::ToolActionOutcome::NotStarted { turn_stop, result };
         }
         let id = match jobs
-            .start_shell(
-                &command,
-                timeout_ms,
-                workdir_display.clone(),
-                request,
-                runner,
-            )
+            .start_shell(&command, timeout_ms, request, runner)
             .await
         {
             Ok(id) => id,
