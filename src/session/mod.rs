@@ -74,13 +74,14 @@ pub(crate) use resume::PreparingResume;
 pub(crate) use resume::RecoveredSession;
 pub(crate) use search::{
     MAX_SESSION_EVENT_READ_WINDOW, MAX_SESSION_SEARCH_QUERY_BYTES, SessionEventReadOutcome,
-    SessionEventSearchOutcome, SessionEventSummary, SessionSearchError, SessionSearchOutcome,
-    SessionSearchQuery, SessionSearchRuntime,
+    SessionEventSearchOutcome, SessionEventSummary, SessionEventTraceOutcome, SessionLineageNode,
+    SessionSearchError, SessionSearchOutcome, SessionSearchQuery, SessionSearchRuntime,
+    SessionTraceOutcome,
 };
 #[cfg(test)]
 pub(crate) use search::{
     MAX_SESSION_SEARCH_RESULTS, MAX_SESSION_SEARCH_SNIPPET_CHARS, SessionEventSearchHit,
-    SessionEventSurface, SessionSearchHit,
+    SessionEventSurface, SessionLineageRecord, SessionSearchHit,
 };
 pub(crate) use tool_result_pruner::{
     ToolResultPruneConfig, ToolResultPruneError, ToolResultPruneOutcome, ValidatedRawReplacement,

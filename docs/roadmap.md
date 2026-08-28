@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–39 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–40 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -47,6 +47,7 @@ for behavior that users can run today.
 | 37 | Configured bounded stdio LSP code navigation | `complete` | [`validation/phase-37.md`](validation/phase-37.md) |
 | 38 | Durable opt-in per-step time context | `complete` | [`validation/phase-38.md`](validation/phase-38.md) |
 | 39 | Bounded exact navigation inside prior Session events | `complete` | [`validation/phase-39.md`](validation/phase-39.md) |
+| 40 | Bounded prior-Session lineage and event relationship traces | `complete` | [`validation/phase-40.md`](validation/phase-40.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -813,20 +814,51 @@ are the current turn's ordinary correlated tool call and result. The tools are
 read-only, need no approval and gain no file, Shell, process or network
 authority.
 
-Rust defers the official optional filters/cursors, current-session cutoff,
-session/event lineage traces, live-preferred SQLite index and persistent derived
-index. Acceptance is local-only: fixed-source fixture; schema, authorization,
+At this checkpoint Rust deferred the official optional filters/cursors,
+current-session cutoff, session/event lineage traces (added in Phase 40),
+live-preferred SQLite index and persistent derived index. Acceptance is
+local-only: fixed-source fixture; schema, authorization,
 ranking, surface, exact JSON, window, size, corrupt/busy/not-found, timeout and
 cancellation tests; one real two-process CLI search → event search → exact read
 journey; and the normal local Rust gates. No real DeepSeek request, remote CI,
 public network or extra platform/stress matrix is required.
+
+## Phase 40 prior-Session relationship tracing boundary (2026-08-29)
+
+Phase 40 completes the fixed upstream's five-name session-query tool family by
+adding `session_trace` and `session_event_trace` to the real CLI. Session trace
+shows validated parent ancestry and deterministic descendant trees. Event
+trace shows positional replacement chains separately from direct
+`sourceEventSeqs` citations and later directly derived events.
+
+Both tools require an explicit canonical Session id and reuse the Phase 36
+persisted-only authorization boundary. The target, ancestors and descendants
+must come from normally closed, current-version, strict-replay-valid journals
+in the exact retained workspace. Caller, busy/live, other-workspace, malformed
+and absent Sessions disclose no content. A missing visible parent becomes an
+opaque boundary, and a target-connected parent cycle fails closed.
+
+Event relationships are derived during one strict scan of at most 16 MiB.
+Session lineage uses the existing store cap and observes at most 64 MiB across
+candidate journals. Both operations have the existing five-second cooperative
+deadline, wait for their blocking scan to stop after cancellation, are Agent-
+serialized and produce no approval, file write, process or network side
+effect.
+
+Rust does not add live/current-Session reads, titles, filters, cursors, SQLite,
+an index or subagent creation. Acceptance is local-only: fixed-source fixture;
+schema, lineage, ordering, cycle, replacement, source/derived, authorization,
+corrupt/oversized, cancellation and timeout tests; the real two-process CLI
+journey extended through both trace tools; and the normal local Rust gates. No
+real DeepSeek request, remote CI, public network or extra platform/stress
+matrix is required.
 
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
 - MCP, Hooks, ambient/remote Skills, subagents, and background jobs
-- LSP diagnostics, rename/symbol/call-hierarchy operations, session-query filters/cursors and lineage traces, and a persistent derived search index
+- LSP diagnostics, rename/symbol/call-hierarchy operations, session-query filters/cursors and a persistent derived search index
 - Ambient/browser-derived time zones and configurable time-context refresh intervals
 - Multiple model providers
 - Untested operating systems or sandbox claims

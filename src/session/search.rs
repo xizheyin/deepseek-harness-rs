@@ -1,6 +1,7 @@
 //! Bounded read-only search over normally closed journals in one workspace.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -323,6 +324,195 @@ pub(crate) struct SessionEventReadOutcome {
     after: Vec<SessionEventSummary>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionLineageRecord {
+    session_id: SessionId,
+    created_at: i64,
+    parent_session: Option<SessionId>,
+}
+
+impl SessionLineageRecord {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        session_id: SessionId,
+        created_at: i64,
+        parent_session: Option<SessionId>,
+    ) -> Self {
+        Self {
+            session_id,
+            created_at,
+            parent_session,
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub(crate) fn created_at(&self) -> i64 {
+        self.created_at
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionLineageNode {
+    record: SessionLineageRecord,
+    descendants: Vec<SessionLineageNode>,
+}
+
+impl SessionLineageNode {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        record: SessionLineageRecord,
+        descendants: Vec<SessionLineageNode>,
+    ) -> Self {
+        Self {
+            record,
+            descendants,
+        }
+    }
+
+    pub(crate) fn record(&self) -> &SessionLineageRecord {
+        &self.record
+    }
+
+    pub(crate) fn descendants(&self) -> &[SessionLineageNode] {
+        &self.descendants
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionTraceOutcome {
+    target: SessionLineageRecord,
+    ancestors: Vec<SessionLineageRecord>,
+    ancestor_boundary: bool,
+    descendants: Vec<SessionLineageNode>,
+    corpus_incomplete: bool,
+}
+
+impl SessionTraceOutcome {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        target: SessionLineageRecord,
+        ancestors: Vec<SessionLineageRecord>,
+        ancestor_boundary: bool,
+        descendants: Vec<SessionLineageNode>,
+        corpus_incomplete: bool,
+    ) -> Self {
+        Self {
+            target,
+            ancestors,
+            ancestor_boundary,
+            descendants,
+            corpus_incomplete,
+        }
+    }
+
+    pub(crate) fn target(&self) -> &SessionLineageRecord {
+        &self.target
+    }
+
+    pub(crate) fn ancestors(&self) -> &[SessionLineageRecord] {
+        &self.ancestors
+    }
+
+    pub(crate) fn ancestor_boundary(&self) -> bool {
+        self.ancestor_boundary
+    }
+
+    pub(crate) fn descendants(&self) -> &[SessionLineageNode] {
+        &self.descendants
+    }
+
+    pub(crate) fn corpus_incomplete(&self) -> bool {
+        self.corpus_incomplete
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionEventTraceOutcome {
+    session_id: SessionId,
+    target_seq: u64,
+    target_type: String,
+    target_time: i64,
+    target_surface: SessionEventSurface,
+    replaced_by: Option<u64>,
+    replacement_chain: Vec<u64>,
+    replaced_event_seqs: Vec<u64>,
+    source_event_seqs: Vec<u64>,
+    derived_event_seqs: Vec<u64>,
+}
+
+impl SessionEventTraceOutcome {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test(
+        session_id: SessionId,
+        target_seq: u64,
+        target_type: impl Into<String>,
+        target_time: i64,
+        target_surface: SessionEventSurface,
+        replaced_by: Option<u64>,
+        replacement_chain: Vec<u64>,
+        replaced_event_seqs: Vec<u64>,
+        source_event_seqs: Vec<u64>,
+        derived_event_seqs: Vec<u64>,
+    ) -> Self {
+        Self {
+            session_id,
+            target_seq,
+            target_type: target_type.into(),
+            target_time,
+            target_surface,
+            replaced_by,
+            replacement_chain,
+            replaced_event_seqs,
+            source_event_seqs,
+            derived_event_seqs,
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub(crate) fn target_seq(&self) -> u64 {
+        self.target_seq
+    }
+
+    pub(crate) fn target_type(&self) -> &str {
+        &self.target_type
+    }
+
+    pub(crate) fn target_time(&self) -> i64 {
+        self.target_time
+    }
+
+    pub(crate) fn target_surface(&self) -> SessionEventSurface {
+        self.target_surface
+    }
+
+    pub(crate) fn replaced_by(&self) -> Option<u64> {
+        self.replaced_by
+    }
+
+    pub(crate) fn replacement_chain(&self) -> &[u64] {
+        &self.replacement_chain
+    }
+
+    pub(crate) fn replaced_event_seqs(&self) -> &[u64] {
+        &self.replaced_event_seqs
+    }
+
+    pub(crate) fn source_event_seqs(&self) -> &[u64] {
+        &self.source_event_seqs
+    }
+
+    pub(crate) fn derived_event_seqs(&self) -> &[u64] {
+        &self.derived_event_seqs
+    }
+}
+
 impl SessionEventReadOutcome {
     #[cfg(test)]
     pub(crate) fn for_test(
@@ -450,6 +640,37 @@ impl SessionSearchRuntime {
         run_bounded_operation(cancellation, move |cancelled, deadline| {
             event_read_sync(
                 &store, workspace, &caller, session_id, seq, before, after, cancelled, deadline,
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn trace_session(
+        &self,
+        session_id: SessionId,
+        cancellation: CancellationToken,
+    ) -> Result<SessionTraceOutcome, SessionSearchError> {
+        let store = self.store.clone();
+        let workspace = self.workspace;
+        let caller = self.caller.clone();
+        run_bounded_operation(cancellation, move |cancelled, deadline| {
+            session_trace_sync(&store, workspace, &caller, session_id, cancelled, deadline)
+        })
+        .await
+    }
+
+    pub(crate) async fn trace_event(
+        &self,
+        session_id: SessionId,
+        seq: u64,
+        cancellation: CancellationToken,
+    ) -> Result<SessionEventTraceOutcome, SessionSearchError> {
+        let store = self.store.clone();
+        let workspace = self.workspace;
+        let caller = self.caller.clone();
+        run_bounded_operation(cancellation, move |cancelled, deadline| {
+            event_trace_sync(
+                &store, workspace, &caller, session_id, seq, cancelled, deadline,
             )
         })
         .await
@@ -715,6 +936,289 @@ fn event_read_sync(
         target,
         before: preceding,
         after: following,
+    })
+}
+
+fn session_trace_sync(
+    store: &SessionStore,
+    workspace: WorkspaceIdentity,
+    caller: &SessionId,
+    session_id: SessionId,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<SessionTraceOutcome, SessionSearchError> {
+    check_stop(cancelled, deadline)?;
+    let mut candidates = store
+        .search_candidates(workspace, caller)
+        .map_err(map_store_error)?;
+    let target_index = candidates
+        .iter()
+        .position(|candidate| candidate.metadata().id() == &session_id)
+        .ok_or(SessionSearchError::SessionNotFound)?;
+    let target_candidate = candidates.remove(target_index);
+    let target_length = target_candidate.file_length().map_err(map_store_error)?;
+    if target_length > MAX_SESSION_SEARCH_SESSION_BYTES {
+        return Err(SessionSearchError::Unavailable);
+    }
+    let target = scan_lineage_candidate(target_candidate, workspace, cancelled, deadline, true)?
+        .ok_or(SessionSearchError::Unavailable)?;
+
+    let mut records = BTreeMap::new();
+    records.insert(target.session_id.clone(), target.clone());
+    let mut scanned_bytes = target_length;
+    let mut corpus_incomplete = false;
+    for candidate in candidates {
+        check_stop(cancelled, deadline)?;
+        let length = candidate.file_length().map_err(map_store_error)?;
+        if length > MAX_SESSION_SEARCH_SESSION_BYTES {
+            corpus_incomplete = true;
+            continue;
+        }
+        let Some(next_total) = scanned_bytes.checked_add(length) else {
+            corpus_incomplete = true;
+            break;
+        };
+        if next_total > MAX_SESSION_SEARCH_AGGREGATE_BYTES {
+            corpus_incomplete = true;
+            break;
+        }
+        scanned_bytes = next_total;
+        match scan_lineage_candidate(candidate, workspace, cancelled, deadline, false)? {
+            Some(record) => {
+                records.insert(record.session_id.clone(), record);
+            }
+            None => corpus_incomplete = true,
+        }
+    }
+
+    let mut ancestors = Vec::new();
+    let mut seen = BTreeSet::from([session_id.clone()]);
+    let mut parent = target.parent_session.clone();
+    let mut ancestor_boundary = false;
+    while let Some(parent_id) = parent {
+        if !seen.insert(parent_id.clone()) {
+            return Err(SessionSearchError::Unavailable);
+        }
+        let Some(record) = records.get(&parent_id) else {
+            ancestor_boundary = true;
+            break;
+        };
+        ancestors.push(record.clone());
+        parent = record.parent_session.clone();
+    }
+
+    let mut children = BTreeMap::<SessionId, Vec<SessionLineageRecord>>::new();
+    for record in records.values() {
+        if let Some(parent) = &record.parent_session {
+            children
+                .entry(parent.clone())
+                .or_default()
+                .push(record.clone());
+        }
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+    }
+    let mut descendant_seen = BTreeSet::from([session_id]);
+    let descendants = build_descendants(&children, target.session_id(), &mut descendant_seen)?;
+    Ok(SessionTraceOutcome {
+        target,
+        ancestors,
+        ancestor_boundary,
+        descendants,
+        corpus_incomplete,
+    })
+}
+
+fn scan_lineage_candidate(
+    candidate: super::store::SessionSearchCandidate,
+    workspace: WorkspaceIdentity,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+    strict_target: bool,
+) -> Result<Option<SessionLineageRecord>, SessionSearchError> {
+    let metadata = candidate.metadata().clone();
+    let length = candidate.file_length().map_err(map_store_error)?;
+    let mut file = candidate.into_file();
+    let scan = scan_jsonl_observing(
+        &mut file,
+        metadata.id(),
+        cancelled,
+        |header, identity| {
+            if identity != workspace || header.id() != metadata.id() {
+                return Err(StoreError::WorkspaceMismatch);
+            }
+            Ok(())
+        },
+        |_| {
+            check_stop_store(cancelled, deadline)?;
+            Ok(())
+        },
+    );
+    let scan = match scan {
+        Ok(scan) => scan,
+        Err(StoreError::Cancelled) => return Err(stop_error(deadline)),
+        Err(_) if !strict_target => return Ok(None),
+        Err(_) => return Err(SessionSearchError::Unavailable),
+    };
+    if scan.physical_bytes() != length
+        || scan.valid_bytes() != length
+        || !scan.is_quiescent_for_search()
+    {
+        return if strict_target {
+            Err(SessionSearchError::Unavailable)
+        } else {
+            Ok(None)
+        };
+    }
+    Ok(Some(SessionLineageRecord {
+        session_id: scan.header().id().clone(),
+        created_at: scan.header().created_at().get(),
+        parent_session: scan.header().parent_session().cloned(),
+    }))
+}
+
+fn build_descendants(
+    children: &BTreeMap<SessionId, Vec<SessionLineageRecord>>,
+    parent: &SessionId,
+    seen: &mut BTreeSet<SessionId>,
+) -> Result<Vec<SessionLineageNode>, SessionSearchError> {
+    let Some(records) = children.get(parent) else {
+        return Ok(Vec::new());
+    };
+    let mut nodes = Vec::new();
+    nodes
+        .try_reserve_exact(records.len())
+        .map_err(|_| SessionSearchError::Unavailable)?;
+    for record in records {
+        if !seen.insert(record.session_id.clone()) {
+            return Err(SessionSearchError::Unavailable);
+        }
+        let descendants = build_descendants(children, &record.session_id, seen)?;
+        nodes.push(SessionLineageNode {
+            record: record.clone(),
+            descendants,
+        });
+    }
+    Ok(nodes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn event_trace_sync(
+    store: &SessionStore,
+    workspace: WorkspaceIdentity,
+    caller: &SessionId,
+    session_id: SessionId,
+    seq: u64,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<SessionEventTraceOutcome, SessionSearchError> {
+    let candidate = find_target_candidate(store, workspace, caller, &session_id)?;
+    check_target_length(&candidate)?;
+    let metadata = candidate.metadata().clone();
+    let length = candidate.file_length().map_err(map_store_error)?;
+    let mut file = candidate.into_file();
+    let target_seq = EventSeq::new(seq).map_err(|_| SessionSearchError::Invalid)?;
+    let mut target = None;
+    let mut surface_nodes = Vec::<EventSeq>::new();
+    let mut replaced_by = BTreeMap::<EventSeq, EventSeq>::new();
+    let mut replaced_events = BTreeMap::<EventSeq, Vec<EventSeq>>::new();
+    let mut derived = Vec::new();
+    let scan = scan_jsonl_observing(
+        &mut file,
+        &session_id,
+        cancelled,
+        |header, identity| {
+            if identity != workspace || header.id() != metadata.id() {
+                return Err(StoreError::WorkspaceMismatch);
+            }
+            Ok(())
+        },
+        |event| {
+            check_stop_store(cancelled, deadline)?;
+            if event.seq() == target_seq {
+                target = Some((
+                    event.kind().event_type().to_owned(),
+                    event.time().get(),
+                    event.surface_op().is_some(),
+                    event.source_event_seqs().unwrap_or_default().to_vec(),
+                ));
+            } else if event.seq() > target_seq
+                && event
+                    .source_event_seqs()
+                    .is_some_and(|sources| sources.contains(&target_seq))
+            {
+                derived.push(event.seq());
+            }
+            match event.surface_op() {
+                Some(super::SurfaceOp::Append(_)) => surface_nodes.push(event.seq()),
+                Some(super::SurfaceOp::Replace(replacement)) => {
+                    let start = surface_nodes
+                        .iter()
+                        .position(|node| *node == replacement.start)
+                        .ok_or(StoreError::Corrupt)?;
+                    let end = surface_nodes
+                        .iter()
+                        .position(|node| *node == replacement.end)
+                        .ok_or(StoreError::Corrupt)?;
+                    if start > end {
+                        return Err(StoreError::Corrupt);
+                    }
+                    let removed = surface_nodes[start..=end].to_vec();
+                    for removed_seq in &removed {
+                        replaced_by.insert(*removed_seq, event.seq());
+                    }
+                    replaced_events.insert(event.seq(), removed);
+                    surface_nodes.splice(start..=end, [event.seq()]);
+                }
+                None => {}
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| map_target_scan_error(error, deadline))?;
+    if scan.physical_bytes() != length
+        || scan.valid_bytes() != length
+        || !scan.is_quiescent_for_search()
+    {
+        return Err(SessionSearchError::Unavailable);
+    }
+    let (target_type, target_time, surface_event, sources) =
+        target.ok_or(SessionSearchError::EventNotFound)?;
+    let immediate = replaced_by.get(&target_seq).copied();
+    let mut replacement_chain = Vec::new();
+    let mut replacement = immediate;
+    while let Some(replacer) = replacement {
+        replacement_chain.push(replacer.get());
+        replacement = replaced_by.get(&replacer).copied();
+    }
+    let target_surface = if !surface_event {
+        SessionEventSurface::LogOnly
+    } else if surface_nodes.contains(&target_seq) {
+        SessionEventSurface::Current
+    } else {
+        SessionEventSurface::Shadowed
+    };
+    Ok(SessionEventTraceOutcome {
+        session_id,
+        target_seq: seq,
+        target_type,
+        target_time,
+        target_surface,
+        replaced_by: immediate.map(EventSeq::get),
+        replacement_chain,
+        replaced_event_seqs: replaced_events
+            .remove(&target_seq)
+            .unwrap_or_default()
+            .into_iter()
+            .map(EventSeq::get)
+            .collect(),
+        source_event_seqs: sources.into_iter().map(EventSeq::get).collect(),
+        derived_event_seqs: derived.into_iter().map(EventSeq::get).collect(),
     })
 }
 
@@ -1211,6 +1715,150 @@ mod tests {
             navigation["eventRead"]["maxSideWindow"],
             MAX_SESSION_EVENT_READ_WINDOW
         );
+
+        let tracing: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/tools/upstream_phase40_session_tracing.json"
+        ))
+        .unwrap();
+        assert_eq!(tracing["sessionTrace"]["name"], "session_trace");
+        assert_eq!(tracing["eventTrace"]["name"], "session_event_trace");
+        assert_eq!(
+            tracing["rustIntentionalDifference"]["lineageCorpusBytes"],
+            MAX_SESSION_SEARCH_AGGREGATE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn traces_complete_partial_and_cyclic_session_lineage_deterministically() {
+        let root = private_directory("lineage-store");
+        let workspace = private_directory("lineage-workspace");
+        let authority = WorkspaceAuthority::open(&workspace).unwrap();
+        let root_id = SessionId::new("session-015e8400-e29b-41d4-a716-446655440000");
+        let parent_id = SessionId::new("session-115e8400-e29b-41d4-a716-446655440000");
+        let target_id = SessionId::new("session-215e8400-e29b-41d4-a716-446655440000");
+        let older_id = SessionId::new("session-315e8400-e29b-41d4-a716-446655440000");
+        let child_id = SessionId::new("session-415e8400-e29b-41d4-a716-446655440000");
+        let grandchild_id = SessionId::new("session-515e8400-e29b-41d4-a716-446655440000");
+        write_lineage_history(&root, &authority, &root_id, 1_000, None);
+        write_lineage_history(&root, &authority, &parent_id, 2_000, Some(&root_id));
+        write_lineage_history(&root, &authority, &target_id, 3_000, Some(&parent_id));
+        write_lineage_history(&root, &authority, &older_id, 4_000, Some(&target_id));
+        write_lineage_history(&root, &authority, &child_id, 5_000, Some(&target_id));
+        write_lineage_history(&root, &authority, &grandchild_id, 6_000, Some(&child_id));
+        let runtime = SessionSearchRuntime::new(
+            SessionStore::open_existing(&root).unwrap(),
+            authority.identity(),
+            SessionId::new("session-615e8400-e29b-41d4-a716-446655440000"),
+        );
+        let trace = runtime
+            .trace_session(target_id.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(trace.target().session_id(), &target_id);
+        assert_eq!(
+            trace
+                .ancestors()
+                .iter()
+                .map(SessionLineageRecord::session_id)
+                .collect::<Vec<_>>(),
+            [&parent_id, &root_id]
+        );
+        assert!(!trace.ancestor_boundary());
+        assert_eq!(
+            trace
+                .descendants()
+                .iter()
+                .map(|node| node.record().session_id())
+                .collect::<Vec<_>>(),
+            [&older_id, &child_id]
+        );
+        assert_eq!(
+            trace.descendants()[1].descendants()[0]
+                .record()
+                .session_id(),
+            &grandchild_id
+        );
+
+        let partial_id = SessionId::new("session-715e8400-e29b-41d4-a716-446655440000");
+        let absent_id = SessionId::new("session-815e8400-e29b-41d4-a716-446655440000");
+        write_lineage_history(&root, &authority, &partial_id, 7_000, Some(&absent_id));
+        let partial = runtime
+            .trace_session(partial_id, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(partial.ancestor_boundary());
+        assert!(partial.ancestors().is_empty());
+
+        let cycle_a = SessionId::new("session-915e8400-e29b-41d4-a716-446655440000");
+        let cycle_b = SessionId::new("session-a15e8400-e29b-41d4-a716-446655440000");
+        write_lineage_history(&root, &authority, &cycle_a, 8_000, Some(&cycle_b));
+        write_lineage_history(&root, &authority, &cycle_b, 9_000, Some(&cycle_a));
+        assert_eq!(
+            runtime
+                .trace_session(cycle_a, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            SessionSearchError::Unavailable
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_trace_separates_replacements_sources_and_derived_events() {
+        let root = private_directory("event-trace-store");
+        let workspace = private_directory("event-trace-workspace");
+        let authority = WorkspaceAuthority::open(&workspace).unwrap();
+        let id = SessionId::new("session-b15e8400-e29b-41d4-a716-446655440000");
+        let (original, first, final_seq, log_only) =
+            write_event_trace_history(&root, &authority, &id);
+        let runtime = SessionSearchRuntime::new(
+            SessionStore::open_existing(&root).unwrap(),
+            authority.identity(),
+            SessionId::new("session-c15e8400-e29b-41d4-a716-446655440000"),
+        );
+        let trace = runtime
+            .trace_event(id.clone(), original, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(trace.target_surface(), SessionEventSurface::Shadowed);
+        assert_eq!(trace.replaced_by(), Some(first));
+        assert_eq!(trace.replacement_chain(), &[first, final_seq]);
+        assert!(trace.replaced_event_seqs().is_empty());
+        assert!(trace.source_event_seqs().is_empty());
+        assert_eq!(trace.derived_event_seqs(), &[first]);
+
+        let replacement = runtime
+            .trace_event(id.clone(), first, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(replacement.replaced_by(), Some(final_seq));
+        assert_eq!(replacement.replaced_event_seqs(), &[original]);
+        assert_eq!(replacement.source_event_seqs(), &[original]);
+        assert_eq!(replacement.derived_event_seqs(), &[final_seq]);
+        let current = runtime
+            .trace_event(id.clone(), final_seq, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(current.target_surface(), SessionEventSurface::Current);
+        assert_eq!(current.replaced_event_seqs(), &[first]);
+        assert_eq!(current.source_event_seqs(), &[first]);
+        let log = runtime
+            .trace_event(id.clone(), log_only, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(log.target_surface(), SessionEventSurface::LogOnly);
+        assert_eq!(
+            runtime
+                .trace_event(id, 9_999, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            SessionSearchError::EventNotFound
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[tokio::test]
@@ -1278,14 +1926,28 @@ mod tests {
                 .unwrap_err(),
             SessionSearchError::EventNotFound
         );
-        for unavailable in [hidden, busy] {
+        for unavailable in [&hidden, &busy] {
             assert_eq!(
                 runtime
                     .search_events(
-                        unavailable,
+                        unavailable.clone(),
                         SessionSearchQuery::new("needle").unwrap(),
                         CancellationToken::new(),
                     )
+                    .await
+                    .unwrap_err(),
+                SessionSearchError::SessionNotFound
+            );
+            assert_eq!(
+                runtime
+                    .trace_event(unavailable.clone(), target_seq, CancellationToken::new())
+                    .await
+                    .unwrap_err(),
+                SessionSearchError::SessionNotFound
+            );
+            assert_eq!(
+                runtime
+                    .trace_session(unavailable.clone(), CancellationToken::new())
                     .await
                     .unwrap_err(),
                 SessionSearchError::SessionNotFound
@@ -1298,7 +1960,14 @@ mod tests {
         );
         assert_eq!(
             self_runtime
-                .read_event(visible, target_seq, 0, 0, CancellationToken::new())
+                .read_event(visible.clone(), target_seq, 0, 0, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            SessionSearchError::SessionNotFound
+        );
+        assert_eq!(
+            self_runtime
+                .trace_session(visible, CancellationToken::new())
                 .await
                 .unwrap_err(),
             SessionSearchError::SessionNotFound
@@ -1425,7 +2094,28 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .read_event(oversized, 0, 0, 0, CancellationToken::new(),)
+                .read_event(oversized.clone(), 0, 0, 0, CancellationToken::new(),)
+                .await
+                .unwrap_err(),
+            SessionSearchError::Unavailable
+        );
+        assert_eq!(
+            runtime
+                .trace_session(oversized, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            SessionSearchError::Unavailable
+        );
+        assert_eq!(
+            runtime
+                .trace_event(malformed.clone(), 0, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            SessionSearchError::Unavailable
+        );
+        assert_eq!(
+            runtime
+                .trace_session(malformed.clone(), CancellationToken::new())
                 .await
                 .unwrap_err(),
             SessionSearchError::Unavailable
@@ -1453,6 +2143,15 @@ mod tests {
                 .unwrap_err(),
             SessionSearchError::Cancelled
         );
+        let trace_cancellation = CancellationToken::new();
+        trace_cancellation.cancel();
+        assert_eq!(
+            runtime
+                .trace_session(malformed.clone(), trace_cancellation)
+                .await
+                .unwrap_err(),
+            SessionSearchError::Cancelled
+        );
         assert_eq!(
             search_sync(
                 &SessionStore::open_existing(&root).unwrap(),
@@ -1470,8 +2169,33 @@ mod tests {
                 &SessionStore::open_existing(&root).unwrap(),
                 authority.identity(),
                 &SessionId::new("session-c50e8400-e29b-41d4-a716-446655440000"),
-                malformed,
+                malformed.clone(),
                 &SessionSearchQuery::new("bounded").unwrap(),
+                &AtomicBool::new(false),
+                Instant::now() - Duration::from_millis(1),
+            )
+            .unwrap_err(),
+            SessionSearchError::Timeout
+        );
+        assert_eq!(
+            event_trace_sync(
+                &SessionStore::open_existing(&root).unwrap(),
+                authority.identity(),
+                &SessionId::new("session-c50e8400-e29b-41d4-a716-446655440000"),
+                malformed,
+                0,
+                &AtomicBool::new(false),
+                Instant::now() - Duration::from_millis(1),
+            )
+            .unwrap_err(),
+            SessionSearchError::Timeout
+        );
+        assert_eq!(
+            session_trace_sync(
+                &SessionStore::open_existing(&root).unwrap(),
+                authority.identity(),
+                &SessionId::new("session-c50e8400-e29b-41d4-a716-446655440000"),
+                SessionId::new("session-d50e8400-e29b-41d4-a716-446655440000"),
                 &AtomicBool::new(false),
                 Instant::now() - Duration::from_millis(1),
             )
@@ -1591,6 +2315,107 @@ mod tests {
             .unwrap();
         write_session(root, &header, &session);
         replacement.seq().get()
+    }
+
+    fn write_lineage_history(
+        root: &std::path::Path,
+        authority: &WorkspaceAuthority,
+        id: &SessionId,
+        created_at: i64,
+        parent: Option<&SessionId>,
+    ) -> std::path::PathBuf {
+        let base = SessionHeader::new_durable(
+            id.clone(),
+            UnixMillis::new(created_at).unwrap(),
+            authority.canonical_path().to_str().unwrap().to_owned(),
+            authority.identity(),
+        )
+        .unwrap();
+        let mut raw = base.raw().as_value().clone();
+        if let Some(parent) = parent {
+            raw.as_object_mut()
+                .unwrap()
+                .insert("parentSession".to_owned(), json!(parent));
+        }
+        let header = SessionHeader::from_value(raw).unwrap();
+        let mut session = Session::new(id.as_str()).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .unwrap();
+        write_session(root, &header, &session)
+    }
+
+    fn write_event_trace_history(
+        root: &std::path::Path,
+        authority: &WorkspaceAuthority,
+        id: &SessionId,
+    ) -> (u64, u64, u64, u64) {
+        let header = SessionHeader::new_durable(
+            id.clone(),
+            UnixMillis::new(1_000).unwrap(),
+            authority.canonical_path().to_str().unwrap().to_owned(),
+            authority.identity(),
+        )
+        .unwrap();
+        let mut session = Session::new(id.as_str()).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        let append_message = |id: &str, text: &str| {
+            Message::user(
+                id,
+                vec![crate::model::ContentBlock::text(text).unwrap()],
+                MessageSource::plugin("trace-test").unwrap(),
+            )
+            .unwrap()
+        };
+        let original = session
+            .append(NewEvent::surface(
+                EventKind::user_message(append_message("trace-original", "original")),
+                SurfaceIntent::append(),
+            ))
+            .unwrap();
+        let first = session
+            .append(NewEvent::surface(
+                EventKind::user_message(append_message("trace-first", "first")),
+                SurfaceIntent::replace(original.seq(), original.seq(), vec![original.seq()]),
+            ))
+            .unwrap();
+        let final_event = session
+            .append(NewEvent::surface(
+                EventKind::user_message(append_message("trace-final", "final")),
+                SurfaceIntent::replace(first.seq(), first.seq(), vec![first.seq()]),
+            ))
+            .unwrap();
+        let log_only = session
+            .append(NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "trace log".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            }))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .unwrap();
+        write_session(root, &header, &session);
+        (
+            original.seq().get(),
+            first.seq().get(),
+            final_event.seq().get(),
+            log_only.seq().get(),
+        )
     }
 
     fn write_session(

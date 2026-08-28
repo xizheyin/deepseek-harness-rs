@@ -2192,3 +2192,48 @@ It requires an explicit canonical id, refuses the caller and all busy/live or
 cross-workspace sources, and exposes no filters/cursors or SQLite index. It
 retains the official literal semantic search, surface labels, exact target JSON,
 neighbor summaries, strict workspace authorization and stable cancellation.
+
+## Phase 40 prior-Session relationship tracing — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The following fixed-commit sources
+and tests were inspected before design or implementation:
+
+- `packages/session-query/session-query/src/tracing.ts` for canonical surface
+  analysis, immediate replacement maps, replacement chains, direct source and
+  derived links, ancestor walks, cycle rejection and iterative descendant
+  construction;
+- `packages/session-query/session-query/src/types.ts` for the event record,
+  lineage node, complete/unresolved trace and event relationship contracts;
+- `packages/session-query/session-query/tests/tracing.spec.ts` for deterministic
+  child ordering, roots, unresolved parents, cycles, deep trees, positional
+  replacement chains, source ordering, target-before-surface failure order and
+  invalid provenance rejection;
+- `packages/session-query/tool-session-query/src/{index,operations,presentation}.ts`
+  for the exact `session_trace` and `session_event_trace` tool names, optional
+  current target, workspace pruning, title observation and output wording;
+- `packages/session-query/tool-session-query/src/workspace-access.ts` and its
+  focused tests for stopping ancestor disclosure and pruning descendant
+  subtrees at workspace boundaries.
+
+Fixed upstream folds the complete event log once. For each replacement it maps
+every removed current surface node to the replacing event, then follows that
+map for a replacement chain. `sourceEventSeqs` is a separate provenance edge:
+the target exposes its recorded earlier sources, while derived events are later
+events that cite the target directly. Session ancestry follows
+`parentSession`, rejects cycles connected to the target, records the first
+unresolved parent, and orders each child list by creation time ascending then id
+ascending.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. A direct fixed-to-master diff of
+the tracing algorithm is empty; the observable trace relation semantics are
+unchanged.
+
+Rust Phase 40 retains these relationship definitions and presentation fields
+but deliberately keeps Phase 36's stricter persisted-only corpus. Both tools
+require an explicit canonical id, refuse the caller and busy/live or foreign
+workspace journals, render no title, and label availability only as persisted.
+Each visible journal must pass the ordinary strict replay scanner. An absent or
+unvalidated parent is exposed only as an outside-workspace boundary, and
+descendants outside the bounded validated corpus are omitted.

@@ -375,6 +375,18 @@ impl LocalToolRegistry {
                     source,
                 }
             })?);
+            schemas.push(session_search::session_trace_schema().map_err(|source| {
+                ToolRegistryBuildError::InvalidSchema {
+                    tool: session_search::SESSION_TRACE_TOOL_NAME,
+                    source,
+                }
+            })?);
+            schemas.push(session_search::event_trace_schema().map_err(|source| {
+                ToolRegistryBuildError::InvalidSchema {
+                    tool: session_search::SESSION_EVENT_TRACE_TOOL_NAME,
+                    source,
+                }
+            })?);
         }
         if lsp_config.is_some() {
             schemas.push(lsp::schema()?);

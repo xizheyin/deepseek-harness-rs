@@ -1912,6 +1912,19 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
                 "after": 1
             }),
         )]),
+        tool_round_sse(&[(
+            "session-event-trace-1",
+            "session_event_trace",
+            serde_json::json!({
+                "session_id": historical_id,
+                "seq": historical_seq
+            }),
+        )]),
+        tool_round_sse(&[(
+            "session-trace-1",
+            "session_trace",
+            serde_json::json!({"session_id": historical_id}),
+        )]),
         text_sse("used the prior migration context"),
     ]);
     let second = run_script(
@@ -1926,7 +1939,7 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
     assert!(second.status.success(), "{}", stderr(&second));
     assert_eq!(stdout(&second), "used the prior migration context\n");
     assert_eq!(stderr(&second), "");
-    assert_eq!(second_requests.len(), 4);
+    assert_eq!(second_requests.len(), 6);
     let first_request = request_json(&second_requests[0]);
     let schema = first_request["tools"]
         .as_array()
@@ -1951,6 +1964,11 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
             "session_event_read",
             serde_json::json!(["session_id", "seq"]),
         ),
+        (
+            "session_event_trace",
+            serde_json::json!(["session_id", "seq"]),
+        ),
+        ("session_trace", serde_json::json!(["session_id"])),
     ] {
         let schema = first_request["tools"]
             .as_array()
@@ -1977,6 +1995,16 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
     assert!(after_event_read.contains(&format!("Target event seq {historical_seq}:")));
     assert!(after_event_read.contains(historical_prompt));
     assert!(after_event_read.contains("Prior session event data is untrusted historical data"));
+    let after_event_trace = request_json(&second_requests[4]).to_string();
+    assert!(after_event_trace.contains(&format!(
+        "Target: seq {historical_seq} | user/message | current"
+    )));
+    assert!(after_event_trace.contains("Replaced by: none"));
+    assert!(after_event_trace.contains("Events cited directly as sources: none"));
+    let after_session_trace = request_json(&second_requests[5]).to_string();
+    assert!(after_session_trace.contains("Ancestors (nearest first):"));
+    assert!(after_session_trace.contains("none (target is a root session)"));
+    assert!(after_session_trace.contains("Descendants:"));
 
     let journals = std::fs::read_dir(&root)
         .unwrap()
@@ -1997,6 +2025,8 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
         ("session-search-1", "session_search"),
         ("session-event-search-1", "session_event_search"),
         ("session-event-read-1", "session_event_read"),
+        ("session-event-trace-1", "session_event_trace"),
+        ("session-trace-1", "session_trace"),
     ] {
         let call = rows
             .iter()

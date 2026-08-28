@@ -1,0 +1,44 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "paths": [
+      "packages/session-query/session-query/src/tracing.ts",
+      "packages/session-query/session-query/src/types.ts",
+      "packages/session-query/session-query/tests/tracing.spec.ts",
+      "packages/session-query/tool-session-query/src/operations.ts",
+      "packages/session-query/tool-session-query/src/presentation.ts"
+    ]
+  },
+  "sessionTrace": {
+    "name": "session_trace",
+    "officialRequired": [],
+    "rustRequired": ["session_id"],
+    "ancestorHeading": "Ancestors (nearest first):",
+    "descendantHeading": "Descendants:",
+    "root": "- none (target is a root session)",
+    "boundary": "- [outside workspace boundary]",
+    "availability": "persisted"
+  },
+  "eventTrace": {
+    "name": "session_event_trace",
+    "officialRequired": ["seq"],
+    "rustRequired": ["session_id", "seq"],
+    "lines": [
+      "Replaced by:",
+      "Replacement chain:",
+      "Events replaced by target:",
+      "Events cited directly as sources:",
+      "Direct derived events:"
+    ],
+    "surfaces": ["current", "shadowed", "log-only"]
+  },
+  "rustIntentionalDifference": {
+    "source": "strict normally closed same-workspace JSONL only",
+    "targetId": "required canonical session UUID",
+    "titles": false,
+    "liveSessions": false,
+    "perSessionBytes": 16777216,
+    "lineageCorpusBytes": 67108864
+  }
+}

@@ -390,6 +390,12 @@ impl SessionHeader {
         self.cwd.as_deref()
     }
 
+    /// Parent Session recorded for a delegated lineage, when present.
+    #[must_use]
+    pub fn parent_session(&self) -> Option<&SessionId> {
+        self.parent_session.as_ref()
+    }
+
     /// Complete validated header JSON, including fields unknown to this build.
     #[must_use]
     pub fn raw(&self) -> &JsonValue {
