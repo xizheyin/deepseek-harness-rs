@@ -376,6 +376,14 @@ impl LiveFrame {
                 writeln!(&mut text, "     {description}").map_err(|_| LiveRenderError)?;
             }
         }
+        if !request.options().is_empty() {
+            writeln!(
+                &mut text,
+                "  {}. Other (type your own answer)",
+                request.options().len() + 1
+            )
+            .map_err(|_| LiveRenderError)?;
+        }
         let mut parts = try_parts(3)?;
         let title = if total == 1 {
             if retry {
@@ -393,13 +401,20 @@ impl LiveFrame {
             role: UiRole::Dsh,
             text,
         });
-        if enhanced {
+        if request.options().is_empty() {
+            parts.push(LivePart::TrustedLine(if enhanced {
+                "Type your answer below · Enter submits · Ctrl+J newline · Esc cancels\n"
+            } else {
+                "Type your answer and press Enter\n"
+            }));
+        } else if enhanced {
             let mut hint = String::new();
             hint.try_reserve_exact(64).map_err(|_| LiveRenderError)?;
             writeln!(
                 &mut hint,
-                "Press 1-{} to choose · Esc cancels the question",
-                request.options().len()
+                "Press 1-{} to choose · {} opens custom text · Esc cancels",
+                request.options().len(),
+                request.options().len() + 1
             )
             .map_err(|_| LiveRenderError)?;
             parts.push(LivePart::TrustedOwned(hint));
@@ -408,6 +423,21 @@ impl LiveFrame {
                 "Type the option number and press Enter\n",
             ));
         }
+        Ok(Self { parts })
+    }
+
+    pub(super) fn user_question_custom_prompt(retry: bool) -> Result<Self, LiveRenderError> {
+        let mut parts = try_parts(2)?;
+        parts.push(LivePart::TrustedLine(if retry {
+            "[question answer not recognized]\n"
+        } else {
+            "[custom answer requested]\n"
+        }));
+        parts.push(LivePart::TrustedLine(if retry {
+            "Type a nonblank answer of at most 4096 bytes and press Enter\n"
+        } else {
+            "Type your answer and press Enter\n"
+        }));
         Ok(Self { parts })
     }
 }

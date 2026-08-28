@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–18 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–19 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -26,6 +26,7 @@ for behavior that users can run today.
 | 16 | Autonomous Goal terminal wrap-up context | `complete` | [`validation/phase-16.md`](validation/phase-16.md) |
 | 17 | Bounded interactive model-to-human question | `complete` | [`validation/phase-17.md`](validation/phase-17.md) |
 | 18 | Sequential bounded user-question batches | `complete` | [`validation/phase-18.md`](validation/phase-18.md) |
+| 19 | Bounded custom and option-free user answers | `complete` | [`validation/phase-19.md`](validation/phase-19.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -245,6 +246,26 @@ The compatibility row remains `partial`: Rust caps a batch at three and still
 does not collect official custom-text, option-free, multi-select, or plan-review
 forms. Evidence and the deliberate bounds are in
 `docs/design/user-question-batch.md` and `docs/validation/phase-18.md`.
+
+## Phase 19 custom-answer boundary (2026-08-28)
+
+Phase 19 closes the next official `ask_user_question` gap: a question may omit
+choices and collect free text, while a question with choices gains one explicit
+custom-answer path. In the existing single-select form, custom text replaces a
+choice and returns `selected: []` plus trimmed `custom`; ordinary choices keep
+returning the exact displayed label.
+
+Custom input is capped at 4,096 UTF-8 bytes. Enhanced terminals reuse the
+Unicode-aware composer with bounded multiline editing, while preserving and
+restoring any draft the user had already typed for the next turn. Linear mode
+accepts one canonical text record. Empty text retries the same question;
+Escape or turn cancellation closes the whole batch without publishing partial
+answers.
+
+Multi-select, skip, plan-review presentation, product subagent routing, and a
+general answerer waterfall remain outside this phase. Design and local evidence
+live in `docs/design/user-question-custom.md` and
+`docs/validation/phase-19.md`.
 
 ## Still deferred
 

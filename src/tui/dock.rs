@@ -32,6 +32,9 @@ pub(crate) enum DockInteraction {
         running: bool,
         snapshot: CommandPaletteSnapshot,
     },
+    QuestionCustom {
+        retry: bool,
+    },
     Approval(DockApprovalSelection),
     ExactShellApproval(DockApprovalSelection),
 }
@@ -266,6 +269,7 @@ impl DockFrame {
                 DockInteraction::CommandPalette { snapshot, .. } => Some(snapshot),
                 DockInteraction::Idle
                 | DockInteraction::Running
+                | DockInteraction::QuestionCustom { .. }
                 | DockInteraction::Approval(_)
                 | DockInteraction::ExactShellApproval(_) => None,
             };
@@ -326,6 +330,12 @@ impl DockFrame {
                     DockInteraction::CommandPalette { running: true, .. } => {
                         working_status(model.working)
                     }
+                    DockInteraction::QuestionCustom { retry: false } => {
+                        "Type a custom answer".to_owned()
+                    }
+                    DockInteraction::QuestionCustom { retry: true } => {
+                        "Answer required · 4 KiB maximum".to_owned()
+                    }
                     DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_) => {
                         "Approval required".to_owned()
                     }
@@ -377,6 +387,10 @@ impl DockFrame {
                     }
                     DockInteraction::CommandPalette { .. } if compact => "Enter · Esc",
                     DockInteraction::CommandPalette { .. } => "Enter complete · Esc close",
+                    DockInteraction::QuestionCustom { .. } if compact => "Enter · Esc",
+                    DockInteraction::QuestionCustom { .. } => {
+                        "Enter answer | Ctrl+J newline | Esc cancels question"
+                    }
                     DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_) => {
                         "Arrow keys move | Enter confirms | Esc stops"
                     }

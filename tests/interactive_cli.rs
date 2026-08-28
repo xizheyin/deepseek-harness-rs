@@ -2304,6 +2304,132 @@ fn user_question_batch_collects_each_choice_before_continuing() {
 }
 
 #[test]
+fn user_question_optionless_custom_answer_continues_with_exact_unicode_text() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-custom",
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{
+                    "id": "detail",
+                    "question": "How should I validate this change?"
+                }]
+            }),
+        ),
+        text_sse("I will follow the custom validation scope."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask for a custom validation scope\r");
+    dsh.expect(b"How should I validate this change?");
+    dsh.expect(b"Enter answer | Ctrl+J newline");
+    dsh.write(" 只跑必要检查".as_bytes());
+    dsh.write(&[0x0a]);
+    dsh.write("并保留草稿 \r".as_bytes());
+    dsh.expect(b"I will follow the custom validation scope.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-custom"),
+        r#"{"answers":[{"custom":"只跑必要检查\n并保留草稿","id":"detail","selected":[]}]}"#
+    );
+}
+
+#[test]
+fn user_question_custom_escape_cancels_without_publishing_partial_text() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-custom-cancel",
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{
+                    "id": "detail",
+                    "question": "Describe the optional change."
+                }]
+            }),
+        ),
+        text_sse("The custom question was cancelled."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask for optional details\r");
+    dsh.expect(b"Describe the optional change.");
+    dsh.expect(b"Enter answer | Ctrl+J newline");
+    dsh.write(b"partial text");
+    dsh.write(&[0x1b]);
+    dsh.expect(b"The custom question was cancelled.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-custom-cancel"),
+        "Error: ask_user_question was cancelled before the user answered"
+    );
+}
+
+#[test]
+fn user_question_mixed_batch_keeps_choice_and_custom_answers_in_order() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-mixed",
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [
+                    {
+                        "id": "mode",
+                        "question": "Which implementation mode?",
+                        "options": [{"label":"Safe"},{"label":"Fast"}]
+                    },
+                    {
+                        "id": "detail",
+                        "question": "What local check should I run?",
+                        "options": [{"label":"Format"},{"label":"Unit tests"}]
+                    }
+                ]
+            }),
+        ),
+        text_sse("I received the mixed answers."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask for a choice and a custom check\r");
+    dsh.expect(b"question 1/2 from assistant");
+    dsh.write(b"1");
+    dsh.expect(b"question 2/2 from assistant");
+    dsh.expect(b"3. Other (type your own answer)");
+    dsh.write(b"3");
+    dsh.expect(b"Enter answer | Ctrl+J newline");
+    dsh.write(b"cargo test focused\r");
+    dsh.expect(b"I received the mixed answers.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-mixed"),
+        concat!(
+            r#"{"answers":[{"id":"mode","selected":["Safe"]},"#,
+            r#"{"custom":"cargo test focused","id":"detail","selected":[]}]}"#,
+        )
+    );
+}
+
+#[test]
 fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
     let first_server = SequenceSseServer::start(vec![

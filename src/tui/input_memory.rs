@@ -438,6 +438,26 @@ struct HistoryNavigation {
     saved_cursor: usize,
 }
 
+struct ComposerOverlay {
+    saved_draft: String,
+    saved_cursor: usize,
+    saved_history_navigation: Option<HistoryNavigation>,
+}
+
+impl fmt::Debug for ComposerOverlay {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComposerOverlay")
+            .field("saved_draft_bytes", &self.saved_draft.len())
+            .field("saved_cursor", &self.saved_cursor)
+            .field(
+                "saved_history_navigation",
+                &self.saved_history_navigation.is_some(),
+            )
+            .finish()
+    }
+}
+
 impl fmt::Debug for HistoryNavigation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -455,6 +475,7 @@ pub(crate) struct InputMemory {
     queue: PromptQueue,
     history: PromptHistory,
     history_navigation: Option<HistoryNavigation>,
+    composer_overlay: Option<ComposerOverlay>,
 }
 
 impl fmt::Debug for InputMemory {
@@ -465,6 +486,7 @@ impl fmt::Debug for InputMemory {
             .field("queue", &self.queue)
             .field("history", &self.history)
             .field("history_navigation", &self.history_navigation)
+            .field("composer_overlay", &self.composer_overlay)
             .finish()
     }
 }
@@ -472,6 +494,52 @@ impl fmt::Debug for InputMemory {
 impl InputMemory {
     pub(crate) fn composer(&self) -> &Composer {
         &self.composer
+    }
+
+    pub(crate) fn begin_question_overlay(&mut self) -> Result<(), InputMemoryError> {
+        if self.composer_overlay.is_some() {
+            return Err(InputMemoryError::InvalidState);
+        }
+        let (saved_draft, saved_cursor) = self
+            .composer
+            .swap_draft(String::new(), 0)
+            .map_err(|_| InputMemoryError::Composer)?;
+        self.composer_overlay = Some(ComposerOverlay {
+            saved_draft,
+            saved_cursor,
+            saved_history_navigation: self.history_navigation.take(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn finish_question_overlay(&mut self) -> Result<String, InputMemoryError> {
+        let overlay = self
+            .composer_overlay
+            .take()
+            .ok_or(InputMemoryError::InvalidState)?;
+        let ComposerOverlay {
+            saved_draft,
+            saved_cursor,
+            saved_history_navigation,
+        } = overlay;
+        match self.composer.swap_draft(saved_draft, saved_cursor) {
+            Ok((answer, _)) => {
+                self.history_navigation = saved_history_navigation;
+                Ok(answer)
+            }
+            Err(saved_draft) => {
+                self.composer_overlay = Some(ComposerOverlay {
+                    saved_draft,
+                    saved_cursor,
+                    saved_history_navigation,
+                });
+                Err(InputMemoryError::Composer)
+            }
+        }
+    }
+
+    pub(crate) fn question_overlay_active(&self) -> bool {
+        self.composer_overlay.is_some()
     }
 
     #[cfg(test)]
@@ -566,6 +634,14 @@ impl InputMemory {
 
     pub(crate) fn move_line_end(&mut self) -> bool {
         self.composer.move_line_end()
+    }
+
+    pub(crate) fn move_question_up(&mut self, width: usize) -> Result<bool, InputMemoryError> {
+        self.composer.move_up(width).map_err(Into::into)
+    }
+
+    pub(crate) fn move_question_down(&mut self, width: usize) -> Result<bool, InputMemoryError> {
+        self.composer.move_down(width).map_err(Into::into)
     }
 
     pub(crate) fn move_up_or_history(&mut self, width: usize) -> Result<bool, InputMemoryError> {
@@ -1099,6 +1175,45 @@ mod tests {
         assert!(input.history_next().unwrap());
         assert_eq!(input.composer().text(), "matching");
         assert_eq!(input.composer().cursor(), saved_cursor);
+    }
+
+    #[test]
+    fn question_overlay_restores_the_exact_draft_cursor_and_history_navigation() {
+        let mut input = InputMemory::default();
+        input
+            .history_mut()
+            .record_committed("older prompt")
+            .unwrap();
+        input.composer_mut().insert_text("next-turn draft").unwrap();
+        input.composer_mut().move_left();
+        let original_cursor = input.composer().cursor();
+        assert!(input.history_previous().unwrap());
+        assert_eq!(input.composer().text(), "older prompt");
+
+        input.begin_question_overlay().unwrap();
+        assert!(input.question_overlay_active());
+        assert_eq!(input.composer().text(), "");
+        input.insert_text("自定义答案").unwrap();
+        assert_eq!(input.finish_question_overlay().unwrap(), "自定义答案");
+        assert!(!input.question_overlay_active());
+        assert_eq!(input.composer().text(), "older prompt");
+        assert!(input.history_next().unwrap());
+        assert_eq!(input.composer().text(), "next-turn draft");
+        assert_eq!(input.composer().cursor(), original_cursor);
+    }
+
+    #[test]
+    fn question_overlay_is_exclusive_and_cancel_discards_only_the_question_text() {
+        let mut input = InputMemory::default();
+        input.insert_text("kept draft").unwrap();
+        input.begin_question_overlay().unwrap();
+        assert_eq!(
+            input.begin_question_overlay(),
+            Err(InputMemoryError::InvalidState)
+        );
+        input.insert_text("discarded answer").unwrap();
+        assert_eq!(input.finish_question_overlay().unwrap(), "discarded answer");
+        assert_eq!(input.composer().text(), "kept draft");
     }
 
     #[test]

@@ -35,7 +35,7 @@ use crate::{
         theme::{ThemeCommand, ThemePalette, ThemeRequest, ThemeState},
         view::{ContextEstimate, ViewMode, ViewRequest, ViewState},
     },
-    user_question::{UserQuestionEnvelope, UserQuestionReceiver},
+    user_question::{MAX_CUSTOM_ANSWER_BYTES, UserQuestionEnvelope, UserQuestionReceiver},
 };
 
 use super::{
@@ -65,7 +65,7 @@ use super::{
         ApprovalTerminalMode, AsyncTerminal, ENHANCED_VISUAL_RESET_BYTES, TERMINAL_READ_BYTES,
         TerminalError, TerminalPanicRestore, TerminalSession, TerminalSize,
     },
-    user_question::{QuestionInputUpdate, UserQuestionUiState},
+    user_question::{QuestionAcceptingMode, QuestionInputUpdate, UserQuestionUiState},
 };
 
 const FRAME_DEADLINE: Duration = Duration::from_secs(5);
@@ -1740,7 +1740,9 @@ async fn render_enhanced_dock(
         let show_file_suggestions = view.requested().mode() == ViewMode::Focus
             && !matches!(
                 model.interaction,
-                DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+                DockInteraction::QuestionCustom { .. }
+                    | DockInteraction::Approval(_)
+                    | DockInteraction::ExactShellApproval(_)
             );
         let staged = file_suggestions
             .stage_presentation(show_file_suggestions)
@@ -1833,7 +1835,9 @@ async fn render_active_dock(
         let show_file_suggestions = dock.view.requested().mode() == ViewMode::Focus
             && !matches!(
                 interaction,
-                DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+                DockInteraction::QuestionCustom { .. }
+                    | DockInteraction::Approval(_)
+                    | DockInteraction::ExactShellApproval(_)
             );
         let staged = dock
             .file_suggestions
@@ -1962,7 +1966,9 @@ fn command_palette_interaction(
     if view == ViewMode::Focus
         && !matches!(
             interaction,
-            DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+            DockInteraction::QuestionCustom { .. }
+                | DockInteraction::Approval(_)
+                | DockInteraction::ExactShellApproval(_)
         )
         && command_palette.is_visible()
     {
@@ -3323,6 +3329,7 @@ async fn redraw_active_after_resize(
     live: &LiveRenderer,
     input: Option<&InputMemory>,
     notice: Option<&str>,
+    interaction: DockInteraction,
     terminal: &AsyncTerminal,
     signals: &mut SignalStreams,
     dock: Option<&mut ActiveDock<'_>>,
@@ -3334,7 +3341,7 @@ async fn redraw_active_after_resize(
     render_active_dock(
         input.ok_or(InteractiveError::Agent)?,
         notice,
-        DockInteraction::Running,
+        interaction,
         live,
         terminal,
         signals,
@@ -3342,6 +3349,68 @@ async fn redraw_active_after_resize(
         Some(motion_clock),
     )
     .await
+}
+
+fn question_dock_interaction(
+    question: &UserQuestionUiState,
+    approval: &ApprovalUiState<'_>,
+) -> DockInteraction {
+    if question.is_custom() {
+        DockInteraction::QuestionCustom {
+            retry: question.custom_retry(),
+        }
+    } else {
+        approval.dock_interaction()
+    }
+}
+
+fn restore_question_overlay(input: Option<&mut InputMemory>) -> Result<(), InteractiveError> {
+    let Some(input) = input else {
+        return Ok(());
+    };
+    if input.question_overlay_active() {
+        let _ = input.finish_question_overlay()?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuestionCustomDispatch {
+    Continue,
+    Redraw,
+    Eof,
+}
+
+fn dispatch_enhanced_question_custom(
+    outcome: QuestionCustomInputOutcome,
+    question: &mut UserQuestionUiState,
+    input: &mut InputMemory,
+) -> Result<QuestionCustomDispatch, InteractiveError> {
+    match outcome {
+        QuestionCustomInputOutcome::Continue => Ok(QuestionCustomDispatch::Continue),
+        QuestionCustomInputOutcome::Redraw => Ok(QuestionCustomDispatch::Redraw),
+        QuestionCustomInputOutcome::Invalid => {
+            question.retry();
+            Ok(QuestionCustomDispatch::Redraw)
+        }
+        QuestionCustomInputOutcome::Submit => {
+            let custom = input.finish_question_overlay()?;
+            if !question.submit_custom(custom) {
+                input.begin_question_overlay()?;
+            }
+            Ok(QuestionCustomDispatch::Redraw)
+        }
+        QuestionCustomInputOutcome::Cancel => {
+            let _ = input.finish_question_overlay()?;
+            question.cancel();
+            Ok(QuestionCustomDispatch::Redraw)
+        }
+        QuestionCustomInputOutcome::Eof => {
+            let _ = input.finish_question_overlay()?;
+            question.cancel();
+            Ok(QuestionCustomDispatch::Eof)
+        }
+    }
 }
 
 fn prepare_pending_for_resize(
@@ -3510,11 +3579,13 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         dock.palette_suppressed,
                     )
                     .map_err(|_| InteractiveError::Agent)?;
-                reset_file_suggestion_decoder(
-                    dock.file_suggestions,
-                    active.enhanced_decoder.as_deref_mut(),
-                    &mut input_escape_deadline,
-                )?;
+                if !question_ui.is_custom() {
+                    reset_file_suggestion_decoder(
+                        dock.file_suggestions,
+                        active.enhanced_decoder.as_deref_mut(),
+                        &mut input_escape_deadline,
+                    )?;
+                }
                 let file_snapshot = dock.file_suggestions.snapshot();
                 let palette_snapshot = active_command_palette_snapshot(input, dock);
                 let eligible = MotionEligibility {
@@ -3571,7 +3642,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 active.signals,
                 active.queued_input.as_deref(),
                 active.queue_notice.as_deref().and_then(Option::as_deref),
-                approval_ui.dock_interaction(),
+                question_dock_interaction(&question_ui, &approval_ui),
                 active.live,
                 active.active_dock.as_mut(),
                 &mut motion_clock,
@@ -3610,7 +3681,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         .as_deref()
                         .ok_or(InteractiveError::Agent)?,
                     active.queue_notice.as_deref().and_then(Option::as_deref),
-                    approval_ui.dock_interaction(),
+                    question_dock_interaction(&question_ui, &approval_ui),
                     active.live,
                     &mut motion_clock,
                     active.active_dock.as_mut().ok_or(InteractiveError::Agent)?,
@@ -3664,9 +3735,24 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 continue;
             }
             if pending.is_none() && question_ui.rendering_finished() {
-                question_ui
+                let mode = question_ui
                     .begin_accepting()
                     .map_err(|_| InteractiveError::Agent)?;
+                if mode == QuestionAcceptingMode::Custom && active.enhanced {
+                    active
+                        .queued_input
+                        .as_deref_mut()
+                        .ok_or(InteractiveError::Agent)?
+                        .begin_question_overlay()?;
+                    active
+                        .enhanced_decoder
+                        .as_deref_mut()
+                        .ok_or(InteractiveError::Agent)?
+                        .reset_epoch()
+                        .map_err(|_| InteractiveError::Agent)?;
+                    input_escape_deadline = None;
+                    dock_redraw_requested = true;
+                }
             }
             if pending.is_none() {
                 if let Some((request, retry, position, total)) = question_ui.frame_request() {
@@ -3710,6 +3796,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     active.live,
                     active.queued_input.as_deref(),
                     active.queue_notice.as_deref().and_then(Option::as_deref),
+                    question_dock_interaction(&question_ui, &approval_ui),
                     active.terminal,
                     active.signals,
                     active.active_dock.as_mut(),
@@ -3848,7 +3935,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                     .queue_notice
                                     .as_deref()
                                     .and_then(Option::as_deref),
-                                approval_ui.dock_interaction(),
+                                question_dock_interaction(&question_ui, &approval_ui),
                                 active.live,
                                 active.active_dock.as_mut(),
                                 &mut motion_clock,
@@ -4079,7 +4166,45 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         }
                         UiWork::InputEscapeExpired => {
                             input_escape_deadline = None;
-                            if approval_owns_active_input(active.joins, &approval_ui) {
+                            if question_ui.is_custom() && active.enhanced {
+                                let width = usize::from(
+                                    active
+                                        .terminal
+                                        .size()
+                                        .unwrap_or(TerminalSize {
+                                            rows: MIN_ENHANCED_ROWS,
+                                            columns: MIN_ENHANCED_COLUMNS,
+                                        })
+                                        .columns
+                                        .saturating_sub(3),
+                                )
+                                .max(1);
+                                let outcome = handle_question_custom_escape_expiry(
+                                    active.enhanced_decoder.as_deref_mut(),
+                                    active.queued_input.as_deref_mut(),
+                                    width,
+                                )?;
+                                let dispatched = dispatch_enhanced_question_custom(
+                                    outcome,
+                                    &mut question_ui,
+                                    active
+                                        .queued_input
+                                        .as_deref_mut()
+                                        .ok_or(InteractiveError::Agent)?,
+                                )?;
+                                match dispatched {
+                                    QuestionCustomDispatch::Continue => {}
+                                    QuestionCustomDispatch::Redraw => {
+                                        active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                        dock_redraw_requested = true;
+                                    }
+                                    QuestionCustomDispatch::Eof => {
+                                        stop = Some(StopIntent::Eof);
+                                        cancellation.cancel();
+                                        discard_pending(&mut pending, active.presenter);
+                                    }
+                                }
+                            } else if approval_owns_active_input(active.joins, &approval_ui) {
                                 if let Some(decoder) = active.enhanced_decoder.as_deref_mut() {
                                     decoder.reset_epoch().map_err(|_| InteractiveError::Agent)?;
                                 }
@@ -4221,6 +4346,39 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             if stop.is_some() {
                                 cancellation.cancel();
                                 discard_pending(&mut pending, active.presenter);
+                            } else if question_ui.is_custom() && active.enhanced {
+                                let outcome = handle_question_custom_input(
+                                    active.terminal,
+                                    active.enhanced_decoder.as_deref_mut(),
+                                    active.queued_input.as_deref_mut(),
+                                    &active.scratch[..count],
+                                )?;
+                                if let Some(decoder) = active.enhanced_decoder.as_deref() {
+                                    refresh_decoder_escape_deadline(
+                                        decoder,
+                                        &mut input_escape_deadline,
+                                    );
+                                }
+                                let dispatched = dispatch_enhanced_question_custom(
+                                    outcome,
+                                    &mut question_ui,
+                                    active
+                                        .queued_input
+                                        .as_deref_mut()
+                                        .ok_or(InteractiveError::Agent)?,
+                                )?;
+                                match dispatched {
+                                    QuestionCustomDispatch::Continue => {}
+                                    QuestionCustomDispatch::Redraw => {
+                                        active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                        dock_redraw_requested = true;
+                                    }
+                                    QuestionCustomDispatch::Eof => {
+                                        stop = Some(StopIntent::Eof);
+                                        cancellation.cancel();
+                                        discard_pending(&mut pending, active.presenter);
+                                    }
+                                }
                             } else if question_ui.is_accepting() {
                                 match question_ui.feed(&active.scratch[..count], active.enhanced) {
                                     QuestionInputUpdate::None => {}
@@ -4229,13 +4387,69 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
                                         dock_redraw_requested = active.enhanced;
                                     }
+                                    QuestionInputUpdate::CustomRequested => {
+                                        question_ui
+                                            .begin_custom()
+                                            .map_err(|_| InteractiveError::Agent)?;
+                                        if active.enhanced {
+                                            active
+                                                .queued_input
+                                                .as_deref_mut()
+                                                .ok_or(InteractiveError::Agent)?
+                                                .begin_question_overlay()?;
+                                            active
+                                                .enhanced_decoder
+                                                .as_deref_mut()
+                                                .ok_or(InteractiveError::Agent)?
+                                                .reset_epoch()
+                                                .map_err(|_| InteractiveError::Agent)?;
+                                            input_escape_deadline = None;
+                                            dock_redraw_requested = true;
+                                        } else {
+                                            enqueue_frame(
+                                                LiveFrame::user_question_custom_prompt(false)
+                                                    .map_err(|_| InteractiveError::Output)?,
+                                                AfterFrame::None,
+                                                &mut pending,
+                                                &mut frame_deadline,
+                                                &mut after_frame,
+                                            )?;
+                                        }
+                                    }
+                                    QuestionInputUpdate::CustomSubmitted(custom) => {
+                                        if !question_ui.submit_custom(custom) {
+                                            enqueue_frame(
+                                                LiveFrame::user_question_custom_prompt(true)
+                                                    .map_err(|_| InteractiveError::Output)?,
+                                                AfterFrame::None,
+                                                &mut pending,
+                                                &mut frame_deadline,
+                                                &mut after_frame,
+                                            )?;
+                                        }
+                                        active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                    }
                                     QuestionInputUpdate::Cancelled => {
                                         question_ui.cancel();
                                         active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
                                         dock_redraw_requested = active.enhanced;
                                     }
-                                    QuestionInputUpdate::Invalid => question_ui.retry(),
+                                    QuestionInputUpdate::Invalid => {
+                                        let custom = question_ui.is_custom();
+                                        question_ui.retry();
+                                        if custom && !active.enhanced {
+                                            enqueue_frame(
+                                                LiveFrame::user_question_custom_prompt(true)
+                                                    .map_err(|_| InteractiveError::Output)?,
+                                                AfterFrame::None,
+                                                &mut pending,
+                                                &mut frame_deadline,
+                                                &mut after_frame,
+                                            )?;
+                                        }
+                                    }
                                     QuestionInputUpdate::Eof => {
+                                        question_ui.cancel();
                                         stop = Some(StopIntent::Eof);
                                         cancellation.cancel();
                                         discard_pending(&mut pending, active.presenter);
@@ -4422,6 +4636,10 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     dock.file_suggestions.cancel_for_shutdown();
                 }
                 let _ = approval_ui.restore();
+                let question_overlay = restore_question_overlay(active.queued_input.as_deref_mut());
+                if question_ui.is_active() {
+                    question_ui.cancel();
+                }
                 if let Some(restorer) = active.panic_restore.as_ref() {
                     restorer.restore_now();
                 }
@@ -4437,10 +4655,18 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 active
                     .joins
                     .finish_turn(active.approvals, ApprovalResetMode::Discard)?;
+                question_overlay?;
                 return Err(error);
             }
         }
     };
+
+    if let Err(error) = restore_question_overlay(active.queued_input.as_deref_mut()) {
+        observe_failure(&mut stop, error);
+    }
+    if question_ui.is_active() {
+        question_ui.cancel();
+    }
 
     tokio::task::yield_now().await;
     drain_active_signals(active.signals, &mut stop);
@@ -4493,7 +4719,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 active.signals,
                 active.queued_input.as_deref(),
                 active.queue_notice.as_deref().and_then(Option::as_deref),
-                approval_ui.dock_interaction(),
+                question_dock_interaction(&question_ui, &approval_ui),
                 active.live,
                 active.active_dock.as_mut(),
                 &mut motion_clock,
@@ -4525,7 +4751,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                         .as_deref()
                         .ok_or(InteractiveError::Agent)?,
                     active.queue_notice.as_deref().and_then(Option::as_deref),
-                    approval_ui.dock_interaction(),
+                    question_dock_interaction(&question_ui, &approval_ui),
                     active.live,
                     &mut motion_clock,
                     active.active_dock.as_mut().ok_or(InteractiveError::Agent)?,
@@ -4572,6 +4798,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     active.live,
                     active.queued_input.as_deref(),
                     active.queue_notice.as_deref().and_then(Option::as_deref),
+                    question_dock_interaction(&question_ui, &approval_ui),
                     active.terminal,
                     active.signals,
                     active.active_dock.as_mut(),
@@ -4630,7 +4857,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                     .queue_notice
                                     .as_deref()
                                     .and_then(Option::as_deref),
-                                approval_ui.dock_interaction(),
+                                question_dock_interaction(&question_ui, &approval_ui),
                                 active.live,
                                 active.active_dock.as_mut(),
                                 &mut motion_clock,
@@ -5114,6 +5341,149 @@ enum ActiveInputOutcome {
     Redraw,
     PasteFence,
     Eof,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuestionCustomInputOutcome {
+    Continue,
+    Redraw,
+    Submit,
+    Cancel,
+    Eof,
+    Invalid,
+}
+
+fn handle_question_custom_input(
+    terminal: &AsyncTerminal,
+    decoder: Option<&mut KeyDecoder>,
+    input: Option<&mut InputMemory>,
+    bytes: &[u8],
+) -> Result<QuestionCustomInputOutcome, InteractiveError> {
+    let (Some(decoder), Some(input)) = (decoder, input) else {
+        return Err(InteractiveError::Agent);
+    };
+    let size = terminal.size().unwrap_or(TerminalSize {
+        rows: MIN_ENHANCED_ROWS,
+        columns: MIN_ENHANCED_COLUMNS,
+    });
+    let width = usize::from(size.columns.saturating_sub(3)).max(1);
+    let mut outcome = QuestionCustomInputOutcome::Continue;
+    let _ = decoder.feed(bytes, |decoded| {
+        let next = apply_question_custom_event(decoded.event, input, width);
+        match next {
+            Ok(QuestionCustomInputOutcome::Continue) => ControlFlow::Continue(()),
+            Ok(QuestionCustomInputOutcome::Redraw) => {
+                outcome = QuestionCustomInputOutcome::Redraw;
+                ControlFlow::Continue(())
+            }
+            Ok(next) => {
+                outcome = next;
+                ControlFlow::Break(())
+            }
+            Err(_) => {
+                outcome = QuestionCustomInputOutcome::Invalid;
+                ControlFlow::Break(())
+            }
+        }
+    });
+    Ok(outcome)
+}
+
+fn handle_question_custom_escape_expiry(
+    decoder: Option<&mut KeyDecoder>,
+    input: Option<&mut InputMemory>,
+    width: usize,
+) -> Result<QuestionCustomInputOutcome, InteractiveError> {
+    let (Some(decoder), Some(input)) = (decoder, input) else {
+        return Err(InteractiveError::Agent);
+    };
+    let Some(decoded) = decoder.expire_escape() else {
+        return Ok(QuestionCustomInputOutcome::Continue);
+    };
+    apply_question_custom_event(decoded.event, input, width).map_err(|_| InteractiveError::Agent)
+}
+
+fn apply_question_custom_event(
+    event: InputEvent,
+    input: &mut InputMemory,
+    width: usize,
+) -> Result<QuestionCustomInputOutcome, InputMemoryError> {
+    let cursor_only = matches!(
+        &event,
+        InputEvent::Key(
+            Key::BackTab | Key::Left | Key::Right | Key::Up | Key::Down | Key::Home | Key::End
+        )
+    );
+    let mut changed = false;
+    match event {
+        InputEvent::PasteStarted => return Ok(QuestionCustomInputOutcome::Continue),
+        InputEvent::Paste(text) => {
+            if !question_custom_fits(input, text.len()) {
+                return Ok(QuestionCustomInputOutcome::Invalid);
+            }
+            input.insert_paste(&text)?;
+            return Ok(QuestionCustomInputOutcome::Redraw);
+        }
+        InputEvent::PasteRejected(_) | InputEvent::Rejected(_) => {
+            return Ok(QuestionCustomInputOutcome::Invalid);
+        }
+        InputEvent::Key(Key::Enter) => return Ok(QuestionCustomInputOutcome::Submit),
+        InputEvent::Key(Key::Escape) => return Ok(QuestionCustomInputOutcome::Cancel),
+        InputEvent::Key(Key::Eof) => return Ok(QuestionCustomInputOutcome::Eof),
+        InputEvent::Key(Key::Newline) => {
+            if !question_custom_fits(input, 1) {
+                return Ok(QuestionCustomInputOutcome::Invalid);
+            }
+            input.insert_newline()?;
+        }
+        InputEvent::Key(Key::Char(character)) => {
+            if !question_custom_fits(input, character.len_utf8()) {
+                return Ok(QuestionCustomInputOutcome::Invalid);
+            }
+            input.insert_char(character)?;
+        }
+        InputEvent::Key(Key::Tab) => {
+            if !question_custom_fits(input, 1) {
+                return Ok(QuestionCustomInputOutcome::Invalid);
+            }
+            input.insert_text("\t")?;
+        }
+        InputEvent::Key(Key::BackTab | Key::Left) => changed = input.move_left(),
+        InputEvent::Key(Key::Right) => changed = input.move_right(),
+        InputEvent::Key(Key::Up) => changed = input.move_question_up(width)?,
+        InputEvent::Key(Key::Down) => changed = input.move_question_down(width)?,
+        InputEvent::Key(Key::Home) => changed = input.move_line_start(),
+        InputEvent::Key(Key::End) => changed = input.move_line_end(),
+        InputEvent::Key(Key::Backspace) => changed = input.backspace()?,
+        InputEvent::Key(Key::Delete) => changed = input.delete()?,
+        InputEvent::Key(Key::WordErase) => changed = input.erase_word()?,
+        InputEvent::Key(Key::ClearBefore) => changed = input.clear_before_cursor()?,
+        InputEvent::Key(Key::ClearAfter) => changed = input.clear_after_cursor()?,
+        InputEvent::Key(Key::Yank) => {
+            changed = input.yank()?;
+            if input.composer().byte_len() > MAX_CUSTOM_ANSWER_BYTES {
+                let _ = input.undo()?;
+                return Ok(QuestionCustomInputOutcome::Invalid);
+            }
+        }
+        InputEvent::Key(Key::Undo) => changed = input.undo()?,
+        InputEvent::Key(Key::ReverseSearch | Key::Inspect | Key::PageUp | Key::PageDown) => {
+            return Ok(QuestionCustomInputOutcome::Continue);
+        }
+    }
+    Ok(if changed || !cursor_only {
+        QuestionCustomInputOutcome::Redraw
+    } else {
+        QuestionCustomInputOutcome::Continue
+    })
+}
+
+fn question_custom_fits(input: &InputMemory, added_bytes: usize) -> bool {
+    input
+        .composer()
+        .byte_len()
+        .checked_add(added_bytes)
+        .is_some_and(|total| total <= MAX_CUSTOM_ANSWER_BYTES)
 }
 
 fn handle_active_input(
@@ -5719,7 +6089,9 @@ fn complete_ready_frame(
         let show_file_suggestions = dock.view.requested().mode() == ViewMode::Focus
             && !matches!(
                 interaction,
-                DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+                DockInteraction::QuestionCustom { .. }
+                    | DockInteraction::Approval(_)
+                    | DockInteraction::ExactShellApproval(_)
             );
         let staged_file_suggestions = dock
             .file_suggestions
@@ -6285,7 +6657,9 @@ async fn write_enhanced_terminal_frame(
         let show_file_suggestions = dock.view.committed().mode() == ViewMode::Focus
             && !matches!(
                 model.interaction,
-                DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_)
+                DockInteraction::QuestionCustom { .. }
+                    | DockInteraction::Approval(_)
+                    | DockInteraction::ExactShellApproval(_)
             );
         let staged_file_suggestions = dock
             .file_suggestions
@@ -6468,12 +6842,12 @@ mod tests {
     use super::{
         AfterFrame, ApprovalUiUpdate, EnhancedSubmission, FileSuggestionController, InlineIntent,
         InteractiveError, InteractiveExit, InteractivePresentation, MotionClock, MotionEligibility,
-        PendingInlineOutput, PendingOutput, StagedFileSuggestionPresentation, StopIntent,
-        SurfaceCommit, UiWork, apply_approval_update,
+        PendingInlineOutput, PendingOutput, QuestionCustomInputOutcome,
+        StagedFileSuggestionPresentation, StopIntent, SurfaceCommit, UiWork, apply_approval_update,
         apply_enhanced_input as apply_enhanced_input_with_files, apply_motion_command,
-        apply_theme_command, classify_enhanced_submission, commit_screen_working, commit_surface,
-        discard_ready_updates_after_stop, enqueue_enhanced_dock,
-        enqueue_standalone_motion_baseline,
+        apply_question_custom_event, apply_theme_command, classify_enhanced_submission,
+        commit_screen_working, commit_surface, discard_ready_updates_after_stop,
+        enqueue_enhanced_dock, enqueue_standalone_motion_baseline,
         expire_enhanced_escape as expire_enhanced_escape_with_files,
         fences_ordinary_input_after_motion_preemption, latch_observer_fault, next_ui_work,
         normalize_working_presentation, observe_enhanced_cleanup_signal, observe_failure,
@@ -6506,7 +6880,7 @@ mod tests {
             file_suggestions::FileSuggestionSnapshot,
             inline_screen::InlineScreen,
             input_memory::InputMemory,
-            key_decoder::KeyDecoder,
+            key_decoder::{InputEvent, Key, KeyDecoder},
             motion::{
                 MotionCommand, MotionPreference, MotionState, WorkingAge, WorkingPhase,
                 WorkingPresentation,
@@ -6593,6 +6967,36 @@ mod tests {
             size,
             notice,
         )
+    }
+
+    #[test]
+    fn question_custom_editor_keeps_the_exact_limit_when_one_more_byte_is_rejected() {
+        let mut input = InputMemory::default();
+        input.insert_text("saved draft").unwrap();
+        input.begin_question_overlay().unwrap();
+        input
+            .insert_text(&"x".repeat(crate::user_question::MAX_CUSTOM_ANSWER_BYTES))
+            .unwrap();
+        assert_eq!(
+            apply_question_custom_event(InputEvent::Key(Key::Char('y')), &mut input, 80).unwrap(),
+            QuestionCustomInputOutcome::Invalid
+        );
+        assert_eq!(
+            input.composer().byte_len(),
+            crate::user_question::MAX_CUSTOM_ANSWER_BYTES
+        );
+        assert_eq!(
+            apply_question_custom_event(InputEvent::Key(Key::Backspace), &mut input, 80).unwrap(),
+            QuestionCustomInputOutcome::Redraw
+        );
+        assert_eq!(
+            apply_question_custom_event(InputEvent::Key(Key::Char('y')), &mut input, 80).unwrap(),
+            QuestionCustomInputOutcome::Redraw
+        );
+        let answer = input.finish_question_overlay().unwrap();
+        assert_eq!(answer.len(), crate::user_question::MAX_CUSTOM_ANSWER_BYTES);
+        assert!(answer.ends_with('y'));
+        assert_eq!(input.composer().text(), "saved draft");
     }
 
     #[allow(clippy::too_many_arguments)]

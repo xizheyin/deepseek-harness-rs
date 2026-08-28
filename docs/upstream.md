@@ -1519,6 +1519,29 @@ not change this tool result. Rust Phase 18 keeps one terminal answerer and adds
 the bounded sequential batch defined in
 `docs/design/user-question-batch.md`.
 
+## Phase 19 custom-answer inspection — 2026-08-28
+
+The fixed `packages/interaction/tool-ask-user/src/index.ts` was rechecked for
+its optional `options` input and output object containing required `selected`
+plus optional `custom`. The fixed
+`packages/interaction/user-questions/src/types.ts` confirms that option-free
+questions and custom text use the same awaited interaction rather than a new
+model-visible message.
+
+The fixed Web implementation and tests were inspected at
+`packages/client/ui-user-questions/src/client/QuestionComposer.tsx` and
+`packages/client/ui-user-questions/tests/user-questions-composer.client.spec.tsx`.
+For a single-select question, nonblank trimmed custom text replaces the selected
+option and is returned with an empty `selected` array; an option-free question
+uses the same custom field. Escape cancels the whole request, and incomplete
+local drafts are not submitted.
+
+Latest `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc` and keeps the model-facing contract.
+Rust Phase 19 retains one terminal answerer plus explicit count and byte limits;
+the exact implementation boundary is in
+`docs/design/user-question-custom.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

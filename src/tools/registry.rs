@@ -523,10 +523,16 @@ async fn prepare_user_question(
     let result = broker.ask(question, cancellation).await;
     let result = match result {
         Ok(answer) => serde_json::to_string(&json!({
-            "answers": answer.answers().iter().map(|answer| json!({
-                "id": answer.id(),
-                "selected": [answer.selected()],
-            })).collect::<Vec<_>>()
+            "answers": answer.answers().iter().map(|answer| {
+                let mut value = json!({
+                    "id": answer.id(),
+                    "selected": answer.selected().into_iter().collect::<Vec<_>>(),
+                });
+                if let Some(custom) = answer.custom() {
+                    value["custom"] = json!(custom);
+                }
+                value
+            }).collect::<Vec<_>>()
         }))
         .map_err(|_| ToolExecutorError::new("user-question result normalization failed"))
         .and_then(normalize_success),
@@ -606,11 +612,18 @@ fn parse_user_question_item(value: &serde_json::Value) -> ToolCallResult<UserQue
         .transpose()?;
     let option_values = question
         .get("options")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| ToolCallError::invalid_args("options must be an array"))?;
-    if !(MIN_QUESTION_OPTIONS..=MAX_QUESTION_OPTIONS).contains(&option_values.len()) {
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| ToolCallError::invalid_args("options must be an array"))
+        })
+        .transpose()?;
+    let option_values = option_values.map(Vec::as_slice).unwrap_or_default();
+    if !option_values.is_empty()
+        && !(MIN_QUESTION_OPTIONS..=MAX_QUESTION_OPTIONS).contains(&option_values.len())
+    {
         return Err(ToolCallError::invalid_args(
-            "options must contain between two and four choices",
+            "options must be empty or contain between two and four choices",
         ));
     }
     let mut options = Vec::new();
@@ -1232,7 +1245,7 @@ fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
 fn build_user_question_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
     schema(
         "ask_user_question",
-        "Ask the user one concise single-choice question when a decision or missing fact is required before continuing.",
+        "Ask the user one to three concise single-choice or free-text questions when a decision or missing fact is required before continuing.",
         json!({
             "type": "object",
             "properties": {
@@ -1260,8 +1273,9 @@ fn build_user_question_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
                             },
                             "options": {
                                 "type": "array",
-                                "minItems": MIN_QUESTION_OPTIONS,
+                                "minItems": 0,
                                 "maxItems": MAX_QUESTION_OPTIONS,
+                                "description": "Optional choices. Omit or send an empty array for a free-text answer; the terminal also offers a bounded custom answer beside choices.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -1286,7 +1300,7 @@ fn build_user_question_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
                                 "description": "This terminal version supports single-select only"
                             }
                         },
-                        "required": ["id", "question", "options"],
+                        "required": ["id", "question"],
                         "additionalProperties": false
                     }
                 }
@@ -1325,7 +1339,7 @@ mod tests {
         goal::GoalRuntime,
         model::{CallId, ContentBlockKind, JsonValue},
         tools::EMPTY_TEXT_BLOCK_JSON_BYTES,
-        user_question::UserQuestionBroker,
+        user_question::{UserQuestionBroker, UserQuestionResponseItem},
     };
 
     fn goal_request(name: &str, arguments: serde_json::Value) -> ToolExecutionRequest {
@@ -1382,6 +1396,17 @@ mod tests {
         assert_eq!(parameters["properties"]["questions"]["minItems"], 1);
         assert_eq!(parameters["properties"]["questions"]["maxItems"], 3);
         assert_eq!(
+            parameters["properties"]["questions"]["items"]["properties"]["options"]["minItems"],
+            0
+        );
+        assert!(
+            !parameters["properties"]["questions"]["items"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "options")
+        );
+        assert_eq!(
             parameters["properties"]["questions"]["items"]["properties"]["multi_select"]["enum"],
             serde_json::json!([false])
         );
@@ -1401,6 +1426,18 @@ mod tests {
         let parsed = parse_user_question_arguments(&valid).unwrap();
         assert_eq!(parsed.questions()[0].header(), Some("Choose mode"));
         assert_eq!(parsed.questions()[0].options()[1].label(), "Fast");
+        for free_text in [
+            serde_json::json!({ "questions": [{ "id": "detail", "question": "What should I do?" }] }),
+            serde_json::json!({ "questions": [{ "id": "detail", "question": "What should I do?", "options": [] }] }),
+        ] {
+            assert!(
+                parse_user_question_arguments(&free_text)
+                    .unwrap()
+                    .questions()[0]
+                    .options()
+                    .is_empty()
+            );
+        }
 
         for invalid in [
             serde_json::json!({ "questions": [] }),
@@ -1445,7 +1482,11 @@ mod tests {
         let future = prepare_user_question(Some(broker), &request, CancellationToken::new());
         tokio::pin!(future);
         assert!(poll!(&mut future).is_pending());
-        receiver.try_recv().unwrap().answer(vec![1]).unwrap();
+        receiver
+            .try_recv()
+            .unwrap()
+            .answer(vec![UserQuestionResponseItem::Selected(1)])
+            .unwrap();
         let prepared = future.await.unwrap();
         let ToolPreparation::Complete(result) = prepared else {
             panic!("user question should settle as an ordinary result")
@@ -1455,6 +1496,37 @@ mod tests {
             panic!("user question should render compact JSON text")
         };
         assert_eq!(text, r#"{"answers":[{"id":"mode","selected":["Fast"]}]}"#);
+    }
+
+    #[tokio::test]
+    async fn user_question_returns_custom_text_with_an_empty_selection() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let request = goal_request(
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{"id":"detail","question":"What should I do?"}]
+            }),
+        );
+        let future = prepare_user_question(Some(broker), &request, CancellationToken::new());
+        tokio::pin!(future);
+        assert!(poll!(&mut future).is_pending());
+        receiver
+            .try_recv()
+            .unwrap()
+            .answer(vec![UserQuestionResponseItem::Custom(
+                "只跑必要检查".to_owned(),
+            )])
+            .unwrap();
+        let ToolPreparation::Complete(result) = future.await.unwrap() else {
+            panic!("user question should settle as an ordinary result")
+        };
+        let ContentBlockKind::Text { text } = result.content()[0].kind() else {
+            panic!("user question should render compact JSON text")
+        };
+        assert_eq!(
+            text,
+            r#"{"answers":[{"custom":"只跑必要检查","id":"detail","selected":[]}]}"#
+        );
     }
 
     #[test]
