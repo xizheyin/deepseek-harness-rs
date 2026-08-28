@@ -2254,6 +2254,56 @@ fn user_question_escape_returns_a_cancelled_tool_result_without_choosing() {
 }
 
 #[test]
+fn user_question_batch_collects_each_choice_before_continuing() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-batch",
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [
+                    {
+                        "id": "mode",
+                        "question": "Which implementation mode?",
+                        "options": [{"label":"Safe"},{"label":"Fast"}]
+                    },
+                    {
+                        "id": "tests",
+                        "question": "Which validation scope?",
+                        "options": [{"label":"Focused"},{"label":"Full"}]
+                    }
+                ]
+            }),
+        ),
+        text_sse("I have both decisions and can continue."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask for both decisions\r");
+    dsh.expect(b"question 1/2 from assistant");
+    dsh.expect(b"Which implementation mode?");
+    dsh.write(b"2");
+    dsh.expect(b"question 2/2 from assistant");
+    dsh.expect(b"Which validation scope?");
+    dsh.write(b"1");
+    dsh.expect(b"I have both decisions and can continue.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-batch"),
+        concat!(
+            r#"{"answers":[{"id":"mode","selected":["Fast"]},"#,
+            r#"{"id":"tests","selected":["Focused"]}]}"#,
+        )
+    );
+}
+
+#[test]
 fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
     let first_server = SequenceSseServer::start(vec![

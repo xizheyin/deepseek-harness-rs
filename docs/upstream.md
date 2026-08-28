@@ -1504,6 +1504,21 @@ in-flight cancellation is normalized. Phase 17 keeps one owned terminal
 answerer and the existing turn cancellation path; the first bounded UI form is
 specified in `docs/design/user-question.md`.
 
+## Phase 18 user-question batch inspection — 2026-08-28
+
+The fixed `packages/interaction/tool-ask-user/src/index.ts` and
+`tests/tool-ask-user.spec.ts` were rechecked for ordered multi-answer behavior.
+One tool call forwards the complete question array, awaits one answer object,
+and renders one compact `answers` array in provider order. The fixed
+`packages/interaction/user-questions/src/{index,types}.ts` owns the whole batch
+as one UI request and does not expose partial choices to the model.
+
+Latest `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`; its answerer-waterfall refactor does
+not change this tool result. Rust Phase 18 keeps one terminal answerer and adds
+the bounded sequential batch defined in
+`docs/design/user-question-batch.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

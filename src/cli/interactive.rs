@@ -3669,7 +3669,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     .map_err(|_| InteractiveError::Agent)?;
             }
             if pending.is_none() {
-                if let Some((request, retry)) = question_ui.frame_request() {
+                if let Some((request, retry, position, total)) = question_ui.frame_request() {
                     if active.enhanced {
                         active.terminal.revalidate_identity()?;
                         active
@@ -3684,7 +3684,13 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     }
                     active.terminal.flush_input()?;
                     active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
-                    let frame = LiveFrame::user_question(request, retry, active.enhanced)
+                    let frame = LiveFrame::user_question(
+                        request,
+                        retry,
+                        position,
+                        total,
+                        active.enhanced,
+                    )
                         .map_err(|_| InteractiveError::Output)?;
                     enqueue_frame(
                         frame,

@@ -6,6 +6,7 @@ pub(crate) const MAX_QUESTION_HEADER_BYTES: usize = 64;
 pub(crate) const MAX_QUESTION_TEXT_BYTES: usize = 512;
 pub(crate) const MAX_QUESTION_OPTION_LABEL_BYTES: usize = 128;
 pub(crate) const MAX_QUESTION_OPTION_DESCRIPTION_BYTES: usize = 256;
+pub(crate) const MAX_USER_QUESTIONS: usize = 3;
 pub(crate) const MIN_QUESTION_OPTIONS: usize = 2;
 pub(crate) const MAX_QUESTION_OPTIONS: usize = 4;
 
@@ -32,14 +33,14 @@ impl UserQuestionOption {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct UserQuestionRequest {
+pub(crate) struct UserQuestionItem {
     id: String,
     header: Option<String>,
     question: String,
     options: Vec<UserQuestionOption>,
 }
 
-impl UserQuestionRequest {
+impl UserQuestionItem {
     pub(crate) fn new(
         id: String,
         header: Option<String>,
@@ -54,7 +55,6 @@ impl UserQuestionRequest {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -73,18 +73,44 @@ impl UserQuestionRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct UserQuestionAnswer {
+pub(crate) struct UserQuestionRequest {
+    questions: Vec<UserQuestionItem>,
+}
+
+impl UserQuestionRequest {
+    pub(crate) fn new(questions: Vec<UserQuestionItem>) -> Self {
+        Self { questions }
+    }
+
+    pub(crate) fn questions(&self) -> &[UserQuestionItem] {
+        &self.questions
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserQuestionAnswerItem {
     id: String,
     selected: String,
 }
 
-impl UserQuestionAnswer {
+impl UserQuestionAnswerItem {
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
 
     pub(crate) fn selected(&self) -> &str {
         &self.selected
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserQuestionAnswer {
+    answers: Vec<UserQuestionAnswerItem>,
+}
+
+impl UserQuestionAnswer {
+    pub(crate) fn answers(&self) -> &[UserQuestionAnswerItem] {
+        &self.answers
     }
 }
 
@@ -104,8 +130,7 @@ pub(crate) type UserQuestionReceiver = mpsc::Receiver<UserQuestionEnvelope>;
 
 #[derive(Debug)]
 struct UserQuestionResponse {
-    id: String,
-    selected_index: Option<usize>,
+    selected_indices: Option<Vec<usize>>,
 }
 
 #[derive(Debug)]
@@ -119,14 +144,18 @@ impl UserQuestionEnvelope {
         &self.request
     }
 
-    pub(crate) fn select(self, selected_index: usize) -> Result<(), UserQuestionError> {
-        if selected_index >= self.request.options.len() {
+    pub(crate) fn answer(self, selected_indices: Vec<usize>) -> Result<(), UserQuestionError> {
+        if selected_indices.len() != self.request.questions.len()
+            || selected_indices
+                .iter()
+                .zip(&self.request.questions)
+                .any(|(index, question)| *index >= question.options.len())
+        {
             return Err(UserQuestionError::InvalidResponse);
         }
         self.response
             .send(UserQuestionResponse {
-                id: self.request.id,
-                selected_index: Some(selected_index),
+                selected_indices: Some(selected_indices),
             })
             .map_err(|_| UserQuestionError::Unavailable)
     }
@@ -134,8 +163,7 @@ impl UserQuestionEnvelope {
     pub(crate) fn cancel(self) -> Result<(), UserQuestionError> {
         self.response
             .send(UserQuestionResponse {
-                id: self.request.id,
-                selected_index: None,
+                selected_indices: None,
             })
             .map_err(|_| UserQuestionError::Unavailable)
     }
@@ -155,8 +183,7 @@ impl UserQuestionBroker {
         if cancellation.is_cancelled() {
             return Err(UserQuestionError::Cancelled);
         }
-        let expected_id = request.id.clone();
-        let options = request.options.clone();
+        let questions = request.questions.clone();
         let (response, receive_response) = oneshot::channel();
         self.sender
             .try_send(UserQuestionEnvelope { request, response })
@@ -166,21 +193,29 @@ impl UserQuestionBroker {
             _ = cancellation.cancelled() => return Err(UserQuestionError::Cancelled),
             response = receive_response => response.map_err(|_| UserQuestionError::Unavailable)?,
         };
-        if response.id != expected_id {
-            return Err(UserQuestionError::InvalidResponse);
-        }
-        let Some(selected_index) = response.selected_index else {
+        let Some(selected_indices) = response.selected_indices else {
             return Err(UserQuestionError::Cancelled);
         };
-        let selected = options
-            .get(selected_index)
-            .ok_or(UserQuestionError::InvalidResponse)?
-            .label
-            .clone();
-        Ok(UserQuestionAnswer {
-            id: expected_id,
-            selected,
-        })
+        if selected_indices.len() != questions.len() {
+            return Err(UserQuestionError::InvalidResponse);
+        }
+        let mut answers = Vec::new();
+        answers
+            .try_reserve_exact(questions.len())
+            .map_err(|_| UserQuestionError::Unavailable)?;
+        for (question, selected_index) in questions.into_iter().zip(selected_indices) {
+            let selected = question
+                .options
+                .get(selected_index)
+                .ok_or(UserQuestionError::InvalidResponse)?
+                .label
+                .clone();
+            answers.push(UserQuestionAnswerItem {
+                id: question.id,
+                selected,
+            });
+        }
+        Ok(UserQuestionAnswer { answers })
     }
 }
 
@@ -190,10 +225,13 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::sync::CancellationToken;
 
-    use super::{UserQuestionBroker, UserQuestionError, UserQuestionOption, UserQuestionRequest};
+    use super::{
+        UserQuestionBroker, UserQuestionError, UserQuestionItem, UserQuestionOption,
+        UserQuestionRequest,
+    };
 
-    fn request(id: &str) -> UserQuestionRequest {
-        UserQuestionRequest::new(
+    fn item(id: &str) -> UserQuestionItem {
+        UserQuestionItem::new(
             id.to_owned(),
             Some("Mode".to_owned()),
             "Which mode?".to_owned(),
@@ -202,6 +240,10 @@ mod tests {
                 UserQuestionOption::new("Fast".to_owned(), None),
             ],
         )
+    }
+
+    fn request(id: &str) -> UserQuestionRequest {
+        UserQuestionRequest::new(vec![item(id)])
     }
 
     #[tokio::test]
@@ -213,15 +255,38 @@ mod tests {
         tokio::pin!(future);
         assert!(poll!(&mut future).is_pending());
         let envelope = receiver.try_recv().unwrap();
-        assert_eq!(envelope.request().id(), "mode");
-        envelope.select(1).unwrap();
-        assert_eq!(
-            future.await.unwrap(),
-            super::UserQuestionAnswer {
-                id: "mode".to_owned(),
-                selected: "Fast".to_owned(),
-            }
+        assert_eq!(envelope.request().questions()[0].id(), "mode");
+        envelope.answer(vec![1]).unwrap();
+        let answer = future.await.unwrap();
+        assert_eq!(answer.answers()[0].id(), "mode");
+        assert_eq!(answer.answers()[0].selected(), "Fast");
+    }
+
+    #[tokio::test]
+    async fn broker_preserves_batch_order_and_rejects_a_short_response() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let request = UserQuestionRequest::new(vec![item("first"), item("second")]);
+        let future = broker.ask(request, CancellationToken::new());
+        tokio::pin!(future);
+        assert!(poll!(&mut future).is_pending());
+        receiver.try_recv().unwrap().answer(vec![1, 0]).unwrap();
+        let answer = future.await.unwrap();
+        assert_eq!(answer.answers()[0].id(), "first");
+        assert_eq!(answer.answers()[0].selected(), "Fast");
+        assert_eq!(answer.answers()[1].id(), "second");
+        assert_eq!(answer.answers()[1].selected(), "Safe");
+
+        let future = broker.ask(
+            UserQuestionRequest::new(vec![item("first"), item("second")]),
+            CancellationToken::new(),
         );
+        tokio::pin!(future);
+        assert!(poll!(&mut future).is_pending());
+        assert_eq!(
+            receiver.try_recv().unwrap().answer(vec![0]),
+            Err(UserQuestionError::InvalidResponse)
+        );
+        assert_eq!(future.await, Err(UserQuestionError::Unavailable));
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use crate::tui::{
 };
 
 use crate::agent::{ApprovalPreviewKind, TurnOutcome};
-use crate::user_question::UserQuestionRequest;
+use crate::user_question::UserQuestionItem;
 
 use super::{
     render::VisibleRenderer,
@@ -356,8 +356,10 @@ impl LiveFrame {
     }
 
     pub(super) fn user_question(
-        request: &UserQuestionRequest,
+        request: &UserQuestionItem,
         retry: bool,
+        position: usize,
+        total: usize,
         enhanced: bool,
     ) -> Result<Self, LiveRenderError> {
         let mut text = String::new();
@@ -375,11 +377,18 @@ impl LiveFrame {
             }
         }
         let mut parts = try_parts(3)?;
-        parts.push(LivePart::TrustedLine(if retry {
-            "[question answer not recognized]\n"
+        let title = if total == 1 {
+            if retry {
+                "[question answer not recognized]\n".to_owned()
+            } else {
+                "[question from assistant]\n".to_owned()
+            }
+        } else if retry {
+            format!("[question {position}/{total} answer not recognized]\n")
         } else {
-            "[question from assistant]\n"
-        }));
+            format!("[question {position}/{total} from assistant]\n")
+        };
+        parts.push(LivePart::TrustedOwned(title));
         parts.push(LivePart::Untrusted {
             role: UiRole::Dsh,
             text,

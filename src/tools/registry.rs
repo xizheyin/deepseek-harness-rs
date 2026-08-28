@@ -13,8 +13,8 @@ use crate::{
     user_question::{
         MAX_QUESTION_HEADER_BYTES, MAX_QUESTION_ID_BYTES, MAX_QUESTION_OPTION_DESCRIPTION_BYTES,
         MAX_QUESTION_OPTION_LABEL_BYTES, MAX_QUESTION_OPTIONS, MAX_QUESTION_TEXT_BYTES,
-        MIN_QUESTION_OPTIONS, UserQuestionBroker, UserQuestionError, UserQuestionOption,
-        UserQuestionRequest,
+        MAX_USER_QUESTIONS, MIN_QUESTION_OPTIONS, UserQuestionBroker, UserQuestionError,
+        UserQuestionItem, UserQuestionOption, UserQuestionRequest,
     },
     workspace_authority::WorkspaceAuthority,
 };
@@ -523,10 +523,10 @@ async fn prepare_user_question(
     let result = broker.ask(question, cancellation).await;
     let result = match result {
         Ok(answer) => serde_json::to_string(&json!({
-            "answers": [{
+            "answers": answer.answers().iter().map(|answer| json!({
                 "id": answer.id(),
                 "selected": [answer.selected()],
-            }]
+            })).collect::<Vec<_>>()
         }))
         .map_err(|_| ToolExecutorError::new("user-question result normalization failed"))
         .and_then(normalize_success),
@@ -550,12 +550,30 @@ fn parse_user_question_arguments(
         .get("questions")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| ToolCallError::invalid_args("questions must be an array"))?;
-    if questions.len() != 1 {
+    if questions.is_empty() || questions.len() > MAX_USER_QUESTIONS {
         return Err(ToolCallError::invalid_args(
-            "questions must contain exactly one question",
+            "questions must contain between one and three questions",
         ));
     }
-    let question = questions[0]
+    let mut parsed = Vec::new();
+    parsed
+        .try_reserve_exact(questions.len())
+        .map_err(|_| ToolCallError::invalid_args("questions could not be retained"))?;
+    for question in questions {
+        let question = parse_user_question_item(question)?;
+        if parsed
+            .iter()
+            .any(|existing: &UserQuestionItem| existing.id() == question.id())
+        {
+            return Err(ToolCallError::invalid_args("question ids must be unique"));
+        }
+        parsed.push(question);
+    }
+    Ok(UserQuestionRequest::new(parsed))
+}
+
+fn parse_user_question_item(value: &serde_json::Value) -> ToolCallResult<UserQuestionItem> {
+    let question = value
         .as_object()
         .ok_or_else(|| ToolCallError::invalid_args("question must be an object"))?;
     if question.keys().any(|key| {
@@ -634,7 +652,7 @@ fn parse_user_question_arguments(
             .transpose()?;
         options.push(UserQuestionOption::new(label, description));
     }
-    Ok(UserQuestionRequest::new(id, header, text, options))
+    Ok(UserQuestionItem::new(id, header, text, options))
 }
 
 fn bounded_question_text(
@@ -1221,7 +1239,7 @@ fn build_user_question_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
                 "questions": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 1,
+                    "maxItems": MAX_USER_QUESTIONS,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -1362,7 +1380,7 @@ mod tests {
         let parameters = schema.parameters().as_value();
         assert_eq!(parameters["additionalProperties"], false);
         assert_eq!(parameters["properties"]["questions"]["minItems"], 1);
-        assert_eq!(parameters["properties"]["questions"]["maxItems"], 1);
+        assert_eq!(parameters["properties"]["questions"]["maxItems"], 3);
         assert_eq!(
             parameters["properties"]["questions"]["items"]["properties"]["multi_select"]["enum"],
             serde_json::json!([false])
@@ -1381,12 +1399,21 @@ mod tests {
             }]
         });
         let parsed = parse_user_question_arguments(&valid).unwrap();
-        assert_eq!(parsed.header(), Some("Choose mode"));
-        assert_eq!(parsed.options()[1].label(), "Fast");
+        assert_eq!(parsed.questions()[0].header(), Some("Choose mode"));
+        assert_eq!(parsed.questions()[0].options()[1].label(), "Fast");
 
         for invalid in [
             serde_json::json!({ "questions": [] }),
-            serde_json::json!({ "questions": [valid["questions"][0].clone(), valid["questions"][0].clone()] }),
+            serde_json::json!({ "questions": [
+                valid["questions"][0].clone(),
+                {"id":"two","question":"Two?","options":[{"label":"A"},{"label":"B"}]},
+                {"id":"three","question":"Three?","options":[{"label":"A"},{"label":"B"}]},
+                {"id":"four","question":"Four?","options":[{"label":"A"},{"label":"B"}]}
+            ] }),
+            serde_json::json!({ "questions": [
+                {"id":"same","question":"One?","options":[{"label":"A"},{"label":"B"}]},
+                {"id":"same","question":"Two?","options":[{"label":"A"},{"label":"B"}]}
+            ] }),
             serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"Only"}] }] }),
             serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"Same"},{"label":"Same"}] }] }),
             serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"A"},{"label":"B"}], "multi_select": true }] }),
@@ -1418,7 +1445,7 @@ mod tests {
         let future = prepare_user_question(Some(broker), &request, CancellationToken::new());
         tokio::pin!(future);
         assert!(poll!(&mut future).is_pending());
-        receiver.try_recv().unwrap().select(1).unwrap();
+        receiver.try_recv().unwrap().answer(vec![1]).unwrap();
         let prepared = future.await.unwrap();
         let ToolPreparation::Complete(result) = prepared else {
             panic!("user question should settle as an ordinary result")

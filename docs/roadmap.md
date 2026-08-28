@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–17 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–18 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -25,6 +25,7 @@ for behavior that users can run today.
 | 15 | Official Goal tool contract and configurable cap | `complete` | [`validation/phase-15.md`](validation/phase-15.md) |
 | 16 | Autonomous Goal terminal wrap-up context | `complete` | [`validation/phase-16.md`](validation/phase-16.md) |
 | 17 | Bounded interactive model-to-human question | `complete` | [`validation/phase-17.md`](validation/phase-17.md) |
+| 18 | Sequential bounded user-question batches | `complete` | [`validation/phase-18.md`](validation/phase-18.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -226,6 +227,24 @@ question batches, free-form answers, multi-select, plan-review presentation,
 product subagent routing, and the latest Cordis answerer waterfall remain
 outside Phase 17. The exact choice, risks, and evidence are in
 `docs/design/user-question.md` and `docs/validation/phase-17.md`.
+
+## Phase 18 question-batch boundary (2026-08-28)
+
+Phase 18 extends `ask_user_question` to one through three questions per tool
+call. The terminal presents one bounded question at a time with explicit batch
+progress, fences input again before every later question, and returns one
+ordered compact answer array only after the final selection. Escape or turn
+cancellation closes the whole batch without publishing partial choices.
+
+Question IDs are unique, every response index is rechecked against the exact
+displayed options, and the existing one-shot capacity-one broker still owns the
+entire interaction. The Session continues to contain one tool intent and one
+correlated result; no intermediate UI choice becomes model context.
+
+The compatibility row remains `partial`: Rust caps a batch at three and still
+does not collect official custom-text, option-free, multi-select, or plan-review
+forms. Evidence and the deliberate bounds are in
+`docs/design/user-question-batch.md` and `docs/validation/phase-18.md`.
 
 ## Still deferred
 
