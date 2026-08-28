@@ -24,5 +24,6 @@ mod signal;
 mod storage_failure;
 mod terminal;
 mod theme;
+mod user_question;
 
 pub use entry::entry;

@@ -35,6 +35,7 @@ use crate::{
         theme::{ThemeCommand, ThemePalette, ThemeRequest, ThemeState},
         view::{ContextEstimate, ViewMode, ViewRequest, ViewState},
     },
+    user_question::{UserQuestionEnvelope, UserQuestionReceiver},
 };
 
 use super::{
@@ -64,6 +65,7 @@ use super::{
         ApprovalTerminalMode, AsyncTerminal, ENHANCED_VISUAL_RESET_BYTES, TERMINAL_READ_BYTES,
         TerminalError, TerminalPanicRestore, TerminalSession, TerminalSize,
     },
+    user_question::{QuestionInputUpdate, UserQuestionUiState},
 };
 
 const FRAME_DEADLINE: Duration = Duration::from_secs(5);
@@ -290,6 +292,7 @@ async fn run_enhanced(
         mut agent,
         mut events,
         mut approvals,
+        mut user_questions,
         mut joins,
         session_id,
         resumed,
@@ -716,6 +719,7 @@ async fn run_enhanced(
                                 agent: &mut agent,
                                 events: &mut events,
                                 approvals: &mut approvals,
+                                user_questions: &mut user_questions,
                                 joins: &mut joins,
                                 live: &mut live,
                                 presenter: &mut presenter,
@@ -2376,6 +2380,7 @@ async fn run_linear(
         mut agent,
         mut events,
         mut approvals,
+        mut user_questions,
         mut joins,
         session_id,
         resumed,
@@ -2406,6 +2411,7 @@ async fn run_linear(
                         agent: &mut agent,
                         events: &mut events,
                         approvals: &mut approvals,
+                        user_questions: &mut user_questions,
                         joins: &mut joins,
                         live: &mut live,
                         presenter: &mut presenter,
@@ -2616,6 +2622,7 @@ async fn run_linear(
                             agent: &mut agent,
                             events: &mut events,
                             approvals: &mut approvals,
+                            user_questions: &mut user_questions,
                             joins: &mut joins,
                             live: &mut live,
                             presenter: &mut presenter,
@@ -2693,6 +2700,7 @@ struct ActiveTurn<'a> {
     agent: &'a mut AgentLoop,
     events: &'a mut CommittedUiReceiver,
     approvals: &'a mut ApprovalEnvelopeReceiver,
+    user_questions: &'a mut UserQuestionReceiver,
     joins: &'a mut ApprovalJoin,
     live: &'a mut LiveRenderer,
     presenter: &'a mut InteractivePresenter,
@@ -3466,6 +3474,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
     let mut frame_deadline = None;
     let mut after_frame = AfterFrame::None;
     let mut approval_ui = ApprovalUiState::new();
+    let mut question_ui = UserQuestionUiState::default();
     let mut turn_end_seen = false;
     let mut turn_end_rendered = false;
     let mut stop = None;
@@ -3486,7 +3495,9 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             let mut motion_eligible = false;
             if let Some(dock) = active.active_dock.as_mut() {
                 dock.palette_suppressed =
-                    active.joins.question().is_some() || !approval_ui.is_inactive();
+                    active.joins.question().is_some()
+                        || !approval_ui.is_inactive()
+                        || question_ui.is_active();
                 let input = active
                     .queued_input
                     .as_deref()
@@ -3510,7 +3521,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     enhanced: active.enhanced,
                     turn_open: !turn_end_seen,
                     approval_inactive: approval_ui.is_inactive(),
-                    no_question: active.joins.question().is_none(),
+                    no_question: active.joins.question().is_none() && !question_ui.is_active(),
                     focus: dock.view.requested().mode() == ViewMode::Focus,
                     no_notice: active.queue_notice.as_deref().is_none_or(|notice| notice.is_none()),
                     queue_empty: input.queue().len() == 0,
@@ -3652,6 +3663,41 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 );
                 continue;
             }
+            if pending.is_none() && question_ui.rendering_finished() {
+                question_ui
+                    .begin_accepting()
+                    .map_err(|_| InteractiveError::Agent)?;
+            }
+            if pending.is_none() {
+                if let Some((request, retry)) = question_ui.frame_request() {
+                    if active.enhanced {
+                        active.terminal.revalidate_identity()?;
+                        active
+                            .enhanced_decoder
+                            .as_deref_mut()
+                            .ok_or(InteractiveError::Agent)?
+                            .reset_epoch()
+                            .map_err(|_| InteractiveError::Agent)?;
+                        input_escape_deadline = None;
+                    } else {
+                        active.terminal.revalidate()?;
+                    }
+                    active.terminal.flush_input()?;
+                    active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                    let frame = LiveFrame::user_question(request, retry, active.enhanced)
+                        .map_err(|_| InteractiveError::Output)?;
+                    enqueue_frame(
+                        frame,
+                        AfterFrame::None,
+                        &mut pending,
+                        &mut frame_deadline,
+                        &mut after_frame,
+                    )?;
+                    question_ui
+                        .mark_rendering()
+                        .map_err(|_| InteractiveError::Agent)?;
+                }
+            }
             if pending.is_none() && mem::take(&mut dock_redraw_requested) {
                 match redraw_active_after_resize(
                     active.enhanced,
@@ -3759,6 +3805,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             let work = next_ui_work(
                 active.terminal,
                 active.approvals,
+                active.user_questions,
                 active.events,
                 active.scratch,
                 pending.as_ref(),
@@ -3769,7 +3816,8 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 active.active_dock.as_ref().and_then(|dock| {
                     motion_clock.deadline(dock.motion.committed().preference(), dock.working)
                 }),
-                !(pending.is_some() && approval_ui.suppresses_read_while_pending()),
+                !(pending.is_some() && approval_ui.suppresses_read_while_pending())
+                    && (!question_ui.is_active() || question_ui.is_accepting()),
                 prefer_input,
             );
             let suggestion_running = active
@@ -3892,6 +3940,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             | UiWork::EscapeExpired
                             | UiWork::InputEscapeExpired
                             | UiWork::Envelope(_)
+                            | UiWork::Question(_)
                             | UiWork::Event(_)
                             | UiWork::Read(_)
                     );
@@ -4098,6 +4147,24 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                 );
                             }
                         }
+                        UiWork::Question(envelope) => {
+                            let received = envelope
+                                .ok_or(InteractiveError::Agent)
+                                .and_then(|envelope| {
+                                    question_ui
+                                        .receive(envelope)
+                                        .map_err(|_| InteractiveError::Agent)
+                                });
+                            if let Err(error) = received {
+                                latch_active_failure(
+                                    &mut stop,
+                                    &cancellation,
+                                    &mut pending,
+                                    active.presenter,
+                                    error,
+                                );
+                            }
+                        }
                         UiWork::Event(event) => {
                             let processed = event.ok_or(InteractiveError::Agent).and_then(|event| {
                                 process_event(
@@ -4148,6 +4215,26 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             if stop.is_some() {
                                 cancellation.cancel();
                                 discard_pending(&mut pending, active.presenter);
+                            } else if question_ui.is_accepting() {
+                                match question_ui.feed(&active.scratch[..count], active.enhanced) {
+                                    QuestionInputUpdate::None => {}
+                                    QuestionInputUpdate::Selected(index) => {
+                                        question_ui.select(index);
+                                        active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                        dock_redraw_requested = active.enhanced;
+                                    }
+                                    QuestionInputUpdate::Cancelled => {
+                                        question_ui.cancel();
+                                        active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                        dock_redraw_requested = active.enhanced;
+                                    }
+                                    QuestionInputUpdate::Invalid => question_ui.retry(),
+                                    QuestionInputUpdate::Eof => {
+                                        stop = Some(StopIntent::Eof);
+                                        cancellation.cancel();
+                                        discard_pending(&mut pending, active.presenter);
+                                    }
+                                }
                             } else if approval_ui.is_accepting() {
                                 let handled = active
                                     .joins
@@ -4506,6 +4593,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             let work = next_ui_work(
                 active.terminal,
                 active.approvals,
+                active.user_questions,
                 active.events,
                 active.scratch,
                 pending.as_ref(),
@@ -4515,6 +4603,7 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                 input_escape_deadline,
                 None,
                 !(motion_reattach_wait_for_fact
+                    || question_ui.is_active()
                     || pending.is_some() && approval_ui.suppresses_read_while_pending()),
                 prefer_input,
             );
@@ -4679,6 +4768,10 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                 observe_failure(&mut stop, error);
                                 discard_pending(&mut pending, active.presenter);
                             }
+                        }
+                        UiWork::Question(_) => {
+                            observe_failure(&mut stop, InteractiveError::Agent);
+                            discard_pending(&mut pending, active.presenter);
                         }
                         UiWork::Event(event) => {
                             let processed = event.ok_or(InteractiveError::Agent).and_then(|event| {
@@ -5818,6 +5911,7 @@ enum UiWork {
     InputEscapeExpired,
     Write(std::io::Result<usize>),
     Envelope(Option<ApprovalEnvelope>),
+    Question(Option<UserQuestionEnvelope>),
     Event(Option<crate::session::CommittedUiEvent>),
     Read(std::io::Result<usize>),
     MotionTick(MotionTick),
@@ -5832,6 +5926,7 @@ fn fences_ordinary_input_after_motion_preemption(work: &UiWork) -> bool {
 async fn next_ui_work(
     terminal: &AsyncTerminal,
     approvals: &mut ApprovalEnvelopeReceiver,
+    user_questions: &mut UserQuestionReceiver,
     events: &mut CommittedUiReceiver,
     scratch: &mut [u8; TERMINAL_READ_BYTES],
     pending: Option<&PendingOutput>,
@@ -5863,6 +5958,7 @@ async fn next_ui_work(
                 () = tokio::time::sleep_until(input_escape_deadline_at), if input_escape_pending => UiWork::InputEscapeExpired,
                 read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
                 envelope = approvals.recv() => UiWork::Envelope(envelope),
+                question = user_questions.recv() => UiWork::Question(question),
                 event = events.recv() => UiWork::Event(event),
                 write = write_pending(terminal, pending) => UiWork::Write(write),
             }
@@ -5874,6 +5970,7 @@ async fn next_ui_work(
                 () = tokio::time::sleep_until(escape_deadline_at), if escape_pending => UiWork::EscapeExpired,
                 () = tokio::time::sleep_until(input_escape_deadline_at), if input_escape_pending => UiWork::InputEscapeExpired,
                 envelope = approvals.recv() => UiWork::Envelope(envelope),
+                question = user_questions.recv() => UiWork::Question(question),
                 event = events.recv() => UiWork::Event(event),
                 read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
                 write = write_pending(terminal, pending) => UiWork::Write(write),
@@ -5890,6 +5987,7 @@ async fn next_ui_work(
             read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
             write = write_pending(terminal, pending), if pending.is_some() => UiWork::Write(write),
             envelope = approvals.recv() => UiWork::Envelope(envelope),
+            question = user_questions.recv() => UiWork::Question(question),
             event = events.recv(), if pending.is_none() => UiWork::Event(event),
             () = tokio::time::sleep_until(motion_deadline_at), if motion_deadline.is_some() && pending.is_none() => motion_deadline.map(UiWork::MotionTick).unwrap_or(UiWork::FrameExpired),
         }
@@ -5902,6 +6000,7 @@ async fn next_ui_work(
             () = tokio::time::sleep_until(input_escape_deadline_at), if input_escape_pending => UiWork::InputEscapeExpired,
             write = write_pending(terminal, pending), if pending.is_some() => UiWork::Write(write),
             envelope = approvals.recv() => UiWork::Envelope(envelope),
+            question = user_questions.recv() => UiWork::Question(question),
             event = events.recv(), if pending.is_none() => UiWork::Event(event),
             read = terminal.read_once(scratch), if read_enabled => UiWork::Read(read),
             () = tokio::time::sleep_until(motion_deadline_at), if motion_deadline.is_some() && pending.is_none() => motion_deadline.map(UiWork::MotionTick).unwrap_or(UiWork::FrameExpired),
@@ -8385,6 +8484,7 @@ mod tests {
 
             let mut session = Session::new("motion-priority").unwrap();
             let mut events = session.attach_ui_observer().unwrap();
+            let (_question_sender, mut user_questions) = tokio::sync::mpsc::channel(1);
             let mut scratch = [0_u8; super::TERMINAL_READ_BYTES];
             let pending = PendingOutput::MotionDock {
                 interaction: DockInteraction::Running,
@@ -8396,6 +8496,7 @@ mod tests {
             let work = next_ui_work(
                 &terminal,
                 &mut approvals,
+                &mut user_questions,
                 &mut events,
                 &mut scratch,
                 Some(&pending),
@@ -8421,6 +8522,7 @@ mod tests {
             let output: OwnedFd = terminal_side.into();
             let terminal = AsyncTerminal::from_owned_fds_for_test(input, output);
             let (_sender, mut approvals) = tokio::sync::mpsc::channel(1);
+            let (_question_sender, mut user_questions) = tokio::sync::mpsc::channel(1);
             let mut session = Session::new("motion-event-priority").unwrap();
             let mut events = session.attach_ui_observer().unwrap();
             session.append(NewEvent::log(EventKind::EndSeed)).unwrap();
@@ -8435,6 +8537,7 @@ mod tests {
             let work = next_ui_work(
                 &terminal,
                 &mut approvals,
+                &mut user_questions,
                 &mut events,
                 &mut scratch,
                 Some(&pending),

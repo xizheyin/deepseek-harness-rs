@@ -7,6 +7,7 @@ mod goal;
 mod json_value;
 mod resident_credit;
 mod tui;
+mod user_question;
 mod workspace_authority;
 
 pub mod agent;

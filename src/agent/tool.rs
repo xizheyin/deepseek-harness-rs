@@ -40,6 +40,7 @@ pub struct ToolClaimProfile {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ToolClaimKind {
     Standard,
+    UserQuestion,
     ShellAction,
     PluginAction(String),
 }
@@ -50,6 +51,7 @@ impl std::fmt::Debug for ToolClaimProfile {
             .debug_tuple("ToolClaimProfile")
             .field(&match self.kind {
                 ToolClaimKind::Standard => "standard",
+                ToolClaimKind::UserQuestion => "user-question",
                 ToolClaimKind::ShellAction => "crate-controlled-action",
                 ToolClaimKind::PluginAction(_) => "crate-controlled-plugin-action",
             })
@@ -69,6 +71,13 @@ impl ToolClaimProfile {
     pub(crate) fn shell_action() -> Self {
         Self {
             kind: ToolClaimKind::ShellAction,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn user_question() -> Self {
+        Self {
+            kind: ToolClaimKind::UserQuestion,
         }
     }
 
@@ -101,9 +110,14 @@ impl ToolClaimProfile {
         )
     }
 
+    #[must_use]
+    pub(crate) fn is_user_question(&self) -> bool {
+        self.kind == ToolClaimKind::UserQuestion
+    }
+
     pub(crate) fn action_contract(&self) -> Option<ActionContract> {
         match &self.kind {
-            ToolClaimKind::Standard => None,
+            ToolClaimKind::Standard | ToolClaimKind::UserQuestion => None,
             ToolClaimKind::ShellAction => Some(ActionContract::Shell),
             ToolClaimKind::PluginAction(plugin_id) => Some(ActionContract::Plugin {
                 plugin_id: plugin_id.clone(),

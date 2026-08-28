@@ -10,6 +10,12 @@ use crate::{
     },
     goal::{GoalBlockReason, GoalError, GoalRuntime, GoalUpdate, MAX_GOAL_OBJECTIVE_BYTES},
     model::{ContentBlock, JsonValue, ToolSchema},
+    user_question::{
+        MAX_QUESTION_HEADER_BYTES, MAX_QUESTION_ID_BYTES, MAX_QUESTION_OPTION_DESCRIPTION_BYTES,
+        MAX_QUESTION_OPTION_LABEL_BYTES, MAX_QUESTION_OPTIONS, MAX_QUESTION_TEXT_BYTES,
+        MIN_QUESTION_OPTIONS, UserQuestionBroker, UserQuestionError, UserQuestionOption,
+        UserQuestionRequest,
+    },
     workspace_authority::WorkspaceAuthority,
 };
 
@@ -146,6 +152,7 @@ pub struct LocalToolRegistry {
     runner: Arc<ProcessRunner>,
     plugins: Option<Arc<PluginHost>>,
     goal: Option<GoalRuntime>,
+    user_questions: Option<UserQuestionBroker>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -165,6 +172,7 @@ impl std::fmt::Debug for LocalToolRegistry {
                     .map_or(0, |plugins| plugins.schemas().len()),
             )
             .field("goal_enabled", &self.goal.is_some())
+            .field("user_questions_enabled", &self.user_questions.is_some())
             .finish()
     }
 }
@@ -192,6 +200,14 @@ impl LocalToolRegistry {
         authority: WorkspaceAuthority,
         goal: Option<GoalRuntime>,
     ) -> Result<Self, ToolRegistryBuildError> {
+        Self::from_authority_with_interaction(authority, goal, None)
+    }
+
+    pub(crate) fn from_authority_with_interaction(
+        authority: WorkspaceAuthority,
+        goal: Option<GoalRuntime>,
+        user_questions: Option<UserQuestionBroker>,
+    ) -> Result<Self, ToolRegistryBuildError> {
         let workspace = Arc::new(Workspace::from_authority(authority));
         let environment = ShellEnvironment::capture()?;
         let runner = Arc::new(
@@ -203,6 +219,9 @@ impl LocalToolRegistry {
         if goal.is_some() {
             schemas.extend(build_goal_schemas()?);
         }
+        if user_questions.is_some() {
+            schemas.push(build_user_question_schema()?);
+        }
         Ok(Self {
             workspace,
             schemas: schemas.into(),
@@ -210,6 +229,7 @@ impl LocalToolRegistry {
             runner,
             plugins: None,
             goal,
+            user_questions,
         })
     }
 
@@ -218,8 +238,9 @@ impl LocalToolRegistry {
         config: PluginConfig,
         cancellation: CancellationToken,
         goal: Option<GoalRuntime>,
+        user_questions: Option<UserQuestionBroker>,
     ) -> Result<Self, ToolRegistryBuildError> {
-        let mut registry = Self::from_authority_with_goal(authority, goal)?;
+        let mut registry = Self::from_authority_with_interaction(authority, goal, user_questions)?;
         let plugins = Arc::new(
             PluginHost::start(config, &registry.schemas, cancellation)
                 .await
@@ -259,6 +280,8 @@ impl ToolExecutor for LocalToolRegistry {
     fn claim_profile(&self, tool_name: &str) -> ToolClaimProfile {
         if tool_name == "bash" {
             ToolClaimProfile::shell_action()
+        } else if tool_name == "ask_user_question" {
+            ToolClaimProfile::user_question()
         } else if let Some(plugin_id) = self
             .plugins
             .as_ref()
@@ -329,9 +352,13 @@ impl ToolExecutor for LocalToolRegistry {
         let runner = Arc::clone(&self.runner);
         let plugins = self.plugins.clone();
         let goal = self.goal.clone();
+        let user_questions = self.user_questions.clone();
         Box::pin(async move {
             if is_goal_tool(request.name()) {
                 return prepare_goal(goal, &request);
+            }
+            if request.name() == "ask_user_question" {
+                return prepare_user_question(user_questions, &request, cancellation).await;
             }
             if request.name() == "apply_patch" {
                 return patch::prepare(
@@ -475,6 +502,177 @@ fn normalize_success(text: String) -> Result<ToolExecutionResult, ToolExecutorEr
 
 fn is_goal_tool(name: &str) -> bool {
     matches!(name, "get_goal" | "create_goal" | "update_goal")
+}
+
+async fn prepare_user_question(
+    broker: Option<UserQuestionBroker>,
+    request: &ToolExecutionRequest,
+    cancellation: CancellationToken,
+) -> Result<ToolPreparation, ToolExecutorError> {
+    let Some(broker) = broker else {
+        return Ok(ToolPreparation::Complete(
+            ToolCallError::unknown_tool().into_execution_result()?,
+        ));
+    };
+    let question = match parse_user_question_arguments(request.arguments().as_value()) {
+        Ok(question) => question,
+        Err(error) => {
+            return Ok(ToolPreparation::Complete(error.into_execution_result()?));
+        }
+    };
+    let result = broker.ask(question, cancellation).await;
+    let result = match result {
+        Ok(answer) => serde_json::to_string(&json!({
+            "answers": [{
+                "id": answer.id(),
+                "selected": [answer.selected()],
+            }]
+        }))
+        .map_err(|_| ToolExecutorError::new("user-question result normalization failed"))
+        .and_then(normalize_success),
+        Err(error) => user_question_call_error(error).into_execution_result(),
+    }?;
+    Ok(ToolPreparation::Complete(result))
+}
+
+fn parse_user_question_arguments(
+    arguments: &serde_json::Value,
+) -> ToolCallResult<UserQuestionRequest> {
+    let fields = arguments.as_object().ok_or_else(|| {
+        ToolCallError::invalid_args("ask_user_question arguments must be an object")
+    })?;
+    if fields.keys().any(|key| key != "questions") {
+        return Err(ToolCallError::invalid_args(
+            "ask_user_question received an unknown argument",
+        ));
+    }
+    let questions = fields
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| ToolCallError::invalid_args("questions must be an array"))?;
+    if questions.len() != 1 {
+        return Err(ToolCallError::invalid_args(
+            "questions must contain exactly one question",
+        ));
+    }
+    let question = questions[0]
+        .as_object()
+        .ok_or_else(|| ToolCallError::invalid_args("question must be an object"))?;
+    if question.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "id" | "question" | "header" | "options" | "multi_select"
+        )
+    }) {
+        return Err(ToolCallError::invalid_args(
+            "question received an unknown argument",
+        ));
+    }
+    if question
+        .get("multi_select")
+        .is_some_and(|value| value.as_bool() != Some(false))
+    {
+        return Err(ToolCallError::invalid_args(
+            "multi_select must be false in this terminal version",
+        ));
+    }
+    let id = bounded_question_text(question.get("id"), "id", MAX_QUESTION_ID_BYTES)?;
+    let text = bounded_question_text(
+        question.get("question"),
+        "question",
+        MAX_QUESTION_TEXT_BYTES,
+    )?;
+    let header = question
+        .get("header")
+        .map(|value| bounded_question_text(Some(value), "header", MAX_QUESTION_HEADER_BYTES))
+        .transpose()?;
+    let option_values = question
+        .get("options")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| ToolCallError::invalid_args("options must be an array"))?;
+    if !(MIN_QUESTION_OPTIONS..=MAX_QUESTION_OPTIONS).contains(&option_values.len()) {
+        return Err(ToolCallError::invalid_args(
+            "options must contain between two and four choices",
+        ));
+    }
+    let mut options = Vec::new();
+    options
+        .try_reserve_exact(option_values.len())
+        .map_err(|_| ToolCallError::invalid_args("question options could not be retained"))?;
+    for value in option_values {
+        let fields = value
+            .as_object()
+            .ok_or_else(|| ToolCallError::invalid_args("option must be an object"))?;
+        if fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "label" | "description"))
+        {
+            return Err(ToolCallError::invalid_args(
+                "option received an unknown argument",
+            ));
+        }
+        let label = bounded_question_text(
+            fields.get("label"),
+            "option label",
+            MAX_QUESTION_OPTION_LABEL_BYTES,
+        )?;
+        if options
+            .iter()
+            .any(|option: &UserQuestionOption| option.label() == label)
+        {
+            return Err(ToolCallError::invalid_args("option labels must be unique"));
+        }
+        let description = fields
+            .get("description")
+            .map(|value| {
+                bounded_question_text(
+                    Some(value),
+                    "option description",
+                    MAX_QUESTION_OPTION_DESCRIPTION_BYTES,
+                )
+            })
+            .transpose()?;
+        options.push(UserQuestionOption::new(label, description));
+    }
+    Ok(UserQuestionRequest::new(id, header, text, options))
+}
+
+fn bounded_question_text(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+    maximum: usize,
+) -> ToolCallResult<String> {
+    let value = value
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolCallError::invalid_args(format!("{field} must be a string")))?;
+    if value.is_empty()
+        || value.len() > maximum
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err(ToolCallError::invalid_args(format!(
+            "{field} must be nonblank, trimmed, control-free, and at most {maximum} bytes"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn user_question_call_error(error: UserQuestionError) -> ToolCallError {
+    let (code, message) = match error {
+        UserQuestionError::Cancelled => (
+            "ASK_CANCELLED",
+            "ask_user_question was cancelled before the user answered",
+        ),
+        UserQuestionError::Unavailable => (
+            "NO_PROVIDER",
+            "no terminal user-question answerer is available",
+        ),
+        UserQuestionError::InvalidResponse => (
+            "INVALID_RESPONSE",
+            "the terminal returned an invalid user-question answer",
+        ),
+    };
+    ToolCallError::model("UserQuestionError", code, message)
 }
 
 fn dispatch_goal(
@@ -1013,6 +1211,74 @@ fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
     ])
 }
 
+fn build_user_question_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
+    schema(
+        "ask_user_question",
+        "Ask the user one concise single-choice question when a decision or missing fact is required before continuing.",
+        json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_QUESTION_ID_BYTES
+                            },
+                            "question": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_QUESTION_TEXT_BYTES
+                            },
+                            "header": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_QUESTION_HEADER_BYTES
+                            },
+                            "options": {
+                                "type": "array",
+                                "minItems": MIN_QUESTION_OPTIONS,
+                                "maxItems": MAX_QUESTION_OPTIONS,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": MAX_QUESTION_OPTION_LABEL_BYTES
+                                        },
+                                        "description": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "maxLength": MAX_QUESTION_OPTION_DESCRIPTION_BYTES
+                                        }
+                                    },
+                                    "required": ["label"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "multi_select": {
+                                "type": "boolean",
+                                "enum": [false],
+                                "description": "This terminal version supports single-select only"
+                            }
+                        },
+                        "required": ["id", "question", "options"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["questions"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 fn schema(
     name: &'static str,
     description: &'static str,
@@ -1029,14 +1295,19 @@ fn schema(
 
 #[cfg(test)]
 mod tests {
+    use futures_util::poll;
+    use tokio_util::sync::CancellationToken;
+
     use super::{
-        MAX_TOOL_CONTENT_BYTES, build_goal_schemas, dispatch_goal, normalize_success, prepare_goal,
+        MAX_TOOL_CONTENT_BYTES, build_goal_schemas, build_user_question_schema, dispatch_goal,
+        normalize_success, parse_user_question_arguments, prepare_goal, prepare_user_question,
     };
     use crate::{
         agent::{GoalToolCaller, ToolDispatchBinding, ToolExecutionRequest, ToolPreparation},
         goal::GoalRuntime,
         model::{CallId, ContentBlockKind, JsonValue},
         tools::EMPTY_TEXT_BLOCK_JSON_BYTES,
+        user_question::UserQuestionBroker,
     };
 
     fn goal_request(name: &str, arguments: serde_json::Value) -> ToolExecutionRequest {
@@ -1082,6 +1353,81 @@ mod tests {
             rejected.error().map(|error| error.code.as_str()),
             Some("TOOL_OUTPUT_LIMIT")
         );
+    }
+
+    #[test]
+    fn user_question_schema_and_arguments_are_closed_and_bounded() {
+        let schema = build_user_question_schema().unwrap();
+        assert_eq!(schema.name(), "ask_user_question");
+        let parameters = schema.parameters().as_value();
+        assert_eq!(parameters["additionalProperties"], false);
+        assert_eq!(parameters["properties"]["questions"]["minItems"], 1);
+        assert_eq!(parameters["properties"]["questions"]["maxItems"], 1);
+        assert_eq!(
+            parameters["properties"]["questions"]["items"]["properties"]["multi_select"]["enum"],
+            serde_json::json!([false])
+        );
+
+        let valid = serde_json::json!({
+            "questions": [{
+                "id": "mode",
+                "header": "Choose mode",
+                "question": "Which mode should I use?",
+                "options": [
+                    { "label": "Safe (Recommended)", "description": "Keep every guard." },
+                    { "label": "Fast" }
+                ],
+                "multi_select": false
+            }]
+        });
+        let parsed = parse_user_question_arguments(&valid).unwrap();
+        assert_eq!(parsed.header(), Some("Choose mode"));
+        assert_eq!(parsed.options()[1].label(), "Fast");
+
+        for invalid in [
+            serde_json::json!({ "questions": [] }),
+            serde_json::json!({ "questions": [valid["questions"][0].clone(), valid["questions"][0].clone()] }),
+            serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"Only"}] }] }),
+            serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"Same"},{"label":"Same"}] }] }),
+            serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"A"},{"label":"B"}], "multi_select": true }] }),
+            serde_json::json!({ "questions": [{ "id": " mode ", "question": "Choose?", "options": [{"label":"A"},{"label":"B"}] }] }),
+            serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?\n", "options": [{"label":"A"},{"label":"B"}] }] }),
+            serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"A"},{"label":"B","extra":true}] }] }),
+            serde_json::json!({ "questions": [{ "id": "mode", "question": "Choose?", "options": [{"label":"A"},{"label":"B"}] }], "extra": true }),
+        ] {
+            assert!(
+                parse_user_question_arguments(&invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_question_returns_the_selected_label_as_compact_json() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let request = goal_request(
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{
+                    "id": "mode",
+                    "question": "Which mode?",
+                    "options": [{"label":"Safe"},{"label":"Fast"}]
+                }]
+            }),
+        );
+        let future = prepare_user_question(Some(broker), &request, CancellationToken::new());
+        tokio::pin!(future);
+        assert!(poll!(&mut future).is_pending());
+        receiver.try_recv().unwrap().select(1).unwrap();
+        let prepared = future.await.unwrap();
+        let ToolPreparation::Complete(result) = prepared else {
+            panic!("user question should settle as an ordinary result")
+        };
+        assert!(!result.is_error());
+        let ContentBlockKind::Text { text } = result.content()[0].kind() else {
+            panic!("user question should render compact JSON text")
+        };
+        assert_eq!(text, r#"{"answers":[{"id":"mode","selected":["Fast"]}]}"#);
     }
 
     #[test]

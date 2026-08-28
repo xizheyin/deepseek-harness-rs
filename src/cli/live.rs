@@ -18,6 +18,7 @@ use crate::tui::{
 };
 
 use crate::agent::{ApprovalPreviewKind, TurnOutcome};
+use crate::user_question::UserQuestionRequest;
 
 use super::{
     render::VisibleRenderer,
@@ -351,6 +352,53 @@ impl LiveFrame {
         }
         let mut parts = try_parts(1)?;
         parts.push(LivePart::TrustedOwned(output));
+        Ok(Self { parts })
+    }
+
+    pub(super) fn user_question(
+        request: &UserQuestionRequest,
+        retry: bool,
+        enhanced: bool,
+    ) -> Result<Self, LiveRenderError> {
+        let mut text = String::new();
+        text.try_reserve_exact(2 * 1024)
+            .map_err(|_| LiveRenderError)?;
+        if let Some(header) = request.header() {
+            writeln!(&mut text, "{header}").map_err(|_| LiveRenderError)?;
+        }
+        writeln!(&mut text, "{}", request.question()).map_err(|_| LiveRenderError)?;
+        for (index, option) in request.options().iter().enumerate() {
+            writeln!(&mut text, "  {}. {}", index + 1, option.label())
+                .map_err(|_| LiveRenderError)?;
+            if let Some(description) = option.description() {
+                writeln!(&mut text, "     {description}").map_err(|_| LiveRenderError)?;
+            }
+        }
+        let mut parts = try_parts(3)?;
+        parts.push(LivePart::TrustedLine(if retry {
+            "[question answer not recognized]\n"
+        } else {
+            "[question from assistant]\n"
+        }));
+        parts.push(LivePart::Untrusted {
+            role: UiRole::Dsh,
+            text,
+        });
+        if enhanced {
+            let mut hint = String::new();
+            hint.try_reserve_exact(64).map_err(|_| LiveRenderError)?;
+            writeln!(
+                &mut hint,
+                "Press 1-{} to choose · Esc cancels the question",
+                request.options().len()
+            )
+            .map_err(|_| LiveRenderError)?;
+            parts.push(LivePart::TrustedOwned(hint));
+        } else {
+            parts.push(LivePart::TrustedLine(
+                "Type the option number and press Enter\n",
+            ));
+        }
         Ok(Self { parts })
     }
 }

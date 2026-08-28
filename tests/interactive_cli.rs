@@ -121,6 +121,20 @@ fn last_user_content(request: &str) -> String {
         .expect("request should contain a user text message")
 }
 
+fn tool_message_content(request: &str, call_id: &str) -> String {
+    let request = request_json(request);
+    request["messages"]
+        .as_array()
+        .expect("request messages should be an array")
+        .iter()
+        .find(|message| {
+            message["role"] == "tool" && message["tool_call_id"].as_str() == Some(call_id)
+        })
+        .and_then(|message| message["content"].as_str())
+        .expect("request should contain the correlated tool result")
+        .to_owned()
+}
+
 fn repeated_text_sse(delta_count: usize) -> String {
     repeated_text_sse_with_width(delta_count, 1)
 }
@@ -2145,6 +2159,98 @@ fn auto_edit_commits_a_workspace_patch_without_opening_the_approval_selector() {
             .any(|window| window == b"> Reject")
     );
     assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn user_question_selection_returns_the_displayed_label_and_continues_the_turn() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-mode",
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{
+                    "id": "mode",
+                    "header": "Choose mode",
+                    "question": "Which verification mode should I use?",
+                    "options": [
+                        {
+                            "label": "Thorough (Recommended)",
+                            "description": "Run the full local suite."
+                        },
+                        {
+                            "label": "Focused",
+                            "description": "Run only the necessary checks."
+                        }
+                    ]
+                }]
+            }),
+        ),
+        text_sse("I will use focused verification."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask me before choosing the verification mode\r");
+    dsh.expect(b"Which verification mode should I use?");
+    dsh.expect(b"2. Focused");
+    dsh.expect(b"Press 1-2 to choose");
+    dsh.write(b"2");
+    dsh.expect(b"I will use focused verification.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-mode"),
+        r#"{"answers":[{"id":"mode","selected":["Focused"]}]}"#
+    );
+    assert!(
+        request_json(&requests[0])["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "ask_user_question")
+    );
+}
+
+#[test]
+fn user_question_escape_returns_a_cancelled_tool_result_without_choosing() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-cancel",
+            "ask_user_question",
+            serde_json::json!({
+                "questions": [{
+                    "id": "release",
+                    "question": "Ship this release?",
+                    "options": [{"label":"Ship"},{"label":"Wait"}]
+                }]
+            }),
+        ),
+        text_sse("The question was cancelled, so I did not choose."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask whether to ship\r");
+    dsh.expect(b"Ship this release?");
+    dsh.expect(b"Press 1-2 to choose");
+    dsh.write(&[0x1b]);
+    dsh.expect(b"The question was cancelled, so I did not choose.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-cancel"),
+        "Error: ask_user_question was cancelled before the user answered"
+    );
 }
 
 #[test]

@@ -1484,6 +1484,26 @@ before the next Provider request. Complete and blocked tags, source summary,
 event order, and real next-request visibility are recorded in
 `docs/design/goal-wrapup.md` and `docs/validation/phase-16.md`.
 
+## Phase 17 user-question inspection — 2026-08-28
+
+The fixed interactive question seam was inspected before implementation:
+
+- `packages/interaction/tool-ask-user/{README.md,src/index.ts}` and
+  `tests/tool-ask-user.spec.ts` define the `ask_user_question` model schema,
+  awaited execution, option-label preservation, compact JSON answer, abort
+  propagation, and structured failure behavior;
+- `packages/interaction/user-questions/{README.md,src/index.ts,src/types.ts}`
+  and `tests/user-questions.spec.ts` define the UI capability boundary,
+  question/answer values, no-provider and cancellation failures, runtime-root
+  restriction, and the absence of separate model-visible waiting context.
+
+Latest `origin/master` was fetched and confirmed unchanged at
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Its tool schema and compact result
+are unchanged. The provider slot became an Agent-scoped answerer waterfall and
+in-flight cancellation is normalized. Phase 17 keeps one owned terminal
+answerer and the existing turn cancellation path; the first bounded UI form is
+specified in `docs/design/user-question.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

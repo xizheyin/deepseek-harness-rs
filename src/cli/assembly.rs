@@ -16,6 +16,7 @@ use crate::{
     },
     session::{CommittedUiReceiver, Session, SessionStore, StoreError, SystemClock},
     tools::{LocalToolRegistry, PluginConfig, WorkspaceFileCatalogue},
+    user_question::{UserQuestionBroker, UserQuestionReceiver},
     workspace_authority::WorkspaceAuthority,
 };
 use tokio_util::sync::CancellationToken;
@@ -38,6 +39,7 @@ pub(super) struct InteractiveAssembly {
     pub(super) agent: AgentLoop,
     pub(super) events: CommittedUiReceiver,
     pub(super) approvals: ApprovalEnvelopeReceiver,
+    pub(super) user_questions: UserQuestionReceiver,
     pub(super) joins: ApprovalJoin,
     pub(super) session_id: String,
     pub(super) resumed: bool,
@@ -165,6 +167,12 @@ pub(super) async fn assemble_session(
     let file_suggestions =
         interactive.then(|| WorkspaceFileCatalogue::from_authority(authority.clone()));
     let goal = interactive.then(|| GoalRuntime::from_replay(session.state().goal_replay()));
+    let (user_questions, question_receiver) = if interactive {
+        let (broker, receiver) = UserQuestionBroker::new();
+        (Some(broker), Some(receiver))
+    } else {
+        (None, None)
+    };
 
     let registry = match plugin_config {
         Some(plugin_config) => {
@@ -173,10 +181,15 @@ pub(super) async fn assemble_session(
                 plugin_config,
                 cancellation,
                 goal.clone(),
+                user_questions.clone(),
             )
             .await
         }
-        None => LocalToolRegistry::from_authority_with_goal(authority, goal.clone()),
+        None => LocalToolRegistry::from_authority_with_interaction(
+            authority,
+            goal.clone(),
+            user_questions,
+        ),
     };
     let registry = match registry {
         Ok(registry) => Arc::new(registry),
@@ -223,6 +236,9 @@ pub(super) async fn assemble_session(
         let Some(goal) = goal else {
             return Err(AssemblyFailure::new(AssemblyError::Agent, session));
         };
+        let Some(user_questions) = question_receiver else {
+            return Err(AssemblyFailure::new(AssemblyError::Agent, session));
+        };
         let (approval, approvals) = TerminalApprovalProvider::new();
         let (file_change_policy, shell_policy, plugin_policy) = interactive_policies(approval_mode);
         let config = config
@@ -241,6 +257,7 @@ pub(super) async fn assemble_session(
             agent,
             events,
             approvals,
+            user_questions,
             joins,
             session_id,
             resumed,

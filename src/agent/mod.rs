@@ -3331,7 +3331,7 @@ async fn run_one_tool(
                 ToolStop::TurnTimeout,
             )
         }
-        _ = tokio::time::sleep_until(tool_deadline) => {
+        _ = tokio::time::sleep_until(tool_deadline), if !plan.claim_profile.is_user_question() => {
             prestart_failure(
                 plan,
                 "TOOL_TIMEOUT",
