@@ -496,13 +496,21 @@ impl InputMemory {
         &self.composer
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_question_overlay(&mut self) -> Result<(), InputMemoryError> {
+        self.begin_question_overlay_with(String::new())
+    }
+
+    pub(crate) fn begin_question_overlay_with(
+        &mut self,
+        question_draft: String,
+    ) -> Result<(), InputMemoryError> {
         if self.composer_overlay.is_some() {
             return Err(InputMemoryError::InvalidState);
         }
         let (saved_draft, saved_cursor) = self
             .composer
-            .swap_draft(String::new(), 0)
+            .swap_draft(question_draft, 0)
             .map_err(|_| InputMemoryError::Composer)?;
         self.composer_overlay = Some(ComposerOverlay {
             saved_draft,
@@ -1214,6 +1222,18 @@ mod tests {
         input.insert_text("discarded answer").unwrap();
         assert_eq!(input.finish_question_overlay().unwrap(), "discarded answer");
         assert_eq!(input.composer().text(), "kept draft");
+    }
+
+    #[test]
+    fn question_overlay_can_restore_a_saved_question_draft() {
+        let mut input = InputMemory::default();
+        input.insert_text("ordinary draft").unwrap();
+        input
+            .begin_question_overlay_with("saved answer".to_owned())
+            .unwrap();
+        assert_eq!(input.composer().text(), "saved answer");
+        assert_eq!(input.finish_question_overlay().unwrap(), "saved answer");
+        assert_eq!(input.composer().text(), "ordinary draft");
     }
 
     #[test]

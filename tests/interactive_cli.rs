@@ -2644,6 +2644,73 @@ fn user_question_skip_final_multi_discards_its_partial_selection() {
 }
 
 #[test]
+fn user_question_pager_retains_drafts_and_returns_to_the_missing_first_question() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-pager",
+            "ask_user_question",
+            serde_json::json!({
+                "questions":[
+                    {"id":"mode","question":"Which mode?","options":[{"label":"Safe"},{"label":"Fast"}]},
+                    {"id":"detail","question":"What local detail should I keep?"},
+                    {
+                        "id":"targets",
+                        "question":"Which targets?",
+                        "options":[{"label":"tests"},{"label":"docs"}],
+                        "multi_select":true
+                    }
+                ]
+            }),
+        ),
+        text_sse("I received the completed paged answers."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask three paged questions\r");
+    dsh.expect(b"question 1/3 from assistant");
+    dsh.write(b"]");
+    dsh.expect(b"question 2/3 from assistant");
+    dsh.write("必要检查".as_bytes());
+    dsh.write(&[0x0e]);
+    dsh.expect(b"question 3/3 from assistant");
+    dsh.write(b"2");
+    dsh.expect(b"Selected options \xc2\xb7 2");
+    let return_to_detail = dsh.checkpoint();
+    dsh.write(b"[");
+    dsh.expect_after(return_to_detail, b"question 2/3 from assistant");
+    let return_to_mode = dsh.checkpoint();
+    dsh.write(&[0x10]);
+    dsh.expect_after(return_to_mode, b"question 1/3 from assistant");
+    dsh.expect_after(return_to_mode, b"Press 1-2 to choose");
+    let revisit_detail = dsh.checkpoint();
+    dsh.write(b"2");
+    dsh.expect_after(revisit_detail, b"question 2/3 from assistant");
+    dsh.expect_after(revisit_detail, "必要检查".as_bytes());
+    let revisit_targets = dsh.checkpoint();
+    dsh.write(b"\r");
+    dsh.expect_after(revisit_targets, b"question 3/3 from assistant");
+    dsh.expect_after(revisit_targets, b"Selected options \xc2\xb7 2");
+    dsh.write(b"\r");
+    dsh.expect(b"I received the completed paged answers.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-pager"),
+        concat!(
+            r#"{"answers":[{"id":"mode","selected":["Fast"]},"#,
+            r#"{"custom":"必要检查","id":"detail","selected":[]},"#,
+            r#"{"id":"targets","selected":["docs"]}]}"#,
+        )
+    );
+}
+
+#[test]
 fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
     let first_server = SequenceSseServer::start(vec![

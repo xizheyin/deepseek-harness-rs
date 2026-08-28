@@ -75,6 +75,8 @@ pub(crate) enum Key {
     Undo,
     ReverseSearch,
     Inspect,
+    QuestionPrevious,
+    QuestionNext,
     PageUp,
     PageDown,
 }
@@ -104,6 +106,8 @@ impl fmt::Debug for Key {
             Self::Undo => "Undo",
             Self::ReverseSearch => "ReverseSearch",
             Self::Inspect => "Inspect",
+            Self::QuestionPrevious => "QuestionPrevious",
+            Self::QuestionNext => "QuestionNext",
             Self::PageUp => "PageUp",
             Self::PageDown => "PageDown",
         })
@@ -423,6 +427,8 @@ impl KeyDecoder {
             0x08 | 0x7f => InputEvent::Key(Key::Backspace),
             0x0b => InputEvent::Key(Key::ClearAfter),
             0x0f => InputEvent::Key(Key::Inspect),
+            0x0e => InputEvent::Key(Key::QuestionNext),
+            0x10 => InputEvent::Key(Key::QuestionPrevious),
             0x12 => InputEvent::Key(Key::ReverseSearch),
             0x15 => InputEvent::Key(Key::ClearBefore),
             0x17 => InputEvent::Key(Key::WordErase),

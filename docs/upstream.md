@@ -1577,6 +1577,25 @@ Latest `origin/master` remains
 mapping without changing the model-visible shape; see
 `docs/design/user-question-skip.md`.
 
+## Phase 22 question-pager inspection — 2026-08-28
+
+The fixed
+`packages/client/ui-user-questions/src/client/QuestionComposer.tsx` and
+`packages/client/ui-user-questions/tests/user-questions-composer.client.spec.tsx`
+were rechecked before implementation. The composer allocates one draft for
+every question. Previous and Next change only the visible index, so later
+multi-select edits and earlier answers survive navigation. Final submission
+searches for the first incomplete draft, returns to it with feedback, and does
+not publish an answer until every draft is complete.
+
+The focused upstream fixture navigates forward into an unanswered middle
+question, edits a later multi-select draft, proves backward navigation produces
+no response, and then proves final submission returns to the missing question.
+Latest `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc` with the same pager contract. Rust
+Phase 22 maps the behavior to bounded terminal keys while preserving the exact
+ordered tool-result shape; see `docs/design/user-question-pager.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

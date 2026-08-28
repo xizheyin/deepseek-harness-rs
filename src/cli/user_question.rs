@@ -24,6 +24,8 @@ pub(super) enum QuestionAcceptingMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum QuestionInputUpdate {
     None,
+    Previous,
+    Next,
     Selected(usize),
     Toggled(usize),
     MultiSubmitted,
@@ -33,6 +35,56 @@ pub(super) enum QuestionInputUpdate {
     Cancelled,
     Invalid,
     Eof,
+}
+
+#[derive(Debug, Default)]
+struct QuestionDraft {
+    selected: Vec<usize>,
+    custom: String,
+    skipped: bool,
+}
+
+impl QuestionDraft {
+    fn new() -> Result<Self, ()> {
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(MAX_QUESTION_OPTIONS)
+            .map_err(|_| ())?;
+        Ok(Self {
+            selected,
+            custom: String::new(),
+            skipped: false,
+        })
+    }
+
+    fn response(&self, question: &UserQuestionItem) -> Option<UserQuestionResponseItem> {
+        if self.skipped {
+            return Some(UserQuestionResponseItem::Skipped);
+        }
+        let custom = self.custom.trim();
+        let custom = custom_answer_is_valid(custom).then(|| custom.to_owned());
+        if question.multi_select() {
+            return match (self.selected.is_empty(), custom) {
+                (false, Some(custom)) => Some(UserQuestionResponseItem::MultiCustom {
+                    selected: self.selected.clone(),
+                    custom,
+                }),
+                (false, None) => Some(UserQuestionResponseItem::MultiSelected(
+                    self.selected.clone(),
+                )),
+                (true, Some(custom)) => Some(UserQuestionResponseItem::Custom(custom)),
+                (true, None) => None,
+            };
+        }
+        match custom {
+            Some(custom) => Some(UserQuestionResponseItem::Custom(custom)),
+            None => self
+                .selected
+                .first()
+                .copied()
+                .map(UserQuestionResponseItem::Selected),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -45,8 +97,7 @@ pub(super) struct UserQuestionUiState {
     custom_record_len: usize,
     custom_record_oversized: bool,
     current_question: usize,
-    answers: Vec<UserQuestionResponseItem>,
-    multi_selected: Vec<usize>,
+    drafts: Vec<QuestionDraft>,
     multi_retry: bool,
 }
 
@@ -61,8 +112,7 @@ impl Default for UserQuestionUiState {
             custom_record_len: 0,
             custom_record_oversized: false,
             current_question: 0,
-            answers: Vec::new(),
-            multi_selected: Vec::new(),
+            drafts: Vec::new(),
             multi_retry: false,
         }
     }
@@ -73,14 +123,14 @@ impl UserQuestionUiState {
         if self.active.is_some() || self.phase != QuestionPhase::Inactive {
             return Err(());
         }
-        self.answers.clear();
-        self.answers
-            .try_reserve_exact(envelope.request().questions().len())
+        self.drafts.clear();
+        let question_count = envelope.request().questions().len();
+        self.drafts
+            .try_reserve_exact(question_count)
             .map_err(|_| ())?;
-        self.multi_selected.clear();
-        self.multi_selected
-            .try_reserve_exact(MAX_QUESTION_OPTIONS)
-            .map_err(|_| ())?;
+        for _ in 0..question_count {
+            self.drafts.push(QuestionDraft::new()?);
+        }
         self.active = Some(envelope);
         self.phase = QuestionPhase::Received { retry: false };
         self.clear_records();
@@ -115,9 +165,16 @@ impl UserQuestionUiState {
     }
 
     pub(super) fn multi_selected_mask(&self) -> u8 {
-        self.multi_selected
+        self.current_draft()
+            .map(|draft| draft.selected.as_slice())
+            .unwrap_or_default()
             .iter()
             .fold(0_u8, |mask, index| mask | (1_u8 << *index))
+    }
+
+    pub(super) fn custom_draft(&self) -> &str {
+        self.current_draft()
+            .map_or("", |draft| draft.custom.as_str())
     }
 
     pub(super) fn multi_retry(&self) -> bool {
@@ -162,7 +219,6 @@ impl UserQuestionUiState {
         let question = self.current_item().ok_or(())?;
         let has_options = !question.options().is_empty();
         let multi_select = question.multi_select();
-        self.multi_selected.clear();
         self.multi_retry = false;
         if has_options {
             self.phase = QuestionPhase::Selecting;
@@ -194,17 +250,24 @@ impl UserQuestionUiState {
             self.reset();
             return;
         };
-        let question_count = envelope.request().questions().len();
         let valid = envelope
             .request()
             .questions()
             .get(self.current_question)
             .is_some_and(|question| index < question.options().len());
-        if !valid || self.answers.len() != self.current_question {
+        if !valid {
             self.retry();
             return;
         }
-        self.advance_or_finish(UserQuestionResponseItem::Selected(index), question_count);
+        let Some(draft) = self.current_draft_mut() else {
+            self.reset();
+            return;
+        };
+        draft.selected.clear();
+        draft.selected.push(index);
+        draft.custom.clear();
+        draft.skipped = false;
+        self.advance_after_answer();
     }
 
     pub(super) fn toggle(&mut self, index: usize) {
@@ -216,48 +279,50 @@ impl UserQuestionUiState {
             self.retry();
             return;
         }
-        if let Some(position) = self
-            .multi_selected
+        let Some(draft) = self.current_draft_mut() else {
+            self.reset();
+            return;
+        };
+        draft.skipped = false;
+        if let Some(position) = draft
+            .selected
             .iter()
             .position(|selected| *selected == index)
         {
-            self.multi_selected.remove(position);
+            draft.selected.remove(position);
         } else {
-            self.multi_selected.push(index);
+            draft.selected.push(index);
         }
         self.multi_retry = false;
     }
 
     pub(super) fn submit_multi(&mut self) -> bool {
         if !self.is_multi_selecting()
-            || self.answers.len() != self.current_question
-            || self.multi_selected.is_empty()
+            || self
+                .current_draft()
+                .and_then(|draft| self.current_item().and_then(|item| draft.response(item)))
+                .is_none()
         {
             self.multi_retry = true;
             return false;
         }
-        let question_count = self
-            .active
-            .as_ref()
-            .map_or(0, |envelope| envelope.request().questions().len());
-        let selected = std::mem::take(&mut self.multi_selected);
-        self.advance_or_finish(
-            UserQuestionResponseItem::MultiSelected(selected),
-            question_count,
-        );
+        self.advance_after_answer();
         true
     }
 
     pub(super) fn skip(&mut self) {
-        if !self.is_accepting() || self.answers.len() != self.current_question {
+        if !self.is_accepting() {
             self.retry();
             return;
         }
-        let question_count = self
-            .active
-            .as_ref()
-            .map_or(0, |envelope| envelope.request().questions().len());
-        self.advance_or_finish(UserQuestionResponseItem::Skipped, question_count);
+        let Some(draft) = self.current_draft_mut() else {
+            self.reset();
+            return;
+        };
+        draft.selected.clear();
+        draft.custom.clear();
+        draft.skipped = true;
+        self.advance_after_answer();
     }
 
     pub(super) fn begin_custom(&mut self) -> Result<(), ()> {
@@ -265,76 +330,136 @@ impl UserQuestionUiState {
             return Err(());
         }
         self.clear_records();
+        let multi_select = self
+            .current_item()
+            .is_some_and(UserQuestionItem::multi_select);
+        if let Some(draft) = self.current_draft_mut() {
+            draft.skipped = false;
+            if !multi_select {
+                draft.selected.clear();
+            }
+        }
         self.phase = QuestionPhase::Custom { retry: false };
         Ok(())
     }
 
     pub(super) fn submit_custom(&mut self, custom: String) -> bool {
-        if !matches!(self.phase, QuestionPhase::Custom { .. })
-            || self.answers.len() != self.current_question
-        {
+        if !matches!(self.phase, QuestionPhase::Custom { .. }) {
             self.retry_custom();
             return false;
         }
         let multi_select = self
             .current_item()
             .is_some_and(UserQuestionItem::multi_select);
-        let trimmed = custom.trim();
-        if trimmed.is_empty() && multi_select && !self.multi_selected.is_empty() {
-            let question_count = self
-                .active
-                .as_ref()
-                .map_or(0, |envelope| envelope.request().questions().len());
-            let selected = std::mem::take(&mut self.multi_selected);
-            self.advance_or_finish(
-                UserQuestionResponseItem::MultiSelected(selected),
-                question_count,
-            );
+        let Some(draft) = self.current_draft_mut() else {
+            self.reset();
+            return false;
+        };
+        draft.custom = custom;
+        draft.skipped = false;
+        let trimmed = draft.custom.trim();
+        if trimmed.is_empty() && multi_select && !draft.selected.is_empty() {
+            draft.custom.clear();
+            self.advance_after_answer();
             return true;
         }
         if !custom_answer_is_valid(trimmed) {
             self.retry_custom();
             return false;
         }
-        let mut retained = String::new();
-        if retained.try_reserve_exact(trimmed.len()).is_err() {
-            self.retry_custom();
-            return false;
+        draft.custom = trimmed.to_owned();
+        if !multi_select {
+            draft.selected.clear();
         }
-        retained.push_str(trimmed);
-        let question_count = self
-            .active
-            .as_ref()
-            .map_or(0, |envelope| envelope.request().questions().len());
-        let response = if multi_select && !self.multi_selected.is_empty() {
-            UserQuestionResponseItem::MultiCustom {
-                selected: std::mem::take(&mut self.multi_selected),
-                custom: retained,
-            }
-        } else {
-            UserQuestionResponseItem::Custom(retained)
-        };
-        self.advance_or_finish(response, question_count);
+        self.advance_after_answer();
         true
     }
 
-    fn advance_or_finish(&mut self, answer: UserQuestionResponseItem, question_count: usize) {
-        self.answers.push(answer);
-        self.multi_selected.clear();
+    pub(super) fn store_custom_draft(&mut self, custom: String) -> Result<(), ()> {
+        if !self.is_custom() || custom.len() > MAX_CUSTOM_ANSWER_BYTES {
+            return Err(());
+        }
+        let draft = self.current_draft_mut().ok_or(())?;
+        draft.custom = custom;
+        draft.skipped = false;
+        Ok(())
+    }
+
+    pub(super) fn previous(&mut self) -> bool {
+        if !self.is_accepting() || self.current_question == 0 {
+            return false;
+        }
+        self.show_question(self.current_question - 1, false);
+        true
+    }
+
+    pub(super) fn next(&mut self) -> bool {
+        if !self.is_accepting() {
+            return false;
+        }
+        let question_count = self.question_count();
+        if self.current_question + 1 < question_count {
+            self.show_question(self.current_question + 1, false);
+        } else {
+            self.finish_or_focus_missing();
+        }
+        true
+    }
+
+    fn advance_after_answer(&mut self) {
         self.multi_retry = false;
-        if self.answers.len() < question_count {
-            self.current_question += 1;
-            self.phase = QuestionPhase::Received { retry: false };
-            self.clear_records();
+        if self.current_question + 1 < self.question_count() {
+            self.show_question(self.current_question + 1, false);
+        } else {
+            self.finish_or_focus_missing();
+        }
+    }
+
+    fn finish_or_focus_missing(&mut self) {
+        let missing = self.active.as_ref().and_then(|envelope| {
+            envelope
+                .request()
+                .questions()
+                .iter()
+                .zip(&self.drafts)
+                .position(|(question, draft)| draft.response(question).is_none())
+        });
+        if let Some(missing) = missing {
+            self.show_question(missing, true);
             return;
+        }
+        let Some(envelope_ref) = self.active.as_ref() else {
+            self.reset();
+            return;
+        };
+        let mut answers = Vec::new();
+        if answers
+            .try_reserve_exact(envelope_ref.request().questions().len())
+            .is_err()
+        {
+            self.retry();
+            return;
+        }
+        for (question, draft) in envelope_ref.request().questions().iter().zip(&self.drafts) {
+            let Some(answer) = draft.response(question) else {
+                self.retry();
+                return;
+            };
+            answers.push(answer);
         }
         let Some(envelope) = self.active.take() else {
             self.reset();
             return;
         };
-        let answers = std::mem::take(&mut self.answers);
         let _ = envelope.answer(answers);
         self.reset();
+    }
+
+    fn show_question(&mut self, index: usize, retry: bool) {
+        self.current_question = index;
+        self.phase = QuestionPhase::Received { retry };
+        self.clear_records();
+        self.multi_retry = false;
     }
 
     pub(super) fn cancel(&mut self) {
@@ -379,6 +504,12 @@ impl UserQuestionUiState {
         if bytes == b"s" {
             return QuestionInputUpdate::Skipped;
         }
+        if bytes == b"[" {
+            return QuestionInputUpdate::Previous;
+        }
+        if bytes == b"]" {
+            return QuestionInputUpdate::Next;
+        }
         let Some(question) = self.current_item() else {
             return QuestionInputUpdate::Invalid;
         };
@@ -389,10 +520,10 @@ impl UserQuestionUiState {
                 return classify_selection(index, option_count, question.multi_select());
             }
             if matches!(*byte, b'\r' | b'\n') && question.multi_select() {
-                return if self.multi_selected.is_empty() {
-                    QuestionInputUpdate::Invalid
-                } else {
+                return if self.current_draft_is_complete() {
                     QuestionInputUpdate::MultiSubmitted
+                } else {
+                    QuestionInputUpdate::Invalid
                 };
             }
             if !matches!(*byte, b'\r' | b'\n' | b' ' | b'\t') {
@@ -424,18 +555,26 @@ impl UserQuestionUiState {
                         == 1;
                 let blank = record.iter().all(u8::is_ascii_whitespace);
                 let skipped = record == b"s";
+                let previous = record == b"[";
+                let next = record == b"]";
                 self.selection_record_len = 0;
                 if skipped {
                     return QuestionInputUpdate::Skipped;
+                }
+                if previous {
+                    return QuestionInputUpdate::Previous;
+                }
+                if next {
+                    return QuestionInputUpdate::Next;
                 }
                 let Some(question) = self.current_item() else {
                     return QuestionInputUpdate::Invalid;
                 };
                 if blank && question.multi_select() {
-                    return if self.multi_selected.is_empty() {
-                        QuestionInputUpdate::Invalid
-                    } else {
+                    return if self.current_draft_is_complete() {
                         QuestionInputUpdate::MultiSubmitted
+                    } else {
+                        QuestionInputUpdate::Invalid
                     };
                 }
                 let Some(digit) = digit.filter(|_| only_one) else {
@@ -476,6 +615,14 @@ impl UserQuestionUiState {
                     self.clear_records();
                     return QuestionInputUpdate::Skipped;
                 }
+                if record == b"[" {
+                    self.clear_records();
+                    return QuestionInputUpdate::Previous;
+                }
+                if record == b"]" {
+                    self.clear_records();
+                    return QuestionInputUpdate::Next;
+                }
                 let text = match std::str::from_utf8(record) {
                     Ok(text) => text,
                     Err(_) => {
@@ -515,8 +662,7 @@ impl UserQuestionUiState {
         self.phase = QuestionPhase::Inactive;
         self.clear_records();
         self.current_question = 0;
-        self.answers.clear();
-        self.multi_selected.clear();
+        self.drafts.clear();
         self.multi_retry = false;
     }
 
@@ -526,6 +672,26 @@ impl UserQuestionUiState {
             .request()
             .questions()
             .get(self.current_question)
+    }
+
+    fn current_draft(&self) -> Option<&QuestionDraft> {
+        self.drafts.get(self.current_question)
+    }
+
+    fn current_draft_mut(&mut self) -> Option<&mut QuestionDraft> {
+        self.drafts.get_mut(self.current_question)
+    }
+
+    fn question_count(&self) -> usize {
+        self.active
+            .as_ref()
+            .map_or(0, |envelope| envelope.request().questions().len())
+    }
+
+    fn current_draft_is_complete(&self) -> bool {
+        self.current_draft()
+            .zip(self.current_item())
+            .is_some_and(|(draft, question)| draft.response(question).is_some())
     }
 }
 
@@ -853,5 +1019,97 @@ mod tests {
                 .iter()
                 .all(|answer| answer.custom().is_none())
         );
+    }
+
+    #[tokio::test]
+    async fn pager_retains_custom_and_multi_drafts_until_the_batch_is_complete() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let answer = broker.ask(
+            UserQuestionRequest::new(vec![
+                item("mode", "Which mode?"),
+                UserQuestionItem::new(
+                    "detail".to_owned(),
+                    None,
+                    "Anything else?".to_owned(),
+                    Vec::new(),
+                ),
+                item("targets", "Which targets?").with_multi_select(true),
+            ]),
+            CancellationToken::new(),
+        );
+        tokio::pin!(answer);
+        assert!(poll!(&mut answer).is_pending());
+        let mut ui = UserQuestionUiState::default();
+        ui.receive(receiver.try_recv().unwrap()).unwrap();
+
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        ui.select(1);
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        ui.store_custom_draft("必要检查".to_owned()).unwrap();
+        assert!(ui.next());
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        ui.toggle(1);
+        assert_eq!(ui.multi_selected_mask(), 0b10);
+        assert!(ui.previous());
+        ui.mark_rendering().unwrap();
+        assert_eq!(ui.begin_accepting().unwrap(), QuestionAcceptingMode::Custom);
+        assert_eq!(ui.custom_draft(), "必要检查");
+        assert!(ui.submit_custom("必要检查".to_owned()));
+        ui.mark_rendering().unwrap();
+        assert_eq!(
+            ui.begin_accepting().unwrap(),
+            QuestionAcceptingMode::MultiSelection
+        );
+        assert_eq!(ui.multi_selected_mask(), 0b10);
+        assert!(ui.submit_multi());
+
+        let answer = answer.await.unwrap();
+        assert_eq!(answer.answers()[0].selected(), ["Fast"]);
+        assert_eq!(answer.answers()[1].custom(), Some("必要检查"));
+        assert_eq!(answer.answers()[2].selected(), ["Fast"]);
+    }
+
+    #[tokio::test]
+    async fn final_submit_returns_to_the_first_missing_draft_without_settling() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let answer = broker.ask(
+            UserQuestionRequest::new(vec![
+                item("mode", "Which mode?"),
+                item("tests", "Which tests?"),
+            ]),
+            CancellationToken::new(),
+        );
+        tokio::pin!(answer);
+        assert!(poll!(&mut answer).is_pending());
+        let mut ui = UserQuestionUiState::default();
+        ui.receive(receiver.try_recv().unwrap()).unwrap();
+
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        assert_eq!(ui.feed(b"]", true), QuestionInputUpdate::Next);
+        assert!(ui.next());
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        ui.select(0);
+        assert!(poll!(&mut answer).is_pending());
+        let (question, retry, position, total) = ui.frame_request().unwrap();
+        assert_eq!(question.id(), "mode");
+        assert!(retry);
+        assert_eq!((position, total), (1, 2));
+
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        ui.select(1);
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        assert_eq!(ui.feed(b"]", true), QuestionInputUpdate::Next);
+        assert!(ui.next());
+
+        let answer = answer.await.unwrap();
+        assert_eq!(answer.answers()[0].selected(), ["Fast"]);
+        assert_eq!(answer.answers()[1].selected(), ["Safe"]);
     }
 }

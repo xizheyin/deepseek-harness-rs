@@ -1482,7 +1482,9 @@ fn apply_detail_key(key: Key, view: &mut ViewState) -> Result<EnhancedInputActio
         | Key::ClearAfter
         | Key::Yank
         | Key::Undo
-        | Key::ReverseSearch => false,
+        | Key::ReverseSearch
+        | Key::QuestionPrevious
+        | Key::QuestionNext => false,
     };
     Ok(if changed {
         EnhancedInputAction::Redraw
@@ -1678,7 +1680,9 @@ fn apply_enhanced_key(
             });
             return Ok(EnhancedInputAction::Redraw);
         }
-        Key::Inspect | Key::PageUp | Key::PageDown => return Ok(EnhancedInputAction::None),
+        Key::Inspect | Key::QuestionPrevious | Key::QuestionNext | Key::PageUp | Key::PageDown => {
+            return Ok(EnhancedInputAction::None);
+        }
         Key::Escape => {
             *notice = None;
             return Ok(EnhancedInputAction::Redraw);
@@ -3404,7 +3408,27 @@ fn dispatch_enhanced_question_custom(
         QuestionCustomInputOutcome::Submit => {
             let custom = input.finish_question_overlay()?;
             if !question.submit_custom(custom) {
-                input.begin_question_overlay()?;
+                input.begin_question_overlay_with(question.custom_draft().to_owned())?;
+            }
+            Ok(QuestionCustomDispatch::Redraw)
+        }
+        QuestionCustomInputOutcome::Previous => {
+            let custom = input.finish_question_overlay()?;
+            question
+                .store_custom_draft(custom)
+                .map_err(|_| InteractiveError::Agent)?;
+            if !question.previous() {
+                input.begin_question_overlay_with(question.custom_draft().to_owned())?;
+            }
+            Ok(QuestionCustomDispatch::Redraw)
+        }
+        QuestionCustomInputOutcome::Next => {
+            let custom = input.finish_question_overlay()?;
+            question
+                .store_custom_draft(custom)
+                .map_err(|_| InteractiveError::Agent)?;
+            if !question.next() {
+                input.begin_question_overlay_with(question.custom_draft().to_owned())?;
             }
             Ok(QuestionCustomDispatch::Redraw)
         }
@@ -3752,11 +3776,16 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     .begin_accepting()
                     .map_err(|_| InteractiveError::Agent)?;
                 if mode != QuestionAcceptingMode::Selection && active.enhanced {
+                    let question_draft = if mode == QuestionAcceptingMode::Custom {
+                        question_ui.custom_draft().to_owned()
+                    } else {
+                        String::new()
+                    };
                     active
                         .queued_input
                         .as_deref_mut()
                         .ok_or(InteractiveError::Agent)?
-                        .begin_question_overlay()?;
+                        .begin_question_overlay_with(question_draft)?;
                     active
                         .enhanced_decoder
                         .as_deref_mut()
@@ -4395,6 +4424,24 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                             } else if question_ui.is_accepting() {
                                 match question_ui.feed(&active.scratch[..count], active.enhanced) {
                                     QuestionInputUpdate::None => {}
+                                    QuestionInputUpdate::Previous => {
+                                        if question_ui.previous() {
+                                            restore_question_overlay(
+                                                active.queued_input.as_deref_mut(),
+                                            )?;
+                                            active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                        }
+                                        dock_redraw_requested = active.enhanced;
+                                    }
+                                    QuestionInputUpdate::Next => {
+                                        if question_ui.next() {
+                                            restore_question_overlay(
+                                                active.queued_input.as_deref_mut(),
+                                            )?;
+                                            active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                        }
+                                        dock_redraw_requested = active.enhanced;
+                                    }
                                     QuestionInputUpdate::Selected(index) => {
                                         question_ui.select(index);
                                         active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
@@ -4446,7 +4493,9 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                                 .as_deref_mut()
                                                 .ok_or(InteractiveError::Agent)?;
                                             if !input.question_overlay_active() {
-                                                input.begin_question_overlay()?;
+                                                input.begin_question_overlay_with(
+                                                    question_ui.custom_draft().to_owned(),
+                                                )?;
                                             }
                                             active
                                                 .enhanced_decoder
@@ -5419,6 +5468,8 @@ enum ActiveInputOutcome {
 enum QuestionCustomInputOutcome {
     Continue,
     Redraw,
+    Previous,
+    Next,
     Submit,
     Skip,
     Cancel,
@@ -5437,6 +5488,12 @@ fn handle_question_custom_input(
     };
     if bytes == [0x13] {
         return Ok(QuestionCustomInputOutcome::Skip);
+    }
+    if bytes == [0x10] {
+        return Ok(QuestionCustomInputOutcome::Previous);
+    }
+    if bytes == [0x0e] {
+        return Ok(QuestionCustomInputOutcome::Next);
     }
     let size = terminal.size().unwrap_or(TerminalSize {
         rows: MIN_ENHANCED_ROWS,
@@ -5504,6 +5561,10 @@ fn apply_question_custom_event(
             return Ok(QuestionCustomInputOutcome::Invalid);
         }
         InputEvent::Key(Key::Enter) => return Ok(QuestionCustomInputOutcome::Submit),
+        InputEvent::Key(Key::QuestionPrevious) => {
+            return Ok(QuestionCustomInputOutcome::Previous);
+        }
+        InputEvent::Key(Key::QuestionNext) => return Ok(QuestionCustomInputOutcome::Next),
         InputEvent::Key(Key::Escape) => return Ok(QuestionCustomInputOutcome::Cancel),
         InputEvent::Key(Key::Eof) => return Ok(QuestionCustomInputOutcome::Eof),
         InputEvent::Key(Key::Newline) => {
