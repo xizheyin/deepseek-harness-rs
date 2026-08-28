@@ -403,9 +403,9 @@ impl LiveFrame {
         });
         if request.options().is_empty() {
             parts.push(LivePart::TrustedLine(if enhanced {
-                "Type your answer below · Enter submits · Ctrl+J newline · Esc cancels\n"
+                "Type your answer below · Enter submits · Ctrl+J newline · Ctrl+S skips · Esc cancels\n"
             } else {
-                "Type your answer and press Enter\n"
+                "Type your answer and press Enter · type s to skip\n"
             }));
         } else if enhanced {
             let mut hint = String::new();
@@ -413,7 +413,7 @@ impl LiveFrame {
             if request.multi_select() {
                 writeln!(
                     &mut hint,
-                    "Press 1-{} to toggle · Enter submits · {} custom · Esc cancels",
+                    "Press 1-{} to toggle · Enter submits · {} custom · s skips · Esc cancels",
                     request.options().len(),
                     request.options().len() + 1
                 )
@@ -421,7 +421,7 @@ impl LiveFrame {
             } else {
                 writeln!(
                     &mut hint,
-                    "Press 1-{} to choose · {} opens custom text · Esc cancels",
+                    "Press 1-{} to choose · {} custom · s skips · Esc cancels",
                     request.options().len(),
                     request.options().len() + 1
                 )
@@ -430,11 +430,11 @@ impl LiveFrame {
             parts.push(LivePart::TrustedOwned(hint));
         } else if request.multi_select() {
             parts.push(LivePart::TrustedLine(
-                "Type one option number per line to toggle; press Enter on an empty line to submit\n",
+                "Type one option number per line to toggle; empty line submits; s skips\n",
             ));
         } else {
             parts.push(LivePart::TrustedLine(
-                "Type the option number and press Enter\n",
+                "Type the option number and press Enter · type s to skip\n",
             ));
         }
         Ok(Self { parts })
@@ -448,9 +448,9 @@ impl LiveFrame {
             "[custom answer requested]\n"
         }));
         parts.push(LivePart::TrustedLine(if retry {
-            "Type a nonblank answer of at most 4096 bytes and press Enter\n"
+            "Type a nonblank answer of at most 4096 bytes and press Enter · type s to skip\n"
         } else {
-            "Type your answer and press Enter\n"
+            "Type your answer and press Enter · type s to skip\n"
         }));
         Ok(Self { parts })
     }

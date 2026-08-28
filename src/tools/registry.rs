@@ -1576,6 +1576,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn user_question_returns_a_skipped_item_as_an_empty_selection() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let request = goal_request(
+            "ask_user_question",
+            serde_json::json!({"questions":[{"id":"optional","question":"Anything else?"}]}),
+        );
+        let future = prepare_user_question(Some(broker), &request, CancellationToken::new());
+        tokio::pin!(future);
+        assert!(poll!(&mut future).is_pending());
+        receiver
+            .try_recv()
+            .unwrap()
+            .answer(vec![UserQuestionResponseItem::Skipped])
+            .unwrap();
+        let ToolPreparation::Complete(result) = future.await.unwrap() else {
+            panic!("user question should settle as an ordinary result")
+        };
+        let ContentBlockKind::Text { text } = result.content()[0].kind() else {
+            panic!("user question should render compact JSON text")
+        };
+        assert_eq!(text, r#"{"answers":[{"id":"optional","selected":[]}]}"#);
+    }
+
     #[test]
     fn goal_tool_schemas_and_dispatch_are_closed_and_share_one_runtime() {
         let schemas = build_goal_schemas().unwrap();

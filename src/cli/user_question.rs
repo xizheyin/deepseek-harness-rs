@@ -27,6 +27,7 @@ pub(super) enum QuestionInputUpdate {
     Selected(usize),
     Toggled(usize),
     MultiSubmitted,
+    Skipped,
     CustomRequested,
     CustomSubmitted(String),
     Cancelled,
@@ -247,6 +248,18 @@ impl UserQuestionUiState {
         true
     }
 
+    pub(super) fn skip(&mut self) {
+        if !self.is_accepting() || self.answers.len() != self.current_question {
+            self.retry();
+            return;
+        }
+        let question_count = self
+            .active
+            .as_ref()
+            .map_or(0, |envelope| envelope.request().questions().len());
+        self.advance_or_finish(UserQuestionResponseItem::Skipped, question_count);
+    }
+
     pub(super) fn begin_custom(&mut self) -> Result<(), ()> {
         if self.phase != QuestionPhase::Selecting {
             return Err(());
@@ -363,6 +376,9 @@ impl UserQuestionUiState {
         if bytes.contains(&0x1b) {
             return QuestionInputUpdate::Cancelled;
         }
+        if bytes == b"s" {
+            return QuestionInputUpdate::Skipped;
+        }
         let Some(question) = self.current_item() else {
             return QuestionInputUpdate::Invalid;
         };
@@ -407,7 +423,11 @@ impl UserQuestionUiState {
                         .count()
                         == 1;
                 let blank = record.iter().all(u8::is_ascii_whitespace);
+                let skipped = record == b"s";
                 self.selection_record_len = 0;
+                if skipped {
+                    return QuestionInputUpdate::Skipped;
+                }
                 let Some(question) = self.current_item() else {
                     return QuestionInputUpdate::Invalid;
                 };
@@ -452,6 +472,10 @@ impl UserQuestionUiState {
                     return QuestionInputUpdate::Invalid;
                 }
                 let record = &self.custom_record[..self.custom_record_len];
+                if record == b"s" {
+                    self.clear_records();
+                    return QuestionInputUpdate::Skipped;
+                }
                 let text = match std::str::from_utf8(record) {
                     Ok(text) => text,
                     Err(_) => {
@@ -783,5 +807,51 @@ mod tests {
             assert_eq!(answer.answers()[0].selected(), ["Fast"]);
             assert_eq!(answer.answers()[0].custom(), expected_custom);
         }
+    }
+
+    #[tokio::test]
+    async fn skip_advances_custom_and_multi_questions_without_losing_earlier_answers() {
+        let (broker, mut receiver) = UserQuestionBroker::new();
+        let answer = broker.ask(
+            UserQuestionRequest::new(vec![
+                item("mode", "Which mode?"),
+                UserQuestionItem::new(
+                    "detail".to_owned(),
+                    None,
+                    "Anything else?".to_owned(),
+                    Vec::new(),
+                ),
+                item("targets", "Which targets?").with_multi_select(true),
+            ]),
+            CancellationToken::new(),
+        );
+        tokio::pin!(answer);
+        assert!(poll!(&mut answer).is_pending());
+        let mut ui = UserQuestionUiState::default();
+        ui.receive(receiver.try_recv().unwrap()).unwrap();
+
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        ui.select(1);
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        assert_eq!(ui.feed(&[0x13], false), QuestionInputUpdate::None);
+        ui.skip();
+        ui.mark_rendering().unwrap();
+        ui.begin_accepting().unwrap();
+        ui.toggle(0);
+        assert_eq!(ui.feed(b"s", true), QuestionInputUpdate::Skipped);
+        ui.skip();
+
+        let answer = answer.await.unwrap();
+        assert_eq!(answer.answers()[0].selected(), ["Fast"]);
+        assert!(answer.answers()[1].selected().is_empty());
+        assert!(answer.answers()[2].selected().is_empty());
+        assert!(
+            answer
+                .answers()
+                .iter()
+                .all(|answer| answer.custom().is_none())
+        );
     }
 }

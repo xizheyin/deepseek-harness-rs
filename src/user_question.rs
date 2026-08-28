@@ -152,6 +152,7 @@ struct UserQuestionResponse {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum UserQuestionResponseItem {
+    Skipped,
     Selected(usize),
     MultiSelected(Vec<usize>),
     Custom(String),
@@ -234,6 +235,7 @@ impl UserQuestionBroker {
             .map_err(|_| UserQuestionError::Unavailable)?;
         for (question, response) in questions.into_iter().zip(response_answers) {
             let (selected_indices, custom) = match response {
+                UserQuestionResponseItem::Skipped => (Vec::new(), None),
                 UserQuestionResponseItem::Selected(index) => (vec![index], None),
                 UserQuestionResponseItem::MultiSelected(indices) => (indices, None),
                 UserQuestionResponseItem::Custom(custom) if custom_answer_is_valid(&custom) => {
@@ -277,6 +279,7 @@ impl UserQuestionBroker {
 
 fn response_is_valid(answer: &UserQuestionResponseItem, question: &UserQuestionItem) -> bool {
     match answer {
+        UserQuestionResponseItem::Skipped => true,
         UserQuestionResponseItem::Selected(index) => {
             !question.multi_select && *index < question.options.len()
         }

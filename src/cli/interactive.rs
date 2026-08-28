@@ -3408,6 +3408,11 @@ fn dispatch_enhanced_question_custom(
             }
             Ok(QuestionCustomDispatch::Redraw)
         }
+        QuestionCustomInputOutcome::Skip => {
+            let _ = input.finish_question_overlay()?;
+            question.skip();
+            Ok(QuestionCustomDispatch::Redraw)
+        }
         QuestionCustomInputOutcome::Cancel => {
             let _ = input.finish_question_overlay()?;
             question.cancel();
@@ -4423,6 +4428,14 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                                         active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
                                         dock_redraw_requested = active.enhanced;
                                     }
+                                    QuestionInputUpdate::Skipped => {
+                                        restore_question_overlay(
+                                            active.queued_input.as_deref_mut(),
+                                        )?;
+                                        question_ui.skip();
+                                        active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                                        dock_redraw_requested = active.enhanced;
+                                    }
                                     QuestionInputUpdate::CustomRequested => {
                                         question_ui
                                             .begin_custom()
@@ -5407,6 +5420,7 @@ enum QuestionCustomInputOutcome {
     Continue,
     Redraw,
     Submit,
+    Skip,
     Cancel,
     Eof,
     Invalid,
@@ -5421,6 +5435,9 @@ fn handle_question_custom_input(
     let (Some(decoder), Some(input)) = (decoder, input) else {
         return Err(InteractiveError::Agent);
     };
+    if bytes == [0x13] {
+        return Ok(QuestionCustomInputOutcome::Skip);
+    }
     let size = terminal.size().unwrap_or(TerminalSize {
         rows: MIN_ENHANCED_ROWS,
         columns: MIN_ENHANCED_COLUMNS,

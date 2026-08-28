@@ -1562,6 +1562,21 @@ Latest `origin/master` remains
 Rust Phase 20 maps this behavior onto bounded terminal keys as specified in
 `docs/design/user-question-multi-select.md`.
 
+## Phase 21 per-question skip inspection — 2026-08-28
+
+The fixed Web `QuestionComposer.tsx` and
+`tests/user-questions-composer.client.spec.tsx` were rechecked for Skip. A skip
+replaces only the current draft with `selected: []`, advances when another
+question remains, and submits the complete ordered answer array when it skips
+the final question. The fixture proves earlier selected labels survive while
+later custom and multi-select questions can each be skipped.
+
+The fixed tool projection already forwards the empty selected array unchanged.
+Latest `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Rust Phase 21 uses a terminal key
+mapping without changing the model-visible shape; see
+`docs/design/user-question-skip.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

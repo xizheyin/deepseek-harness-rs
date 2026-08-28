@@ -2560,6 +2560,90 @@ fn user_question_multi_select_escape_cancels_the_whole_question() {
 }
 
 #[test]
+fn user_question_skip_custom_middle_keeps_earlier_and_later_answers() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-skip-middle",
+            "ask_user_question",
+            serde_json::json!({
+                "questions":[
+                    {"id":"mode","question":"Which mode?","options":[{"label":"Safe"},{"label":"Fast"}]},
+                    {"id":"detail","question":"Anything else?"},
+                    {"id":"tests","question":"Which tests?","options":[{"label":"Focused"},{"label":"Full"}]}
+                ]
+            }),
+        ),
+        text_sse("I received the answers around the skipped question."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask three questions and let me skip one\r");
+    dsh.expect(b"question 1/3 from assistant");
+    dsh.write(b"2");
+    dsh.expect(b"question 2/3 from assistant");
+    dsh.expect(b"Ctrl+S skips");
+    dsh.write(&[0x13]);
+    dsh.expect(b"question 3/3 from assistant");
+    dsh.write(b"1");
+    dsh.expect(b"I received the answers around the skipped question.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-skip-middle"),
+        concat!(
+            r#"{"answers":[{"id":"mode","selected":["Fast"]},"#,
+            r#"{"id":"detail","selected":[]},"#,
+            r#"{"id":"tests","selected":["Focused"]}]}"#,
+        )
+    );
+}
+
+#[test]
+fn user_question_skip_final_multi_discards_its_partial_selection() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-question-skip-multi",
+            "ask_user_question",
+            serde_json::json!({
+                "questions":[{
+                    "id":"targets",
+                    "question":"Which targets?",
+                    "options":[{"label":"tests"},{"label":"docs"}],
+                    "multi_select":true
+                }]
+            }),
+        ),
+        text_sse("I saw the skipped multi-select question."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"ask a multi question then skip it\r");
+    dsh.expect(b"Press 1-2 to toggle");
+    dsh.write(b"1");
+    dsh.expect(b"Selected options \xc2\xb7 1");
+    dsh.write(b"s");
+    dsh.expect(b"I saw the skipped multi-select question.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-question-skip-multi"),
+        r#"{"answers":[{"id":"targets","selected":[]}]}"#
+    );
+}
+
+#[test]
 fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
     let first_server = SequenceSseServer::start(vec![

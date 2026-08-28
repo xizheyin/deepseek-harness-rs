@@ -407,11 +407,11 @@ impl DockFrame {
                     DockInteraction::CommandPalette { .. } => "Enter complete · Esc close",
                     DockInteraction::QuestionCustom { .. } if compact => "Enter · Esc",
                     DockInteraction::QuestionCustom { .. } => {
-                        "Enter answer | Ctrl+J newline | Esc cancels question"
+                        "Enter answer | Ctrl+J newline | Ctrl+S skip | Esc cancels question"
                     }
                     DockInteraction::QuestionMulti { .. } if compact => "Digits · Enter · Esc",
                     DockInteraction::QuestionMulti { .. } => {
-                        "Number toggles | Enter submits | custom number opens text | Esc cancels"
+                        "Number toggles | Enter submits | custom number | s skips | Esc cancels"
                     }
                     DockInteraction::Approval(_) | DockInteraction::ExactShellApproval(_) => {
                         "Arrow keys move | Enter confirms | Esc stops"

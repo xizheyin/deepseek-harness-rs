@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–20 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–21 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -28,6 +28,7 @@ for behavior that users can run today.
 | 18 | Sequential bounded user-question batches | `complete` | [`validation/phase-18.md`](validation/phase-18.md) |
 | 19 | Bounded custom and option-free user answers | `complete` | [`validation/phase-19.md`](validation/phase-19.md) |
 | 20 | Bounded multi-select user questions | `complete` | [`validation/phase-20.md`](validation/phase-20.md) |
+| 21 | Per-question skip in bounded question batches | `complete` | [`validation/phase-21.md`](validation/phase-21.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -286,6 +287,21 @@ Skip, backward page navigation, plan-review presentation, product subagent
 routing, and a general answerer waterfall remain outside this phase. Design
 and local evidence live in `docs/design/user-question-multi-select.md` and
 `docs/validation/phase-20.md`.
+
+## Phase 21 per-question skip boundary (2026-08-28)
+
+Phase 21 adds the official ability to skip only the current question. Earlier
+answers remain local, the next question opens normally, and final output encodes
+the skipped item as an empty `selected` array without `custom`.
+
+Enhanced selection screens use `s`; an active custom editor uses Ctrl+S so an
+ordinary letter `s` remains valid text. Linear mode accepts `s` plus Enter.
+Skip restores any borrowed Composer overlay, keeps the whole-batch cancellation
+path separate, and still publishes only one final correlated tool result.
+
+Pager navigation, plan-review presentation, product subagent routing, and a
+general answerer waterfall remain outside this phase. Design and evidence live
+in `docs/design/user-question-skip.md` and `docs/validation/phase-21.md`.
 
 ## Still deferred
 
