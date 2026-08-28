@@ -236,6 +236,7 @@ pub(super) async fn assemble_session(
             return Err(AssemblyFailure::new(error, session));
         }
     };
+    let skill_runtime = registry.skill_runtime();
     let schemas = registry.schemas().to_vec();
 
     let config = match AgentLoopConfig::new(call)
@@ -281,6 +282,7 @@ pub(super) async fn assemble_session(
         };
         agent.install_workspace_context(workspace_context);
         agent.install_workspace_instruction_runtime(workspace_instruction_runtime);
+        agent.install_skill_runtime(skill_runtime);
         Ok(AgentAssembly::Interactive(InteractiveAssembly {
             agent,
             events,
@@ -303,6 +305,7 @@ pub(super) async fn assemble_session(
             Ok(mut agent) => {
                 agent.install_workspace_context(workspace_context);
                 agent.install_workspace_instruction_runtime(workspace_instruction_runtime);
+                agent.install_skill_runtime(skill_runtime);
                 Ok(AgentAssembly::Script(agent))
             }
             Err((_error, session)) => {

@@ -12,6 +12,7 @@ use crate::{
     model::{ContentBlock, JsonValue, ToolSchema},
     plan_mode::{MAX_PLAN_BYTES, PlanModeRuntime},
     session::{TodoItem, TodoStatus},
+    skills::{SKILL_TOOL_NAME, SkillLoadError, SkillRuntime},
     user_question::{
         MAX_QUESTION_HEADER_BYTES, MAX_QUESTION_ID_BYTES, MAX_QUESTION_OPTION_DESCRIPTION_BYTES,
         MAX_QUESTION_OPTION_LABEL_BYTES, MAX_QUESTION_OPTIONS, MAX_QUESTION_TEXT_BYTES,
@@ -119,11 +120,12 @@ impl ToolExecutor for ReadOnlyToolRegistry {
     }
 }
 
-/// Capability-bound catalogue containing four read tools plus the closed
+/// Capability-bound catalogue containing read/Skill tools plus the closed
 /// approval-gated built-in text mutation tools.
 #[cfg(unix)]
 pub struct WorkspaceToolRegistry {
     workspace: Workspace,
+    skills: SkillRuntime,
     schemas: Arc<[ToolSchema]>,
 }
 
@@ -141,10 +143,19 @@ impl std::fmt::Debug for WorkspaceToolRegistry {
 #[cfg(unix)]
 impl WorkspaceToolRegistry {
     pub fn open(workspace: impl AsRef<Path>) -> Result<Self, ToolRegistryBuildError> {
-        let workspace = Workspace::open(workspace.as_ref())?;
+        let path = workspace.as_ref();
+        let authority = WorkspaceAuthority::open(path).map_err(|source| {
+            ToolRegistryBuildError::InvalidWorkspace {
+                path: path.to_owned(),
+                source,
+            }
+        })?;
+        let skills = SkillRuntime::from_authority(&authority);
+        let workspace = Workspace::from_authority(authority);
         let schemas = build_workspace_schemas()?;
         Ok(Self {
             workspace,
+            skills,
             schemas: schemas.into(),
         })
     }
@@ -182,6 +193,7 @@ impl WebToolProviders {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct LocalToolRegistry {
     workspace: Arc<Workspace>,
+    skills: SkillRuntime,
     schemas: Arc<[ToolSchema]>,
     environment: ShellEnvironment,
     runner: Arc<ProcessRunner>,
@@ -199,6 +211,7 @@ impl std::fmt::Debug for LocalToolRegistry {
         formatter
             .debug_struct("LocalToolRegistry")
             .field("workspace_configured", &true)
+            .field("project_skills_enabled", &true)
             .field("schema_count", &self.schemas.len())
             .field("environment", &self.environment)
             .field("process_runner", &self.runner)
@@ -257,6 +270,7 @@ impl LocalToolRegistry {
         user_questions: Option<UserQuestionBroker>,
         web: WebToolProviders,
     ) -> Result<Self, ToolRegistryBuildError> {
+        let skills = SkillRuntime::from_authority(&authority);
         let workspace = Arc::new(Workspace::from_authority(authority));
         let environment = ShellEnvironment::capture()?;
         let runner = Arc::new(
@@ -292,6 +306,7 @@ impl LocalToolRegistry {
         }
         Ok(Self {
             workspace,
+            skills,
             schemas: schemas.into(),
             environment,
             runner,
@@ -347,12 +362,19 @@ impl LocalToolRegistry {
     pub fn workspace(&self) -> &Path {
         self.workspace.display_root()
     }
+
+    pub(crate) fn skill_runtime(&self) -> SkillRuntime {
+        self.skills.clone()
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl ToolExecutor for LocalToolRegistry {
     fn execution_mode(&self, tool_name: &str) -> ToolExecutionMode {
-        if matches!(tool_name, "read" | "web_search" | "web_fetch") {
+        if matches!(
+            tool_name,
+            "read" | SKILL_TOOL_NAME | "web_search" | "web_fetch"
+        ) {
             ToolExecutionMode::Parallel
         } else {
             ToolExecutionMode::Exclusive
@@ -419,6 +441,10 @@ impl ToolExecutor for LocalToolRegistry {
                 async move { dispatch_web_fetch(provider, &request, cancellation).await },
             );
         }
+        if request.name() == SKILL_TOOL_NAME {
+            let skills = self.skills.clone();
+            return Box::pin(async move { dispatch_skill(skills, &request, cancellation).await });
+        }
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
         }
@@ -484,6 +510,7 @@ impl ToolExecutor for LocalToolRegistry {
         let user_questions = self.user_questions.clone();
         let web_search = self.web_search.clone();
         let web_fetch = self.web_fetch.clone();
+        let skills = self.skills.clone();
         Box::pin(async move {
             if is_goal_tool(request.name()) {
                 return prepare_goal(goal, &request);
@@ -504,6 +531,10 @@ impl ToolExecutor for LocalToolRegistry {
             }
             if request.name() == web_fetch::WEB_FETCH_TOOL_NAME {
                 let result = dispatch_web_fetch(web_fetch, &request, cancellation).await?;
+                return Ok(ToolPreparation::Complete(result));
+            }
+            if request.name() == SKILL_TOOL_NAME {
+                let result = dispatch_skill(skills, &request, cancellation).await?;
                 return Ok(ToolPreparation::Complete(result));
             }
             if request.name() == "apply_patch" {
@@ -611,7 +642,7 @@ async fn dispatch_web_fetch(
 #[cfg(unix)]
 impl ToolExecutor for WorkspaceToolRegistry {
     fn execution_mode(&self, tool_name: &str) -> ToolExecutionMode {
-        if tool_name == "read" {
+        if matches!(tool_name, "read" | SKILL_TOOL_NAME) {
             ToolExecutionMode::Parallel
         } else {
             ToolExecutionMode::Exclusive
@@ -623,6 +654,10 @@ impl ToolExecutor for WorkspaceToolRegistry {
         request: ToolExecutionRequest,
         cancellation: CancellationToken,
     ) -> ToolExecutionFuture<'_> {
+        if request.name() == SKILL_TOOL_NAME {
+            let skills = self.skills.clone();
+            return Box::pin(async move { dispatch_skill(skills, &request, cancellation).await });
+        }
         if request.name() == "apply_patch" {
             return Box::pin(async {
                 ToolCallError::model(
@@ -669,7 +704,12 @@ impl ToolExecutor for WorkspaceToolRegistry {
         cancellation: CancellationToken,
     ) -> ToolPreparationFuture<'_> {
         let workspace = self.workspace.clone();
+        let skills = self.skills.clone();
         Box::pin(async move {
+            if request.name() == SKILL_TOOL_NAME {
+                let result = dispatch_skill(skills, &request, cancellation).await?;
+                return Ok(ToolPreparation::Complete(result));
+            }
             if request.name() == "apply_patch" {
                 return patch::prepare(&workspace, request.arguments().as_value(), &cancellation)
                     .await;
@@ -802,6 +842,60 @@ fn prepare_todo_write(
         "Updated todo list: {pending} pending, {in_progress} in progress, {completed} completed."
     ))?;
     Ok(ToolPreparation::TodoWrite { todos, result })
+}
+
+async fn dispatch_skill(
+    skills: SkillRuntime,
+    request: &ToolExecutionRequest,
+    cancellation: CancellationToken,
+) -> Result<ToolExecutionResult, ToolExecutorError> {
+    let invalid = |message: String| {
+        ToolCallError::model("SkillError", "SKILL_INVALID", message).into_execution_result()
+    };
+    let fields = match request.arguments().as_value().as_object() {
+        Some(fields) => fields,
+        None => return invalid("skill arguments must be an object".to_owned()),
+    };
+    if fields.keys().any(|key| key != "name") {
+        return invalid("skill received an unknown argument".to_owned());
+    }
+    let Some(name) = fields.get("name").and_then(serde_json::Value::as_str) else {
+        return invalid("skill name must be a string".to_owned());
+    };
+    let text = match skills.load(name, &cancellation).await {
+        Ok(text) => text,
+        Err(SkillLoadError::Invalid) => {
+            return invalid(format!("invalid skill name {name:?}"));
+        }
+        Err(SkillLoadError::Unknown) => {
+            return ToolCallError::model(
+                "SkillError",
+                "SKILL_UNKNOWN",
+                format!("skill {name:?} is unknown or no longer available"),
+            )
+            .into_execution_result();
+        }
+        Err(SkillLoadError::Disabled) => {
+            return ToolCallError::model(
+                "SkillError",
+                "SKILL_DISABLED",
+                format!("skill {name:?} is not available for model invocation"),
+            )
+            .into_execution_result();
+        }
+        Err(SkillLoadError::Unavailable) => {
+            return ToolCallError::model(
+                "SkillError",
+                "SKILL_UNAVAILABLE",
+                "the project Skill catalogue could not be read safely",
+            )
+            .into_execution_result();
+        }
+        Err(SkillLoadError::Cancelled) => {
+            return ToolCallError::aborted().into_execution_result();
+        }
+    };
+    normalize_success(text)
 }
 
 fn parse_todo_write_arguments(arguments: &serde_json::Value) -> ToolCallResult<Vec<TodoItem>> {
@@ -1797,7 +1891,29 @@ fn build_workspace_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> 
         }),
     )?);
     schemas.push(build_todo_write_schema()?);
+    schemas.push(build_skill_schema()?);
     Ok(schemas)
+}
+
+fn build_skill_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
+    schema(
+        SKILL_TOOL_NAME,
+        "Load the full instructions for an available project Skill. Call this with the exact name from the session Skill catalog before acting on a matching task.",
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                    "description": "The exact Skill name from the available Skills list."
+                }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 fn build_todo_write_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
@@ -2026,10 +2142,10 @@ mod tests {
     use super::{
         MAX_TODO_CONTENT_BYTES, MAX_TODO_ITEMS, MAX_TOOL_CONTENT_BYTES,
         build_exit_plan_mode_schema, build_goal_schemas, build_todo_write_schema,
-        build_user_question_schema, dispatch, dispatch_goal, normalize_dispatch_success,
-        normalize_success, parse_exit_plan_mode_arguments, parse_todo_write_arguments,
-        parse_user_question_arguments, prepare_exit_plan_mode, prepare_goal, prepare_todo_write,
-        prepare_user_question,
+        build_user_question_schema, dispatch, dispatch_goal, dispatch_skill,
+        normalize_dispatch_success, normalize_success, parse_exit_plan_mode_arguments,
+        parse_todo_write_arguments, parse_user_question_arguments, prepare_exit_plan_mode,
+        prepare_goal, prepare_todo_write, prepare_user_question,
     };
     use crate::tools::workspace::Workspace;
     use crate::{
@@ -2041,6 +2157,7 @@ mod tests {
         model::{CallId, ContentBlockKind, JsonValue},
         plan_mode::PlanModeRuntime,
         session::TodoStatus,
+        skills::SkillRuntime,
         tools::{
             EMPTY_TEXT_BLOCK_JSON_BYTES, WebFetchBodyKind, WebFetchFuture, WebFetchProvider,
             WebFetchResult, WebSearchFuture, WebSearchProvider, WebSearchProviderError,
@@ -2147,6 +2264,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_dispatch_has_closed_success_error_and_cancellation_results() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-registry-project-skill-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join(".dsh/skills/demo")).unwrap();
+        fs::write(
+            root.join(".dsh/skills/demo/SKILL.md"),
+            "---\nname: demo-skill\ndescription: Demo\n---\nCurrent body.\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(".dsh/skills/hidden")).unwrap();
+        fs::write(
+            root.join(".dsh/skills/hidden/SKILL.md"),
+            "---\nname: hidden-skill\ndescription: Hidden\ndisable-model-invocation: true\n---\nHidden.\n",
+        )
+        .unwrap();
+        let authority = WorkspaceAuthority::open(&root).unwrap();
+        let runtime = SkillRuntime::from_authority(&authority);
+
+        let success = dispatch_skill(
+            runtime.clone(),
+            &goal_request("skill", serde_json::json!({ "name": "demo-skill" })),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!success.is_error());
+        let ContentBlockKind::Text { text } = success.content()[0].kind() else {
+            panic!("Skill result must be text")
+        };
+        assert!(text.contains("Current body."));
+
+        for (arguments, code) in [
+            (serde_json::json!({ "name": "Bad_Name" }), "SKILL_INVALID"),
+            (serde_json::json!({ "name": "missing" }), "SKILL_UNKNOWN"),
+            (
+                serde_json::json!({ "name": "hidden-skill" }),
+                "SKILL_DISABLED",
+            ),
+            (
+                serde_json::json!({ "name": "demo-skill", "extra": true }),
+                "SKILL_INVALID",
+            ),
+        ] {
+            let result = dispatch_skill(
+                runtime.clone(),
+                &goal_request("skill", arguments),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.error().map(|error| error.code.as_str()), Some(code));
+        }
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = dispatch_skill(
+            runtime,
+            &goal_request("skill", serde_json::json!({ "name": "demo-skill" })),
+            cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cancelled.error().map(|error| error.code.as_str()),
+            Some("ABORTED")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn enabled_web_search_is_declared_and_uses_the_ordinary_preparation_path() {
         let root =
             std::env::temp_dir().join(format!("dsh-registry-web-search-{}", uuid::Uuid::new_v4()));
@@ -2172,7 +2361,7 @@ mod tests {
             schema.parameters().as_value()["required"],
             serde_json::json!(["queries"])
         );
-        for name in ["read", "web_search", "web_fetch"] {
+        for name in ["read", "skill", "web_search", "web_fetch"] {
             assert_eq!(registry.execution_mode(name), ToolExecutionMode::Parallel);
         }
         for name in [

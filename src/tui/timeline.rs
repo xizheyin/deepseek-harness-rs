@@ -448,6 +448,7 @@ fn display_tool_name(tool: &ToolActivity) -> &str {
         "glob" => "Glob",
         "grep" => "Search",
         "read" => "Read",
+        "skill" => "Skill",
         "apply_patch" => "Patch",
         "write" => "Write",
         "edit" => "Edit",

@@ -69,11 +69,12 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 能力 | 当前实现 |
 | --- | --- |
 | 多步骤 Agent Loop | 流式接收 DeepSeek 响应，关联 reasoning、文本、工具调用、结果、usage 和结束原因 |
-| 只读工具并行（实验性） | 同一步中的独立 `read`、`web_search`、`web_fetch` 最多 10 个并行；结果仍按模型原顺序进入会话，其他工具保持独占执行 |
+| 只读工具并行（实验性） | 同一步中的独立 `read`、`skill`、`web_search`、`web_fetch` 最多 10 个并行；结果仍按模型原顺序进入会话，其他工具保持独占执行 |
 | 重复调用提醒（实验性） | 模型连续第 3、5、8 次用相同参数调用同一工具时，向下一步追加建议，避免无进展循环持续消耗时间和 token |
 | 代码理解 | 工作区内的 `list`、`glob`、`grep` 和 `read`，输出和扫描范围均有上限 |
 | 联网工具（实验性） | `web_search` 并发执行 1–4 个 DeepSeek 原生查询并公平合并最多 8 个来源；`web_fetch` 匿名读取一个经过公网地址校验的 HTTP(S) 页面；两者均无需额外审批 |
 | 项目指令（实验性） | 有界加载用户级、根目录及已触达嵌套目录的 `AGENTS.md` / `CLAUDE.md`，写入会话并在恢复或文件工具成功后检查变化 |
+| 项目 Skills（实验性） | 有界发现工作区 `.dsh/skills` 和 `.agents/skills` 中的 Markdown Skill；模型先看到名称/描述目录，再用只读 `skill` 工具按需加载当前正文，无需审批 |
 | 文件修改 | 官方风格的完整文件 `write`、唯一/全部字面 `edit` 和 `str_replace_editor`，以及严格的单文件 `apply_patch`；它们都检查实际 diff、路径、符号链接和并发修改，默认审批，也可显式启用进程级 `auto-edit` |
 | 命令执行 | 经审批的前台 `bash`，可显式记住完全相同的本进程调用；限制输出和运行时间，大输出保留尾部并给出私有临时文件路径，并在正常可观察路径下终止、回收同进程组工作 |
 | 交互控制 | 实验性 Unicode 多行 Composer、忙时下一回合队列、动态 Dock、安全粘贴、6 套内置语义主题、可关闭的工作状态动画、源文本保持的有限表格、每个工具生命周期至多一张最终卡、回合收据、只读 Inspect/Review、审批、Ctrl+C 取消，以及严格线性后备 |
@@ -391,6 +392,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | Phase 32 | 已完成：固定上游 `str_replace_editor` 的查看、创建、唯一替换和插入，共用现有审批、冲突与原子写入路径；仅做本机必要验证 |
 | Phase 33 | 已完成：大 Shell 输出保留 64,000 字节尾部，同时把完整已捕获流写入所有者私有临时文件并返回路径；仅做本机必要验证 |
 | Phase 34 | 已完成：固定上游 `write` 完整创建/覆盖和 `edit` 唯一或显式全部字面替换，共用现有审批、冲突与原子发布路径；仅做本机必要验证 |
+| Phase 35 | 已完成：工作区项目 Skills 的有界目录、按需正文加载、变更刷新和恢复对账；只读且无需审批，仅做本机必要验证 |
 
 Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHub-hosted
 `macos-14` arm64 和 `ubuntu-24.04` x86_64 的完整仓库检查、v0.1 安装版旅程与插件
@@ -402,13 +404,14 @@ Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHu
 ### 已知限制
 
 - 当前只支持从源码安装，包没有发布到 crates.io，也没有预编译下载或 Homebrew formula；
-- Provider 只有 DeepSeek；不支持 MCP、Hooks、Skills、子智能体或后台任务；
+- Provider 只有 DeepSeek；不支持 MCP、Hooks、产品内子智能体或后台任务，也没有环境级/远程 Skills；
 - `web_fetch` 只做匿名、无脚本的公网 HTTP(S) 文本读取，不使用登录态、Cookie、代理、JavaScript 或浏览器会话；跨源跳转必须由模型再次明确调用；
-- 并行调度只对白名单中的 `read`、`web_search`、`web_fetch` 生效；它不会并发写入、Shell、插件、人工交互或多个 Agent 回合；
+- 并行调度只对白名单中的 `read`、`skill`、`web_search`、`web_fetch` 生效；它不会并发写入、Shell、插件、人工交互或多个 Agent 回合；
 - 重复工具提醒是精确匹配的内存启发式机制，不是硬阻止；当前阈值和 500 字符参数预览固定，不提供 CLI 配置；
 - Plan Mode 是提示词约束，不是沙箱；不支持图片，也不能在正在运行的同一回合里用命令切换模式；
 - 模型任务列表是整表替换、最多 64 项且只能有一个进行中任务；它不启动并行 worker，也没有 Web 折叠控件；
 - 项目指令只发现用户级、工作区根目录和可信内置文件工具已触达的嵌套目录，不读取符号链接；跨进程恢复只能从仍可见的会话事实重建嵌套范围；
+- 项目 Skills 只扫描工作区根目录下 `.dsh/skills` 和 `.agents/skills` 的一层目录包或平铺 Markdown，拒绝符号链接；暂不扫描用户目录、自定义/内置/远程来源，不监听后台文件事件，不执行 Skill 脚本，也不支持直接 `/skill-name` 调用或完整 YAML；
 - 插件只支持显式本地工具子进程，不兼容 Cordis/npm，也不提供沙箱或热重载；
 - 内置文件修改一次只处理一个 UTF-8 文件；`edit` 只有显式 `replace_all` 才替换多个字面匹配，`str_replace_editor` 仍只接受唯一匹配并提供有界浅目录查看；官方默认要求覆盖前先读文件，Rust 改为准备完整基线、默认显示 diff 审批并在发布前复查，因此显式 `auto-edit` 可能在模型没有先读文件时完整覆盖它；Shell 只运行有界的前台命令，且获批 Shell 不是沙箱；大输出临时文件可能包含命令打印的秘密、可能被系统清理，也不会随会话迁移，读取它仍需获批 Shell；
 - 会话恢复面向正常退出后的继续工作，不是数据库级持久化或备份；
@@ -466,6 +469,8 @@ DeepSeek。三条命令也会在发布 CI 中运行。贡献前请阅读
 - [Phase 31 重复工具提醒设计](docs/design/repeated-tool-reminder.md)
 - [Phase 32 精确文本编辑器设计](docs/design/str-replace-editor.md)
 - [Phase 31 本机验收记录](docs/validation/phase-31.md)
+- [Phase 35 项目 Skills 设计](docs/design/project-skills.md)
+- [Phase 35 本机验收记录](docs/validation/phase-35.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 

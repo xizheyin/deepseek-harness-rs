@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–34 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–35 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -42,6 +42,7 @@ for behavior that users can run today.
 | 32 | Fixed-upstream `str_replace_editor` file editing | `complete` | [`validation/phase-32.md`](validation/phase-32.md) |
 | 33 | Bounded private Shell output spill files | `complete` | [`validation/phase-33.md`](validation/phase-33.md) |
 | 34 | Fixed-upstream `write` and `edit` file tools | `complete` | [`validation/phase-34.md`](validation/phase-34.md) |
+| 35 | Bounded project-local Skills catalog and loader | `complete` | [`validation/phase-35.md`](validation/phase-35.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -629,11 +630,44 @@ stale/cancel/invalid/no-match/ambiguous cases, one real CLI approval journey,
 and the normal local Rust gates. No public network, real model call, remote CI,
 additional platform matrix or unrelated stress run is required.
 
+## Phase 35 bounded project-local Skills boundary (2026-08-29)
+
+Phase 35 adds the fixed official model-facing `skill` contract over real local
+Markdown bundles. The retained workspace is scanned one level below
+`.dsh/skills` and `.agents/skills`; a directory contributes `<name>/SKILL.md`
+and a flat `<name>.md` file is also accepted. Valid model-invocable names and
+normalized descriptions enter a bounded durable catalog after the direct user
+message. The model can then call `skill` with one exact name to load the current
+body and a workspace resource-base hint through the ordinary tool-call/result
+Session order.
+
+The implementation is deliberately read-only and process-free. It reuses the
+opened workspace capability, rejects symbolic links and paths outside that
+capability, caps roots, entries, file bytes, descriptions and rendered output,
+and checks cancellation around each blocking scan/read. `.dsh/skills` wins a
+duplicate before `.agents/skills`. Discovery is repeated before a new turn and
+between tool steps, so first-party or external changes become visible without a
+long-lived filesystem watcher.
+
+This first Rust boundary does not scan `$DSH_HOME`, `~/.agents`, custom, bundled,
+remote or opaque providers; it does not follow skill symlinks, run scripts, or
+implement direct `/skill-name` gestures. Frontmatter accepts the common scalar
+`name`, `description`, optional `whenToUse`, `disable-model-invocation`, and
+`user-invocable` fields rather than arbitrary YAML. These are explicit safety
+and complexity differences, not broad compatibility claims.
+
+Acceptance is local-only: source-attributed schema/catalog/result fixtures,
+strict discovery/parser/precedence/limit/symlink/cancellation tests, real Agent
+catalog → tool call → current body continuation, catalog refresh and resume
+coverage, one real enhanced-PTY journey, and the normal local Rust gates. No
+public network, real DeepSeek call, remote CI or extra platform matrix is
+required.
+
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
-- MCP, Hooks, Skills, subagents, and background jobs
+- MCP, Hooks, ambient/remote Skills, subagents, and background jobs
 - Multiple model providers
 - Untested operating systems or sandbox claims
 - Feature-for-feature or visual copying of Claude Code

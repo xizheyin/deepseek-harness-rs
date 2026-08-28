@@ -3399,6 +3399,174 @@ fn successful_read_injects_nested_workspace_instructions_into_the_next_real_requ
 }
 
 #[test]
+fn project_skill_catalog_and_loader_reach_the_real_enhanced_cli_without_approval() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-load-project-skill",
+            "skill",
+            serde_json::json!({ "name": "demo-skill" }),
+        ),
+        text_sse("Project Skill applied."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let skill_dir = workspace.0.join(".dsh/skills/demo-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo-skill\ndescription: Use the project demo safely.\n---\nFollow the real project Skill body.\n",
+    )
+    .unwrap();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"use the matching project skill\r");
+    dsh.expect(b"Project Skill applied.");
+    dsh.expect(b"Turn complete");
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    let first = request_json(&requests[0]);
+    let schema = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "skill")
+        .unwrap();
+    assert_eq!(
+        schema["function"]["parameters"]["required"],
+        serde_json::json!(["name"])
+    );
+    assert_eq!(
+        schema["function"]["parameters"]["additionalProperties"],
+        false
+    );
+    let users = user_contents(&requests[0]);
+    assert_eq!(users[0], "use the matching project skill");
+    assert!(users[1].contains("<available_skills>"));
+    assert!(users[1].contains("- `demo-skill`: Use the project demo safely."));
+    let result = tool_message_content(&requests[1], "call-load-project-skill");
+    assert!(result.contains("<skill_content name=\"demo-skill\">"));
+    assert!(result.contains("Follow the real project Skill body."));
+    assert!(result.contains(".dsh/skills/demo-skill"));
+    assert!(
+        !transcript
+            .windows(b"> Reject".len())
+            .any(|row| row == b"> Reject")
+    );
+
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let rows = std::fs::read_to_string(entry.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let catalog = rows
+        .iter()
+        .position(|row| {
+            row["type"] == "user/message" && row["data"]["source"]["kind"] == "skill-catalog"
+        })
+        .unwrap();
+    let call = rows
+        .iter()
+        .position(|row| row["type"] == "tool/call")
+        .unwrap();
+    let result = rows
+        .iter()
+        .position(|row| row["type"] == "tool/result")
+        .unwrap();
+    assert!(catalog < call && call < result);
+}
+
+#[test]
+fn resumed_project_skill_catalog_appends_a_complete_replacement_before_provider_work() {
+    let workspace = TestWorkspace::new();
+    let skill_dir = workspace.0.join(".agents/skills/resume-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    let skill_file = skill_dir.join("SKILL.md");
+    std::fs::write(
+        &skill_file,
+        "---\nname: resume-skill\ndescription: First catalog\n---\nFirst body.\n",
+    )
+    .unwrap();
+    let session_root = TestSessionRoot::new();
+    let first_server = SequenceSseServer::start(vec![text_sse("First catalog received.")]);
+    let mut first = PtyHarness::spawn_color_with_session_root_cargo(
+        &first_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+    first.expect("❯".as_bytes());
+    first.write(b"record the first skill catalog\r");
+    first.expect(b"First catalog received.");
+    first.expect(b"Turn complete");
+    let (status, _) = first.exit_cleanly();
+    assert!(status.success());
+    assert_eq!(first_server.finish().len(), 1);
+
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let filename = entry.file_name().into_string().unwrap();
+    let session_id = filename.strip_suffix(".jsonl").unwrap().to_owned();
+    std::fs::write(
+        &skill_file,
+        "---\nname: resume-skill\ndescription: Replacement catalog\n---\nSecond body.\n",
+    )
+    .unwrap();
+
+    let second_server = SequenceSseServer::start(vec![text_sse("Replacement received.")]);
+    let mut resumed = PtyHarness::spawn_resume_color_cargo(
+        &second_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+        &session_id,
+    );
+    resumed.expect("❯".as_bytes());
+    resumed.write(b"observe the updated skill catalog\r");
+    resumed.expect(b"Replacement received.");
+    resumed.expect(b"Turn complete");
+    let (status, _) = resumed.exit_cleanly();
+    let requests = second_server.finish();
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    let users = user_contents(&requests[0]);
+    assert!(users.iter().any(|text| text.contains("First catalog")));
+    assert!(users.last().unwrap().contains("Replacement catalog"));
+    assert!(users.last().unwrap().contains("complete catalog replaces"));
+
+    let rows = std::fs::read_to_string(session_root.path().join(filename))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let catalogs = rows
+        .iter()
+        .filter(|row| {
+            row["type"] == "user/message" && row["data"]["source"]["kind"] == "skill-catalog"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(catalogs.len(), 2);
+    assert_eq!(catalogs[1]["data"]["source"]["update"], true);
+    assert_eq!(
+        catalogs[1]["data"]["source"]["entries"][0]["description"],
+        "Replacement catalog"
+    );
+}
+
+#[test]
 fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
     let first_server = SequenceSseServer::start(vec![

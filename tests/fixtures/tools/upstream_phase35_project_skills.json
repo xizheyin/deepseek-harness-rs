@@ -1,0 +1,30 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "sources": [
+      "packages/skill/skill/src/index.ts",
+      "packages/skill/skill-filesystem/src/index.ts",
+      "packages/skill/tool-skill/src/index.ts",
+      "packages/skill/tool-skill/tests/tool-skill.spec.ts",
+      "apps/cli/config/agent-presets/code/agent.cordis.yml"
+    ]
+  },
+  "schema": {
+    "name": "skill",
+    "required": ["name"],
+    "additionalProperties": false
+  },
+  "roots": [
+    { "rank": 100, "source": "project-dsh", "path": ".dsh/skills" },
+    { "rank": 200, "source": "project-agents", "path": ".agents/skills" }
+  ],
+  "catalogEntry": "- `demo-skill`: Use the demo safely.",
+  "result": "<skill_content name=\"demo-skill\">\n<skill_resources>\nBase directory for this skill: {{RESOURCE_BASE}}\nResolve relative paths mentioned by this skill against the base directory before using them. Load referenced resources only as needed.\n</skill_resources>\n\n<skill_instructions>\nFollow the demo.\n</skill_instructions>\n</skill_content>",
+  "errors": {
+    "invalid": "SKILL_INVALID",
+    "unknown": "SKILL_UNKNOWN",
+    "disabled": "SKILL_DISABLED",
+    "unavailable": "SKILL_UNAVAILABLE"
+  }
+}

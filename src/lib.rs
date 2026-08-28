@@ -7,6 +7,7 @@ mod goal;
 mod json_value;
 mod plan_mode;
 mod resident_credit;
+mod skills;
 mod tui;
 mod user_question;
 mod workspace_authority;

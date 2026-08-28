@@ -1927,6 +1927,58 @@ Rust's existing capability-confined approval and atomic publication path, with
 the observation-policy and resource differences specified in
 `docs/design/write-edit-tools.md`.
 
+## Phase 35 project-local Skills inspection — 2026-08-29
+
+Pinned baseline: `47f943859bef60e4160492346772ded9b24f765a`.
+
+Inspected fixed sources and tests:
+
+- `packages/skill/skill/src/{index.ts,invariant.ts}` and
+  `packages/skill/skill/tests/skill.spec.ts` for kebab-case names, provider/rank
+  resolution, invocation policy, resource bases, canonical skill rendering and
+  cancellation-aware lookup;
+- `packages/skill/skill-filesystem/src/{index.ts,invariant.ts}`,
+  `packages/skill/skill-filesystem/tests/{skill-filesystem.spec.ts,skill-filesystem-watcher.spec.ts}`
+  and its README for project/user roots, one-level directory/flat discovery,
+  YAML frontmatter, duplicate priority, reload-on-get and watcher invalidation;
+- `packages/skill/tool-skill/src/index.ts`,
+  `packages/skill/tool-skill/tests/tool-skill.spec.ts` and its README for the
+  exact `skill {name}` schema, initial/replacement catalog prose, durable source
+  entries, visibility rules, error strings and `<skill_content>` result;
+- `apps/cli/config/agent-presets/code/agent.cordis.yml` and
+  `apps/cli/tests/web-agent-presets.e2e.ts` for the shipped code preset mounting
+  both filesystem discovery and the model loader.
+
+Observed fixed behavior:
+
+- the catalog lists only model-invocable skills, sorted by name, with whitespace-
+  normalized descriptions capped at 500 characters;
+- project roots rank `.dsh/skills` before `.agents/skills`; directory bundles
+  use `<entry>/SKILL.md`, flat `.md` entries use the root as their resource base,
+  and loading rereads current content;
+- the model sees a complete initial or replacement `<available_skills>` catalog
+  and must call the closed `skill` tool with an exact catalog name before using
+  its instructions;
+- a successful call renders the provider, optional resource base and body in one
+  canonical `<skill_content>` block; invalid, missing, stale or model-disabled
+  names fail without fabricating instructions;
+- cancellation covers discovery and body loading, and catalog changes are
+  appended as new Session context rather than rewriting history.
+
+Latest reference: fetched `origin/master` at
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. The tool and filesystem contracts
+remain. The relevant production diff only preserves extra pre-step decision
+fields when adding/removing catalog messages and corrects the filesystem
+provider's documented default name from `local` to `filesystem`; broader preset
+and documentation movement does not change this Phase 35 contract.
+
+Rust Phase 35 implements the useful project-local, model-invocable slice. It
+keeps the workspace capability and rejects symlinks, bounds all retained data,
+rescans at model boundaries instead of owning host watchers, and intentionally
+omits ambient user/custom/bundled/remote providers and direct human `/name`
+injection. The source-attributed fixture therefore supports `partial`, not
+`compatible`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

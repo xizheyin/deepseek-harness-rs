@@ -44,6 +44,7 @@ use crate::{
         RequestHeaderReason, Session, SessionId, SessionStore, StepId, SurfaceIntent, ToolFailure,
         TurnEndReason, TurnId, UnixMillis,
     },
+    skills::SkillRuntime,
     tools::WorkspaceToolRegistry,
     workspace_authority::WorkspaceAuthority,
     workspace_instructions::WorkspaceInstructionRuntime,
@@ -1380,6 +1381,141 @@ async fn successful_builtin_read_refreshes_nested_instructions_after_step_end() 
         events[first_step_end + 1..nested_context]
             .iter()
             .any(|event| matches!(event.kind(), EventKind::StepStart { .. }))
+    );
+
+    agent.shutdown().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn project_skill_catalog_call_and_body_continue_through_the_real_agent() {
+    let root =
+        std::env::temp_dir().join(format!("dsh-agent-project-skill-{}", uuid::Uuid::new_v4()));
+    let skill_dir = root.join(".dsh/skills/demo-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: demo-skill\ndescription: Use the demo safely.\n---\nFollow the current demo body.\n",
+    )
+    .unwrap();
+
+    let replacement = "---\nname: demo-skill\ndescription: Updated demo instructions.\n---\nFollow the updated demo body.\n";
+    let write_arguments = serde_json::to_string(&json!({
+        "file_path": ".dsh/skills/demo-skill/SKILL.md",
+        "content": replacement
+    }))
+    .unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
+            StreamChunk::block_end(
+                0,
+                ContentBlock::tool_call("update-demo-skill", "write", write_arguments).unwrap(),
+            )
+            .unwrap(),
+            StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+        ],
+        vec![
+            StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
+            StreamChunk::block_end(
+                0,
+                ContentBlock::tool_call("load-demo-skill", "skill", r#"{"name":"demo-skill"}"#)
+                    .unwrap(),
+            )
+            .unwrap(),
+            StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+        ],
+        text_response(),
+    ]));
+    let registry = Arc::new(WorkspaceToolRegistry::open(&root).unwrap());
+    assert_eq!(registry.schemas().last().unwrap().name(), "skill");
+    let authority = WorkspaceAuthority::open(&root).unwrap();
+    let skills = SkillRuntime::from_authority(&authority);
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(registry.schemas().to_vec())
+        .unwrap()
+        .with_file_change_policy(FileChangePolicy::Allow);
+    let tools: Arc<dyn ToolExecutor> = registry;
+    let mut agent = AgentLoop::with_runtime(
+        Session::with_clock("project-skill-agent", IncrementingClock(Mutex::new(1_000))).unwrap(),
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+    agent.install_skill_runtime(skills);
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0][0].source().raw().as_value()["kind"], "user");
+    assert_eq!(
+        requests[0][1].source().raw().as_value()["kind"],
+        "skill-catalog"
+    );
+    assert!(requests[0][1].content().iter().any(|block| {
+        matches!(block.kind(), ContentBlockKind::Text { text } if text.contains("- `demo-skill`: Use the demo safely."))
+    }));
+    assert!(requests[1].iter().any(|message| {
+        message.source().raw().as_value()["kind"] == "skill-catalog"
+            && message.source().raw().as_value()["update"] == true
+            && message.content().iter().any(|block| {
+                matches!(block.kind(), ContentBlockKind::Text { text } if text.contains("- `demo-skill`: Updated demo instructions."))
+            })
+    }));
+    assert!(requests[2].iter().any(|message| {
+        message.content().iter().any(|block| {
+            block.tool_result_content().is_some_and(|content| {
+                content.iter().any(|value| {
+                    value["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Follow the updated demo body."))
+                })
+            })
+        })
+    }));
+
+    let event_types = agent
+        .session()
+        .events()
+        .iter()
+        .map(|event| event.kind().event_type())
+        .collect::<Vec<_>>();
+    let catalog = agent
+        .session()
+        .events()
+        .iter()
+        .position(|event| match event.kind() {
+            EventKind::UserMessage { message } => {
+                message.source().raw().as_value()["kind"] == "skill-catalog"
+            }
+            _ => false,
+        })
+        .unwrap();
+    let call = event_types
+        .iter()
+        .position(|event| *event == "tool/call")
+        .unwrap();
+    let result = event_types
+        .iter()
+        .position(|event| *event == "tool/result")
+        .unwrap();
+    assert!(catalog < call && call < result);
+    assert_eq!(
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter(|event| matches!(event.kind(), EventKind::UserMessage { message } if message.source().raw().as_value()["kind"] == "skill-catalog"))
+            .count(),
+        2
     );
 
     agent.shutdown().await.unwrap();
@@ -4962,6 +5098,7 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         deadline: tokio::time::Instant::now() + Duration::from_secs(30),
         goal_tool_caller: super::GoalToolCaller::Untrusted,
         workspace_instructions: None,
+        skills: None,
         pending_workspace_touches: &mut pending_workspace_touches,
         repeat_tool_reminder: &mut repeat_tool_reminder,
         pending_repeat_contexts: &mut pending_repeat_contexts,

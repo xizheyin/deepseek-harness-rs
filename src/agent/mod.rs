@@ -45,6 +45,7 @@ use crate::{
         TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause, TurnEndCancelCause,
         TurnEndReason, TurnId,
     },
+    skills::{SkillRuntime, SkillRuntimeError},
     workspace_instructions::{WorkspaceInstructionError, WorkspaceInstructionRuntime},
 };
 
@@ -798,6 +799,8 @@ pub struct AgentLoop {
     exact_shell_grants: approval::ExactShellGrantStore,
     pending_workspace_context: Option<Message>,
     workspace_instructions: Option<WorkspaceInstructionRuntime>,
+    pending_skill_context: Option<Message>,
+    skills: Option<SkillRuntime>,
     pending_workspace_touches: Vec<String>,
     repeat_tool_reminder: RepeatToolReminder,
     poisoned: bool,
@@ -878,6 +881,8 @@ impl AgentLoop {
             exact_shell_grants: approval::ExactShellGrantStore::new(),
             pending_workspace_context: None,
             workspace_instructions: None,
+            pending_skill_context: None,
+            skills: None,
             pending_workspace_touches: Vec::new(),
             repeat_tool_reminder: RepeatToolReminder::default(),
             poisoned: false,
@@ -906,6 +911,12 @@ impl AgentLoop {
         runtime: WorkspaceInstructionRuntime,
     ) {
         self.workspace_instructions = Some(runtime);
+    }
+
+    /// Install the read-only project Skill runtime used for both catalog
+    /// context and the registry's model-facing loader.
+    pub(crate) fn install_skill_runtime(&mut self, runtime: SkillRuntime) {
+        self.skills = Some(runtime);
     }
 
     /// Commit a local Goal command through the same durable Session owner.
@@ -992,6 +1003,7 @@ impl AgentLoop {
                 deadline: Instant::now() + config.limits.turn_duration,
                 goal_tool_caller: GoalToolCaller::Untrusted,
                 workspace_instructions: self.workspace_instructions.as_ref(),
+                skills: self.skills.as_ref(),
                 pending_workspace_touches: &mut self.pending_workspace_touches,
                 repeat_tool_reminder: &mut self.repeat_tool_reminder,
                 pending_repeat_contexts: &mut pending_repeat_contexts,
@@ -1092,7 +1104,28 @@ impl AgentLoop {
         if self.session.state().open_turn().is_some() {
             return Err(AgentLoopError::SessionNotIdle);
         }
+        self.pending_skill_context = None;
+        if !cancellation.is_cancelled() {
+            if let Some(runtime) = self.skills.as_ref() {
+                match runtime.prepare_catalog(&self.session, &cancellation).await {
+                    Ok(context) => self.pending_skill_context = context,
+                    Err(SkillRuntimeError::Cancelled) => {}
+                    Err(SkillRuntimeError::Task | SkillRuntimeError::Message) => {
+                        return Err(AgentLoopError::Invariant(
+                            "project Skill catalog could not be prepared",
+                        ));
+                    }
+                }
+            }
+        }
         let inserted_workspace_context = match (&mut proposal, &self.pending_workspace_context) {
+            (TurnProposal::Enter(messages), Some(context)) if !messages.is_empty() => {
+                messages.push(context.clone());
+                Some(context.id().as_str().to_owned())
+            }
+            _ => None,
+        };
+        let inserted_skill_context = match (&mut proposal, &self.pending_skill_context) {
             (TurnProposal::Enter(messages), Some(context)) if !messages.is_empty() => {
                 messages.push(context.clone());
                 Some(context.id().as_str().to_owned())
@@ -1141,6 +1174,7 @@ impl AgentLoop {
             &mut self.request_header_logged,
             &mut self.exact_shell_grants,
             self.workspace_instructions.as_ref(),
+            self.skills.as_ref(),
             &mut self.pending_workspace_touches,
             &mut self.repeat_tool_reminder,
             proposal,
@@ -1154,6 +1188,14 @@ impl AgentLoop {
                 .any(|message| message.id().as_str() == id)
         }) {
             self.pending_workspace_context = None;
+        }
+        if inserted_skill_context.as_deref().is_some_and(|id| {
+            self.session
+                .visible_messages()
+                .iter()
+                .any(|message| message.id().as_str() == id)
+        }) {
+            self.pending_skill_context = None;
         }
         if result.is_err()
             || session_has_unresolved_tool_calls(&self.session)
@@ -1372,6 +1414,7 @@ struct Driver<'a> {
     deadline: Instant,
     goal_tool_caller: GoalToolCaller,
     workspace_instructions: Option<&'a WorkspaceInstructionRuntime>,
+    skills: Option<&'a SkillRuntime>,
     pending_workspace_touches: &'a mut Vec<String>,
     repeat_tool_reminder: &'a mut RepeatToolReminder,
     pending_repeat_contexts: &'a mut Vec<Message>,
@@ -1420,6 +1463,7 @@ async fn run_turn_inner(
     request_header_logged: &mut bool,
     exact_shell_grants: &mut approval::ExactShellGrantStore,
     workspace_instructions: Option<&WorkspaceInstructionRuntime>,
+    skills: Option<&SkillRuntime>,
     pending_workspace_touches: &mut Vec<String>,
     repeat_tool_reminder: &mut RepeatToolReminder,
     proposal: TurnProposal,
@@ -1471,6 +1515,7 @@ async fn run_turn_inner(
         deadline: Instant::now() + config.limits.turn_duration,
         goal_tool_caller,
         workspace_instructions,
+        skills,
         pending_workspace_touches,
         repeat_tool_reminder,
         pending_repeat_contexts: &mut pending_repeat_contexts,
@@ -1608,8 +1653,7 @@ async fn run_entered_turn(
 ) -> Result<TurnEndReason, AgentLoopError> {
     let mut summary_attempted = false;
     if let Some(reason) =
-        refresh_workspace_context(reservation.session(), driver, &mut messages, cancellation)
-            .await?
+        refresh_dynamic_context(reservation.session(), driver, &mut messages, cancellation).await?
     {
         return Ok(reason);
     }
@@ -1821,7 +1865,7 @@ async fn run_entered_turn(
         // that message included.
         let input_count_before_rearm = messages.len();
         if let Some(reason) =
-            refresh_workspace_context(reservation.session(), driver, &mut messages, cancellation)
+            refresh_dynamic_context(reservation.session(), driver, &mut messages, cancellation)
                 .await?
         {
             unstarted.release(reservation)?;
@@ -1939,7 +1983,7 @@ async fn run_entered_turn(
         match resolution.outcome {
             StepOutcome::Continue => {
                 messages.append(driver.pending_repeat_contexts);
-                if let Some(reason) = refresh_workspace_context(
+                if let Some(reason) = refresh_dynamic_context(
                     reservation.session(),
                     driver,
                     &mut messages,
@@ -1960,6 +2004,19 @@ async fn run_entered_turn(
             StepOutcome::Error(error) => return Ok(TurnEndReason::Error { error }),
         }
     }
+}
+
+async fn refresh_dynamic_context(
+    session: &Session,
+    driver: &mut Driver<'_>,
+    messages: &mut Vec<Message>,
+    cancellation: &CancellationToken,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if let Some(reason) = refresh_workspace_context(session, driver, messages, cancellation).await?
+    {
+        return Ok(Some(reason));
+    }
+    refresh_skill_context(session, driver, messages, cancellation).await
 }
 
 async fn refresh_workspace_context(
@@ -2000,6 +2057,42 @@ async fn refresh_workspace_context(
 
 fn is_workspace_context_message(message: &Message) -> bool {
     message.source().raw().as_value()["kind"].as_str() == Some("agent-instructions")
+}
+
+async fn refresh_skill_context(
+    session: &Session,
+    driver: &Driver<'_>,
+    messages: &mut Vec<Message>,
+    cancellation: &CancellationToken,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if messages.iter().any(is_skill_catalog_message) {
+        return Ok(None);
+    }
+    let Some(runtime) = driver.skills else {
+        return Ok(None);
+    };
+    match runtime.prepare_catalog(session, cancellation).await {
+        Ok(Some(context)) => {
+            messages.push(context);
+            Ok(None)
+        }
+        Ok(None) => Ok(None),
+        Err(SkillRuntimeError::Cancelled) => Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        })),
+        Err(SkillRuntimeError::Task | SkillRuntimeError::Message) => {
+            Ok(Some(TurnEndReason::Error {
+                error: failure_reason(
+                    "AGENT_SKILLS",
+                    "project Skill catalog could not be refreshed safely",
+                )?,
+            }))
+        }
+    }
+}
+
+fn is_skill_catalog_message(message: &Message) -> bool {
+    message.source().raw().as_value()["kind"].as_str() == Some("skill-catalog")
 }
 
 async fn flush_pending_plan_mode(

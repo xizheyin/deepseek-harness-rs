@@ -1112,6 +1112,11 @@ fn summarize_arguments(
             .and_then(Value::as_str)
             .unwrap_or("file")
             .to_owned(),
+        "skill" => fields
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("skill")
+            .to_owned(),
         "write" | "edit" => fields
             .get("file_path")
             .and_then(Value::as_str)

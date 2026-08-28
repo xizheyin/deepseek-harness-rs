@@ -535,7 +535,7 @@ fn rust_first_mutation_step_types(session: &Session) -> Vec<String> {
 }
 
 #[test]
-fn workspace_registry_keeps_the_fixed_editor_and_patch_schemas_before_todo_write() {
+fn workspace_registry_keeps_fixed_file_and_skill_schemas_in_stable_order() {
     let workspace = TempWorkspace::new("schema");
     let registry = WorkspaceToolRegistry::open(workspace.path()).unwrap();
     assert_eq!(
@@ -553,7 +553,8 @@ fn workspace_registry_keeps_the_fixed_editor_and_patch_schemas_before_todo_write
             "edit",
             "str_replace_editor",
             "apply_patch",
-            "todo_write"
+            "todo_write",
+            "skill"
         ]
     );
     let write = registry.schemas()[4].parameters().as_value();
@@ -582,6 +583,25 @@ fn workspace_registry_keeps_the_fixed_editor_and_patch_schemas_before_todo_write
             .keys()
             .collect::<Vec<_>>(),
         ["patch"]
+    );
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/tools/upstream_phase35_project_skills.json"
+    ))
+    .unwrap();
+    let skill = registry.schemas()[9].parameters().as_value();
+    assert_eq!(fixture["schema"]["name"], "skill");
+    assert_eq!(skill["required"], fixture["schema"]["required"]);
+    assert_eq!(
+        skill["additionalProperties"],
+        fixture["schema"]["additionalProperties"]
+    );
+    assert_eq!(
+        skill["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["name"]
     );
 }
 

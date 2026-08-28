@@ -436,6 +436,7 @@ fn local_registry_exposes_a_closed_foreground_bash_schema() {
             "str_replace_editor",
             "apply_patch",
             "todo_write",
+            "skill",
             "bash"
         ]
     );
