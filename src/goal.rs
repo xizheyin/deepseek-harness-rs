@@ -964,6 +964,39 @@ pub struct PreparedGoalMutation {
     settled: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GoalWrapup {
+    objective: String,
+    blocked_reason: Option<String>,
+}
+
+impl GoalWrapup {
+    pub(crate) fn text(&self) -> String {
+        let objective =
+            serde_json::to_string(&self.objective).unwrap_or_else(|_| "\"\"".to_owned());
+        match &self.blocked_reason {
+            None => format!(
+                "<goal_complete>\nObjective: {objective}\nThe goal is marked complete and this autonomous run is ending. Write the closing message to the user now: state the outcome, summarize what was done and how it was verified, and point to concrete results such as files or commits. Report only what earlier rounds and tool results in this session establish; when a detail is absent, say so instead of inventing it. Note anything the user should review or do next. Address the user directly. Do not call any more tools in this run; further work waits for the user's next instruction.\n</goal_complete>"
+            ),
+            Some(reason) => {
+                let reason = serde_json::to_string(reason).unwrap_or_else(|_| "\"\"".to_owned());
+                format!(
+                    "<goal_blocked>\nObjective: {objective}\nBlocked: {reason}\nThe goal is marked blocked and this autonomous run is ending. Write the closing message to the user now: state what has been completed, describe the concrete blocking condition and what was tried, and say exactly what you need from the user to continue. Report only what earlier rounds and tool results in this session establish; when a detail is absent, say so instead of inventing it. Address the user directly. Do not call any more tools in this run; further work waits for the user's next instruction.\n</goal_blocked>"
+                )
+            }
+        }
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        let action = if self.blocked_reason.is_some() {
+            "blocked"
+        } else {
+            "complete"
+        };
+        bounded_goal_summary(&format!("{action}: {}", self.objective))
+    }
+}
+
 impl std::fmt::Debug for PreparedGoalMutation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -989,6 +1022,25 @@ impl PreparedGoalMutation {
                 .tool_value()
             },
         )
+    }
+
+    pub(crate) fn wrapup(&self) -> Option<GoalWrapup> {
+        let next = self.next.as_ref()?;
+        match self.change.operation {
+            GoalOperation::Complete => Some(GoalWrapup {
+                objective: next.goal.objective.clone(),
+                blocked_reason: None,
+            }),
+            GoalOperation::Block => Some(GoalWrapup {
+                objective: next.goal.objective.clone(),
+                blocked_reason: next
+                    .goal
+                    .blocked_reason
+                    .as_ref()
+                    .map(|reason| reason.message.clone()),
+            }),
+            _ => None,
+        }
     }
 
     pub(crate) fn commit(mut self) -> Result<String, GoalError> {
@@ -1115,6 +1167,18 @@ fn validate_goal_id(id: &str) -> Result<(), GoalError> {
     }
 }
 
+fn bounded_goal_summary(value: &str) -> String {
+    const MAX_BYTES: usize = 512;
+    if value.len() <= MAX_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_BYTES.saturating_sub(3);
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}...", &value[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -1123,8 +1187,8 @@ mod tests {
     };
 
     use super::{
-        GoalCommand, GoalError, GoalPhase, GoalReplayState, GoalRuntime, GoalUpdate,
-        MAX_GOAL_ROUNDS,
+        GoalBlockReason, GoalCommand, GoalError, GoalPhase, GoalReplayState, GoalRuntime,
+        GoalUpdate, MAX_GOAL_ROUNDS,
     };
 
     #[test]
@@ -1255,6 +1319,44 @@ mod tests {
         assert_eq!(value["maxGoalRounds"], 2);
         assert_eq!(value["revision"], 3);
         assert_eq!(value["activation"], "disarmed");
+    }
+
+    #[test]
+    fn terminal_wrapups_quote_grounding_and_distinguish_complete_from_blocked() {
+        let complete_goal = GoalRuntime::new();
+        let created = complete_goal.create("ship \"it\"".to_owned()).unwrap();
+        let complete = complete_goal
+            .prepare_update_exact(
+                Some(created.id()),
+                created.revision(),
+                GoalUpdate::Complete,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let wrapup = complete.wrapup().unwrap();
+        assert!(wrapup.text().contains("<goal_complete>"));
+        assert!(wrapup.text().contains("Objective: \"ship \\\"it\\\"\""));
+        assert!(wrapup.text().contains("Do not call any more tools"));
+        assert_eq!(wrapup.summary(), "complete: ship \"it\"");
+
+        let blocked_goal = GoalRuntime::new();
+        let created = blocked_goal.create("wait safely".to_owned()).unwrap();
+        let blocked = blocked_goal
+            .prepare_update_exact(
+                Some(created.id()),
+                created.revision(),
+                GoalUpdate::Blocked,
+                None,
+                None,
+                Some(GoalBlockReason::model_reported("credential missing").unwrap()),
+            )
+            .unwrap();
+        let wrapup = blocked.wrapup().unwrap();
+        assert!(wrapup.text().contains("<goal_blocked>"));
+        assert!(wrapup.text().contains("Blocked: \"credential missing\""));
+        assert_eq!(wrapup.summary(), "blocked: wait safely");
     }
 
     #[test]

@@ -1806,10 +1806,10 @@ fn goal_command_runs_sequential_rounds_until_the_model_completes_it() {
     assert!(last_user_content(&requests[0]).contains("Round: 1/32"));
     assert!(last_user_content(&requests[0]).contains("finish the bounded task"));
     assert!(last_user_content(&requests[1]).contains("Round: 2/32"));
-    assert_eq!(
-        last_user_content(&requests[2]),
-        last_user_content(&requests[1])
-    );
+    let wrapup = last_user_content(&requests[2]);
+    assert!(wrapup.contains("<goal_complete>"));
+    assert!(wrapup.contains("finish the bounded task"));
+    assert!(wrapup.contains("Do not call any more tools"));
     let first = request_json(&requests[0]);
     let names = first["tools"]
         .as_array()
@@ -1903,6 +1903,7 @@ fn resumed_goal_is_restored_disarmed_and_requires_explicit_resume() {
     assert!(status.success());
     assert_eq!(requests.len(), 2);
     assert!(last_user_content(&requests[0]).contains("Round: 2/32"));
+    assert!(last_user_content(&requests[1]).contains("<goal_complete>"));
     let journal = std::fs::read_to_string(session_root.path().join(filename)).unwrap();
     let event_types = journal
         .lines()
@@ -1914,9 +1915,9 @@ fn resumed_goal_is_restored_disarmed_and_requires_explicit_resume() {
         })
         .collect::<Vec<_>>();
     assert!(
-        event_types
-            .windows(3)
-            .any(|window| { window == ["tool/call", "goal/change", "tool/result"] })
+        event_types.windows(4).any(|window| {
+            window == ["tool/call", "goal/change", "tool/result", "user/message"]
+        })
     );
 }
 

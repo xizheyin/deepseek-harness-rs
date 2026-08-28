@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–15 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–16 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -23,6 +23,7 @@ for behavior that users can run today.
 | 13 | Durable Goal events and disarmed Session recovery | `complete` | [`validation/phase-13.md`](validation/phase-13.md) |
 | 14 | Caller-attested Goal tool authority | `complete` | [`validation/phase-14.md`](validation/phase-14.md) |
 | 15 | Official Goal tool contract and configurable cap | `complete` | [`validation/phase-15.md`](validation/phase-15.md) |
+| 16 | Autonomous Goal terminal wrap-up context | `complete` | [`validation/phase-16.md`](validation/phase-16.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 

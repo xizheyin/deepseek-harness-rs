@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     entropy::EntropySource,
-    goal::PreparedGoalMutation,
+    goal::{GoalWrapup, PreparedGoalMutation},
     model::{
         CallId, ContentBlock, ContentBlockKind, FinishReasonKind, JsonValue, LlmCallConfig,
         LlmFailure, Message, MessageRole, MessageSource, MessageSourceKind, StreamChunkKind,
@@ -2721,6 +2721,7 @@ async fn commit_tool_round(
     let mut concludes_turn = false;
     let mut infrastructure_failure = None;
     let mut latched_stop = ToolStop::None;
+    let mut pending_goal_wrapup = None;
     for index in 0..planned.len() {
         let (completed, remaining) = planned.split_at_mut(index + 1);
         let plan = &mut completed[index];
@@ -2840,6 +2841,9 @@ async fn commit_tool_round(
                     continue;
                 }
                 let result = goal_tool_result(&mutation)?;
+                let wrapup = (driver.goal_tool_caller == GoalToolCaller::GoalRound)
+                    .then(|| mutation.wrapup())
+                    .flatten();
                 let change = mutation.change().clone();
                 if let Err(error) = reservation
                     .append_settled(NewEvent::log(EventKind::goal_change(change)))
@@ -2858,6 +2862,9 @@ async fn commit_tool_round(
                     ResultSettlement::PreferredRequired,
                 )
                 .await?;
+                if wrapup.is_some() {
+                    pending_goal_wrapup = wrapup;
+                }
             }
             ToolRun::Mutation(mutation) => {
                 let resolved =
@@ -3085,6 +3092,9 @@ async fn commit_tool_round(
             }
         }
     }
+    if let Some(wrapup) = pending_goal_wrapup {
+        append_goal_wrapup(reservation, driver, wrapup).await?;
+    }
     let outcome = if driver.durable_limit.is_some() {
         StepOutcome::Error(driver.session_limit_failure.clone())
     } else if driver.observer_unavailable {
@@ -3099,6 +3109,24 @@ async fn commit_tool_round(
         StepOutcome::Continue
     };
     Ok(StepResolution::with_stop(outcome, latched_stop))
+}
+
+async fn append_goal_wrapup(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    wrapup: GoalWrapup,
+) -> Result<(), AgentLoopError> {
+    let id = next_id(driver.runtime, AgentIdKind::Message)?;
+    let source = MessageSource::plugin_notice("tool-goal", wrapup.summary())?;
+    let content = ContentBlock::text(wrapup.text())?;
+    let message = Message::user(id, vec![content], source)?;
+    reservation
+        .append_settled(NewEvent::surface(
+            EventKind::user_message(message),
+            SurfaceIntent::append(),
+        ))
+        .await?;
+    Ok(())
 }
 
 fn goal_tool_result(

@@ -8,9 +8,9 @@ with the fixed upstream contract. It also makes the existing durable
 
 In scope are closed argument schemas, exact Goal ID plus revision checks,
 optional create/edit caps, model-reported blocker text, and the canonical
-`{goal, activation}` result. Autonomous wrap-up context, image attachments,
-subagents, background work, and changing the Rust default cap remain out of
-scope.
+`{goal, activation}` result. Autonomous wrap-up context is handled by the
+following Phase 16; image attachments, subagents, background work, and changing
+the Rust default cap remain out of scope here.
 
 ## Upstream basis
 

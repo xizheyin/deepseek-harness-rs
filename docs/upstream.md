@@ -1468,6 +1468,22 @@ cap ceiling. Autonomous completion wrap-up context remains the next Goal
 behavior gap. Design and local evidence are in
 `docs/design/goal-tool-contract.md` and `docs/validation/phase-15.md`.
 
+## Phase 16 Goal wrap-up inspection — 2026-08-28
+
+`packages/goal/tool-goal/src/wrapup.ts`, the terminal-update branch in
+`src/index.ts`, and its completion/block tests were inspected at the fixed
+commit. Only an exact automatic Goal round receives the deferred plugin-notice
+user context. It is appended after tool settlement, JSON-quotes the objective
+and blocker, asks for a grounded direct-to-user closing message, and explicitly
+forbids more tools in that run. A direct-human terminal update receives no such
+context.
+
+Rust Phase 16 retains one bounded pending wrap-up until all already-declared
+tool results settle, then appends a `tool-goal` plugin-notice `user/message`
+before the next Provider request. Complete and blocked tags, source summary,
+event order, and real next-request visibility are recorded in
+`docs/design/goal-wrapup.md` and `docs/validation/phase-16.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:
