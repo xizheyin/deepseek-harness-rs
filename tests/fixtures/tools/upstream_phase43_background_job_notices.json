@@ -1,0 +1,38 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "paths": [
+      "packages/jobs/tool-jobs/src/index.ts",
+      "packages/jobs/tool-jobs/tests/tool-jobs.spec.ts"
+    ]
+  },
+  "notice": {
+    "text": "background job bash-1 (bash: pnpm test) finished [status: completed, exit code: 0]. Read its output with job_output.",
+    "source": {
+      "kind": "plugin",
+      "plugin": "tool-jobs",
+      "form": "notice",
+      "summary": "bash pnpm test [status: completed, exit code: 0]"
+    }
+  },
+  "delivery": {
+    "busyOwner": "inject-next-step",
+    "idleOwner": "open-turn",
+    "maximumConsecutiveWakes": 3,
+    "directUserClaimResetsBudget": true,
+    "pluginClaimResetsBudget": false
+  },
+  "suppression": {
+    "terminalWait": true,
+    "jobKill": true,
+    "ownerTeardown": true
+  },
+  "rustBoundary": {
+    "maximumPendingNotices": 64,
+    "deliveryMode": "wakeup",
+    "configurable": false,
+    "persistent": false,
+    "multipleOwners": false
+  }
+}

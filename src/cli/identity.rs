@@ -47,6 +47,20 @@ pub(super) fn prepare_goal_turn(
     prepare_turn(session, prompt, Some((goal_id, revision, round)))
 }
 
+pub(super) fn prepare_injected_turn(
+    session: &Session,
+    proposal: TurnProposal,
+) -> Result<PreparedUserTurn, IdentityError> {
+    let start_seq = session
+        .next_seq()
+        .ok_or(IdentityError::SessionSequenceExhausted)?;
+    Ok(PreparedUserTurn {
+        start_seq,
+        turn: session.state().next_turn(),
+        proposal,
+    })
+}
+
 fn prepare_turn(
     session: &Session,
     prompt: &str,

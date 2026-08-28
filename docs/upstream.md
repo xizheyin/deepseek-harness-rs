@@ -2323,3 +2323,35 @@ Bash producer, eight active/64 retained jobs, the existing 295-second Shell
 timeout, final idempotent output and explicit collection. It does not yet
 reproduce incremental read cursors, idle wakeups/busy injection, multi-Agent
 owner fencing, persistence or other job producers.
+
+## Phase 43 background-job completion notices — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. Before implementation, the
+following fixed-commit paths were inspected:
+
+- `packages/jobs/tool-jobs/src/index.ts` for `wakeup`/`quiet` delivery,
+  per-owner consecutive-wake accounting, the claimed-human reset, exact notice
+  text/source, bounded rendering and busy inject versus idle followup;
+- `packages/jobs/tool-jobs/tests/tool-jobs.spec.ts` for idle wake, quiet
+  injection, budget degradation and reset, plugin non-reset, teardown
+  suppression, exact content, bounded content, kill suppression, terminal-wait
+  suppression and exact-owner routing.
+
+The default fixed behavior opens at most three consecutive completion turns
+for one idle owner. A claimed direct-user message resets that count, while a
+plugin-authored notice does not. Busy owners always receive an injected
+next-step message. The exact ordinary notice is a user-role message with
+`plugin=tool-jobs`, `form=notice` and a bounded one-line summary. Killing a job,
+observing its terminal result through a wait, or tearing down its owner claims
+the report and suppresses another notice.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Its relevant production change
+only replaces a numeric system-prompt order with the central constant; the
+completion message and delivery state machine are unchanged.
+
+Rust Phase 43 keeps the default wake behavior and exact small notice shape for
+the one process-local Agent. It deliberately fixes rather than configures the
+delivery mode/budget, caps pending notices at 64 with a bounded overflow fact,
+and has no cross-Agent owner replacement or persistence.

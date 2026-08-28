@@ -50,7 +50,7 @@ use super::{
         FileSuggestionController, FileSuggestionEnter, FileSuggestionMove, JobSettlement,
         StagedFileSuggestionPresentation,
     },
-    identity::{prepare_goal_turn, prepare_user_turn},
+    identity::{prepare_goal_turn, prepare_injected_turn, prepare_user_turn},
     input::{
         CanonicalRecordParser, IdleInput, InputRecordEvent, MAX_APPROVAL_RECORD_BYTES,
         MAX_INTERACTIVE_PROMPT_BYTES, classify_idle_record,
@@ -302,6 +302,7 @@ async fn run_enhanced(
         plan_mode,
     } = assembly;
     let mut file_suggestions = FileSuggestionController::new(file_suggestions);
+    let job_notices = agent.job_notice_inbox();
     let mut live = LiveRenderer::for_session(resumed);
     live.restore_standing_todos(agent.session().state().standing_todos())
         .map_err(|_| InteractiveError::Output)?;
@@ -463,9 +464,11 @@ async fn run_enhanced(
                             EnhancedIdleEvent::Bytes(count)
                         }
                     }
+                    () = job_notices.wait_for_idle_wake() => EnhancedIdleEvent::JobWake,
                 }
             };
             let auto_submit = matches!(&event, EnhancedIdleEvent::AutoSubmit);
+            let job_wake = matches!(&event, EnhancedIdleEvent::JobWake);
             let goal_round = match &event {
                 EnhancedIdleEvent::AutoGoal(round) => Some(round.clone()),
                 _ => None,
@@ -537,6 +540,7 @@ async fn run_enhanced(
                 }
                 EnhancedIdleEvent::AutoSubmit => EnhancedInputAction::Submit,
                 EnhancedIdleEvent::AutoGoal(_) => EnhancedInputAction::Submit,
+                EnhancedIdleEvent::JobWake => EnhancedInputAction::Submit,
                 EnhancedIdleEvent::GoalSettled => {
                     notice = Some("Goal stopped at its automatic round limit".to_owned());
                     EnhancedInputAction::Redraw
@@ -571,6 +575,7 @@ async fn run_enhanced(
                     let composer_submission =
                         classify_enhanced_submission(input.composer().text());
                     let local_command = !auto_submit
+                        && !job_wake
                         && goal_round.is_none()
                         && matches!(
                             &composer_submission,
@@ -581,7 +586,9 @@ async fn run_enhanced(
                                 | EnhancedSubmission::Plan(_)
                                 | EnhancedSubmission::CompactUsage
                         );
-                    let (mut draft, mut cursor) = if let Some(round) = &goal_round {
+                    let (mut draft, mut cursor) = if job_wake {
+                        (String::new(), 0)
+                    } else if let Some(round) = &goal_round {
                         (round.prompt().to_owned(), 0)
                     } else if local_command {
                         let cursor = input.composer().cursor();
@@ -597,7 +604,7 @@ async fn run_enhanced(
                         let cursor = input.composer().cursor();
                         (input.take_draft_for_turn()?, cursor)
                     };
-                    let mut submission = if goal_round.is_some() {
+                    let mut submission = if job_wake || goal_round.is_some() {
                         EnhancedSubmission::Prompt
                     } else if local_command {
                         composer_submission
@@ -744,12 +751,14 @@ async fn run_enhanced(
                                         false,
                                     )
                                     .await?;
-                                } else if let Some(id) = queued_id {
-                                    input.release_reserved(id)?;
-                                } else {
-                                    input
-                                        .restore_uncommitted_draft(draft, cursor)
-                                        .map_err(|_| InteractiveError::Agent)?;
+                                } else if !job_wake {
+                                    if let Some(id) = queued_id {
+                                        input.release_reserved(id)?;
+                                    } else {
+                                        input
+                                            .restore_uncommitted_draft(draft, cursor)
+                                            .map_err(|_| InteractiveError::Agent)?;
+                                    }
                                 }
                                 pending_signal = Some(signal);
                                 continue;
@@ -781,6 +790,7 @@ async fn run_enhanced(
                                 goal_round: goal_round
                                     .as_ref()
                                     .map(|round| (round.revision(), round.number())),
+                                job_wake,
                             })
                             .await;
                             let disposition = turn_result?;
@@ -789,7 +799,7 @@ async fn run_enhanced(
                                 TurnDisposition::Continue
                                     | TurnDisposition::Signal(UiSignal::Suspend)
                             ) {
-                                if goal_round.is_none() {
+                                if goal_round.is_none() && !job_wake {
                                     settle_enhanced_prompt(
                                         &mut input,
                                         queued_id,
@@ -1145,6 +1155,7 @@ enum EnhancedIdleEvent {
     AutoSubmit,
     AutoGoal(GoalRound),
     GoalSettled,
+    JobWake,
     Bytes(usize),
     FileSuggestion(Result<JobSettlement, tokio::task::JoinError>),
 }
@@ -2537,6 +2548,7 @@ async fn run_linear(
         goal,
         plan_mode,
     } = assembly;
+    let job_notices = agent.job_notice_inbox();
     let mut live = LiveRenderer::for_session(resumed);
     live.restore_standing_todos(agent.session().state().standing_todos())
         .map_err(|_| InteractiveError::Output)?;
@@ -2594,6 +2606,7 @@ async fn run_linear(
                         enhanced: false,
                         goal: &goal,
                         goal_round: Some((round.revision(), round.number())),
+                        job_wake: false,
                     })
                     .await;
                     match turn_result? {
@@ -2644,6 +2657,7 @@ async fn run_linear(
                                 break IdleEvent::Record(event);
                             }
                         }
+                        () = job_notices.wait_for_idle_wake() => break IdleEvent::JobWake,
                     }
                 }
             };
@@ -2671,6 +2685,46 @@ async fn run_linear(
                     }
                 }
                 IdleEvent::Eof => return Ok(InteractiveExit::Ordinary(0)),
+                IdleEvent::JobWake => {
+                    parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
+                    let mut prompt_committed = false;
+                    match run_turn(ActiveTurn {
+                        agent: &mut agent,
+                        events: &mut events,
+                        approvals: &mut approvals,
+                        user_questions: &mut user_questions,
+                        joins: &mut joins,
+                        live: &mut live,
+                        presenter: &mut presenter,
+                        terminal: &terminal,
+                        panic_restore: None,
+                        signals,
+                        parser: &mut parser,
+                        scratch: &mut scratch,
+                        prompt: String::new(),
+                        prompt_committed: &mut prompt_committed,
+                        queued_input: None,
+                        queue_notice: None,
+                        enhanced_decoder: None,
+                        active_dock: None,
+                        enhanced_presenter: None,
+                        color,
+                        enhanced: false,
+                        goal: &goal,
+                        goal_round: None,
+                        job_wake: true,
+                    })
+                    .await?
+                    {
+                        TurnDisposition::Continue => {}
+                        TurnDisposition::Exit(code) => {
+                            return Ok(InteractiveExit::Ordinary(code));
+                        }
+                        TurnDisposition::Signal(signal) => {
+                            return Ok(InteractiveExit::Signal(signal));
+                        }
+                    }
+                }
                 IdleEvent::Record(InputRecordEvent::TooLarge) => {
                     if let Some(signal) = write_notice(
                         "[input exceeds 1000 bytes]\n",
@@ -2870,6 +2924,7 @@ async fn run_linear(
                             enhanced: false,
                             goal: &goal,
                             goal_round: None,
+                            job_wake: false,
                         })
                         .await?
                         {
@@ -2922,6 +2977,7 @@ enum IdleEvent {
     Signal(UiSignal),
     Eof,
     Record(InputRecordEvent),
+    JobWake,
 }
 
 struct ActiveTurn<'a> {
@@ -2948,6 +3004,7 @@ struct ActiveTurn<'a> {
     enhanced: bool,
     goal: &'a GoalRuntime,
     goal_round: Option<(u64, u32)>,
+    job_wake: bool,
 }
 
 struct ActiveDock<'a> {
@@ -3764,26 +3821,35 @@ async fn wait_active_file_suggestion(
 }
 
 async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, InteractiveError> {
-    let prepared = match active.goal_round {
-        Some((revision, round)) => {
-            let goal_id = active
-                .goal
-                .snapshot()
-                .map_err(|_| InteractiveError::Agent)?
-                .ok_or(InteractiveError::Agent)?
-                .to_value()["goalId"]
-                .as_str()
-                .ok_or(InteractiveError::Agent)?
-                .to_owned();
-            prepare_goal_turn(
-                active.agent.session(),
-                &active.prompt,
-                &goal_id,
-                revision,
-                round,
-            )
+    let prepared = if active.job_wake {
+        let proposal = active
+            .agent
+            .claim_job_notice_wake()
+            .map_err(|_| InteractiveError::Agent)?
+            .ok_or(InteractiveError::Agent)?;
+        prepare_injected_turn(active.agent.session(), proposal)
+    } else {
+        match active.goal_round {
+            Some((revision, round)) => {
+                let goal_id = active
+                    .goal
+                    .snapshot()
+                    .map_err(|_| InteractiveError::Agent)?
+                    .ok_or(InteractiveError::Agent)?
+                    .to_value()["goalId"]
+                    .as_str()
+                    .ok_or(InteractiveError::Agent)?
+                    .to_owned();
+                prepare_goal_turn(
+                    active.agent.session(),
+                    &active.prompt,
+                    &goal_id,
+                    revision,
+                    round,
+                )
+            }
+            None => prepare_user_turn(active.agent.session(), &active.prompt),
         }
-        None => prepare_user_turn(active.agent.session(), &active.prompt),
     }
     .map_err(|_| InteractiveError::Agent)?;
     let start_seq = prepared.start_seq;

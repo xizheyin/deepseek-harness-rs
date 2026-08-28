@@ -1,6 +1,13 @@
 //! Bounded process-local ownership for background Shell jobs.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -8,7 +15,7 @@ use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::{ToolExecutionResult, ToolExecutorError},
+    agent::{BackgroundJobNotice, JobNoticeInbox, ToolExecutionResult, ToolExecutorError},
     model::{ContentBlock, ContentBlockKind, JsonValue, ToolSchema},
 };
 
@@ -71,6 +78,8 @@ struct JobRecord {
     finished_at: Option<u64>,
     cancellation: CancellationToken,
     changed: tokio::sync::watch::Sender<JobStatus>,
+    waiters: Arc<AtomicUsize>,
+    reported: bool,
 }
 
 #[derive(Clone)]
@@ -119,6 +128,7 @@ struct JobState {
 
 struct JobInner {
     state: Mutex<JobState>,
+    notices: JobNoticeInbox,
 }
 
 /// One CLI-owned, process-local background-job registry.
@@ -147,8 +157,13 @@ impl BackgroundJobRuntime {
                     monitors: Vec::new(),
                     closed: false,
                 }),
+                notices: JobNoticeInbox::new(),
             }),
         }
+    }
+
+    pub(crate) fn notices(&self) -> JobNoticeInbox {
+        self.inner.notices.clone()
     }
 
     pub(crate) async fn start_shell(
@@ -201,6 +216,8 @@ impl BackgroundJobRuntime {
             finished_at: None,
             cancellation: cancellation.clone(),
             changed,
+            waiters: Arc::new(AtomicUsize::new(0)),
+            reported: false,
         });
 
         let runtime = self.clone();
@@ -231,6 +248,7 @@ impl BackgroundJobRuntime {
 
     async fn finish(&self, id: &str, completion: JobCompletion) {
         let mut state = self.inner.state.lock().await;
+        let closed = state.closed;
         let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) else {
             return;
         };
@@ -242,6 +260,21 @@ impl BackgroundJobRuntime {
         job.output = completion.output;
         job.finished_at = Some(epoch_millis());
         job.changed.send_replace(job.status);
+        let notice =
+            (!closed && !job.reported && job.waiters.load(Ordering::Acquire) == 0).then(|| {
+                job.reported = true;
+                BackgroundJobNotice::new(
+                    job.id.clone(),
+                    "bash",
+                    job.label.clone(),
+                    job.status.as_str(),
+                    job.detail.clone(),
+                )
+            });
+        drop(state);
+        if let Some(notice) = notice {
+            self.inner.notices.enqueue(notice);
+        }
     }
 
     pub(crate) async fn execute(
@@ -306,6 +339,9 @@ impl BackgroundJobRuntime {
                 Err(error) => return error.into_execution_result(),
             }
         };
+        if snapshot.status.is_terminal() {
+            self.mark_reported(&snapshot.id).await;
+        }
         let body = if snapshot.output.is_empty() {
             "(no new output)"
         } else {
@@ -330,6 +366,14 @@ impl BackgroundJobRuntime {
         timeout_ms: u64,
         cancellation: &CancellationToken,
     ) -> ToolCallResult<JobSnapshot> {
+        validate_job_id(id)?;
+        let waiters = {
+            let state = self.inner.state.lock().await;
+            let job = expect_job(&state, id)?;
+            Arc::clone(&job.waiters)
+        };
+        waiters.fetch_add(1, Ordering::AcqRel);
+        let _waiter = JobWaiter { waiters };
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             let (current, mut changed) = {
@@ -369,6 +413,15 @@ impl BackgroundJobRuntime {
         expect_job(&state, id).map(snapshot)
     }
 
+    async fn mark_reported(&self, id: &str) {
+        let mut state = self.inner.state.lock().await;
+        if let Some(job) = state.jobs.iter_mut().find(|job| job.id == id) {
+            job.reported = true;
+        }
+        drop(state);
+        self.inner.notices.suppress_job(id);
+    }
+
     async fn kill(&self, arguments: &Value) -> Result<ToolExecutionResult, ToolExecutorError> {
         let args = match parse_kill(arguments) {
             Ok(args) => args,
@@ -379,9 +432,11 @@ impl BackgroundJobRuntime {
             Some(job) => job,
             None => return unknown_job(&args.job_id).into_execution_result(),
         };
+        job.reported = true;
         if job.status.is_terminal() {
             let snapshot = snapshot(job);
             drop(state);
+            self.inner.notices.suppress_job(&args.job_id);
             return success_with_meta(
                 format!(
                     "job {} had already finished {}",
@@ -400,6 +455,7 @@ impl BackgroundJobRuntime {
         job.changed.send_replace(job.status);
         let snapshot = snapshot(job);
         drop(state);
+        self.inner.notices.suppress_job(&args.job_id);
         success_with_meta(
             format!("requested cancellation of job {}", snapshot.id),
             json!({
@@ -416,6 +472,7 @@ impl BackgroundJobRuntime {
             let mut state = self.inner.state.lock().await;
             state.closed = true;
             for job in &mut state.jobs {
+                job.reported = true;
                 if !job.status.is_terminal() {
                     job.cancellation.cancel();
                     job.status = JobStatus::Stopping;
@@ -424,6 +481,7 @@ impl BackgroundJobRuntime {
             }
             std::mem::take(&mut state.monitors)
         };
+        self.inner.notices.close();
         let mut failed = false;
         for monitor in monitors {
             failed |= monitor.await.is_err();
@@ -435,6 +493,16 @@ impl BackgroundJobRuntime {
         } else {
             Ok(())
         }
+    }
+}
+
+struct JobWaiter {
+    waiters: Arc<AtomicUsize>,
+}
+
+impl Drop for JobWaiter {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -813,12 +881,18 @@ pub(crate) fn is_tool(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        BackgroundJobRuntime, JobRecord, JobStatus, MAX_JOB_WAIT_MS, bounded_label, epoch_millis,
-        fit_with_suffix, parse_empty, parse_kill, parse_output, schemas, validate_job_id,
+        BackgroundJobRuntime, JobCompletion, JobRecord, JobStatus, MAX_JOB_WAIT_MS, bounded_label,
+        epoch_millis, fit_with_suffix, parse_empty, parse_kill, parse_output, schemas,
+        validate_job_id,
     };
     use crate::model::ContentBlock;
 
@@ -876,6 +950,8 @@ mod tests {
                 finished_at: None,
                 cancellation: job_cancellation.clone(),
                 changed: tokio::sync::watch::channel(JobStatus::Running).0,
+                waiters: Arc::new(AtomicUsize::new(0)),
+                reported: false,
             });
         }
 
@@ -915,5 +991,86 @@ mod tests {
             runtime.get("bash-1").await.unwrap().status,
             JobStatus::Running
         );
+    }
+
+    async fn insert_running(runtime: &BackgroundJobRuntime, id: &str) {
+        let mut state = runtime.inner.state.lock().await;
+        state.jobs.push_back(JobRecord {
+            id: id.to_owned(),
+            label: "pnpm test".to_owned(),
+            status: JobStatus::Running,
+            detail: None,
+            output: String::new(),
+            started_at: epoch_millis(),
+            finished_at: None,
+            cancellation: CancellationToken::new(),
+            changed: tokio::sync::watch::channel(JobStatus::Running).0,
+            waiters: Arc::new(AtomicUsize::new(0)),
+            reported: false,
+        });
+    }
+
+    fn completion() -> JobCompletion {
+        JobCompletion {
+            status: JobStatus::Completed,
+            detail: "exit code: 0".to_owned(),
+            output: "ok".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_output_kill_and_wait_suppress_completion_notices() {
+        let output_runtime = BackgroundJobRuntime::new();
+        insert_running(&output_runtime, "bash-1").await;
+        output_runtime.finish("bash-1", completion()).await;
+        output_runtime
+            .execute(
+                "job_output",
+                &json!({ "job_id": "bash-1" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(output_runtime.notices().claim_idle_wake().is_none());
+
+        let kill_runtime = BackgroundJobRuntime::new();
+        insert_running(&kill_runtime, "bash-1").await;
+        kill_runtime.finish("bash-1", completion()).await;
+        kill_runtime
+            .execute(
+                "job_kill",
+                &json!({ "job_id": "bash-1" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(kill_runtime.notices().claim_idle_wake().is_none());
+
+        let wait_runtime = BackgroundJobRuntime::new();
+        insert_running(&wait_runtime, "bash-1").await;
+        let waiter_runtime = wait_runtime.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_runtime
+                .execute(
+                    "job_output",
+                    &json!({ "job_id": "bash-1", "wait": true, "timeout_ms": 1000 }),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+        });
+        for _ in 0..32 {
+            let active = {
+                let state = wait_runtime.inner.state.lock().await;
+                state.jobs[0].waiters.load(Ordering::Acquire)
+            };
+            if active != 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        wait_runtime.finish("bash-1", completion()).await;
+        assert!(!waiter.await.unwrap().is_error());
+        assert!(wait_runtime.notices().claim_idle_wake().is_none());
     }
 }

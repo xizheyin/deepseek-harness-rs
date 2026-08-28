@@ -16,11 +16,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     AgentIdKind, AgentLimits, AgentLoop, AgentLoopConfig, AgentLoopError, AgentRuntime,
-    ApprovalFuture, ApprovalPrompt, ApprovalProvider, ApprovalRequest, ExactShellGrantIdentity,
-    FileChangePolicy, ManualCompactionOutcome, MutationDeclineReason, NoApprovalProvider, NoTools,
-    PluginPolicy, PreparedToolMutation, ShellPolicy, ToolCommitOutcome, ToolExecutionFuture,
-    ToolExecutionRequest, ToolExecutionResult, ToolExecutor, ToolExecutorError, ToolPreparation,
-    ToolPreparationFuture, TurnProposal, action_policy,
+    ApprovalFuture, ApprovalPrompt, ApprovalProvider, ApprovalRequest, BackgroundJobNotice,
+    ExactShellGrantIdentity, FileChangePolicy, JobNoticeInbox, ManualCompactionOutcome,
+    MutationDeclineReason, NoApprovalProvider, NoTools, PluginPolicy, PreparedToolMutation,
+    ShellPolicy, ToolCommitOutcome, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult,
+    ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture, TurnProposal,
+    action_policy,
     tool::{
         ActionContract, ActionDeclineReason, PreparedToolAction, PreparedToolActionSetup,
         ToolActionControl, ToolActionDeclineFn, ToolActionOutcome, ToolActionRunFn,
@@ -286,6 +287,7 @@ struct ScriptedProvider {
     stall_compaction: bool,
     panic_clock_on_stream: Option<PanicWhenArmedClock>,
     retry_policy: RetryPolicy,
+    notice_on_first_finish: Mutex<Option<(JobNoticeInbox, BackgroundJobNotice)>>,
 }
 
 struct PruneThenFitProvider {
@@ -408,7 +410,17 @@ impl ScriptedProvider {
                 RetryBackoff::new(1.0, 1.0, 0.0).unwrap(),
             )
             .unwrap(),
+            notice_on_first_finish: Mutex::new(None),
         }
+    }
+
+    fn with_notice_on_first_finish(
+        self,
+        inbox: JobNoticeInbox,
+        notice: BackgroundJobNotice,
+    ) -> Self {
+        *self.notice_on_first_finish.lock().unwrap() = Some((inbox, notice));
+        self
     }
 
     fn with_clock_panic_on_stream(mut self, clock: PanicWhenArmedClock) -> Self {
@@ -499,15 +511,24 @@ impl ModelProvider for ScriptedProvider {
         if let Some(clock) = &self.panic_clock_on_stream {
             clock.arm();
         }
-        Box::pin(stream::iter(
-            self.attempts
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("the action fixture must provide every model response")
-                .into_iter()
-                .map(Ok),
-        ))
+        let chunks = self
+            .attempts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the action fixture must provide every model response");
+        let notice = self.notice_on_first_finish.lock().unwrap().take();
+        let final_index = chunks.len().saturating_sub(1);
+        Box::pin(stream::iter(chunks.into_iter().enumerate().map(
+            move |(index, chunk)| {
+                if index == final_index {
+                    if let Some((inbox, notice)) = &notice {
+                        inbox.enqueue(notice.clone());
+                    }
+                }
+                Ok(chunk)
+            },
+        )))
     }
 }
 
@@ -1215,6 +1236,118 @@ fn workspace_context() -> Message {
         .unwrap(),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn background_job_notices_enter_as_plugin_input_and_can_open_an_idle_turn() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("first done"),
+        text_response_with("noticed completion"),
+    ]));
+    let mut agent = agent(
+        "background-job-notice-agent",
+        provider.clone(),
+        Arc::new(super::NoTools),
+        None,
+    );
+    let inbox = JobNoticeInbox::new();
+    agent.install_job_notice_inbox(inbox.clone());
+    inbox.enqueue(BackgroundJobNotice::new(
+        "bash-1",
+        "bash",
+        "pnpm test",
+        "completed",
+        Some("exit code: 0".to_owned()),
+    ));
+
+    agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    let first = provider.requests();
+    let injected = first[0]
+        .iter()
+        .find(|message| message.source().raw().as_value()["plugin"] == "tool-jobs")
+        .unwrap();
+    assert_eq!(injected.source().raw().as_value()["form"], "notice");
+    assert!(matches!(
+        injected.content()[0].kind(),
+        ContentBlockKind::Text { text } if text.contains("background job bash-1")
+    ));
+
+    inbox.enqueue(BackgroundJobNotice::new(
+        "bash-2",
+        "bash",
+        "cargo test",
+        "completed",
+        Some("exit code: 0".to_owned()),
+    ));
+    let wake = agent.claim_job_notice_wake().unwrap().unwrap();
+    agent
+        .run_turn(wake, CancellationToken::new())
+        .await
+        .unwrap();
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].iter().any(|message| {
+        message.source().raw().as_value()["plugin"] == "tool-jobs"
+            && matches!(
+                message.content()[0].kind(),
+                ContentBlockKind::Text { text } if text.contains("background job bash-2")
+            )
+    }));
+}
+
+#[tokio::test]
+async fn completion_during_a_busy_turn_is_claimed_by_its_next_step() {
+    let inbox = JobNoticeInbox::new();
+    let provider = Arc::new(
+        ScriptedProvider::new(vec![
+            text_response_with("first step would otherwise finish"),
+            text_response_with("completion handled in the same turn"),
+        ])
+        .with_notice_on_first_finish(
+            inbox.clone(),
+            BackgroundJobNotice::new(
+                "bash-1",
+                "bash",
+                "cargo test",
+                "completed",
+                Some("exit code: 0".to_owned()),
+            ),
+        ),
+    );
+    let mut agent = agent(
+        "busy-background-job-notice",
+        provider.clone(),
+        Arc::new(super::NoTools),
+        None,
+    );
+    agent.install_job_notice_inbox(inbox);
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.steps(), 2);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].iter().any(|message| {
+        message.source().raw().as_value()["plugin"] == "tool-jobs"
+            && matches!(
+                message.content()[0].kind(),
+                ContentBlockKind::Text { text } if text.contains("background job bash-1")
+            )
+    }));
+    assert_eq!(
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter(|event| event.kind().event_type() == "turn/start")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -5278,6 +5411,7 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         pending_workspace_touches: &mut pending_workspace_touches,
         repeat_tool_reminder: &mut repeat_tool_reminder,
         pending_repeat_contexts: &mut pending_repeat_contexts,
+        job_notices: &super::JobNoticeInbox::new(),
     };
     let budget_failure = super::failure_reason(
         "AGENT_EVENT_BUDGET",

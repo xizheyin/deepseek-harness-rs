@@ -5746,6 +5746,42 @@ fn background_shell_is_approved_started_and_collected_through_real_terminal_tool
 }
 
 #[test]
+fn idle_background_completion_opens_one_notice_turn_in_the_real_terminal() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-background-wake",
+            "bash",
+            serde_json::json!({
+                "command": "sleep 1; printf idle-wake-output",
+                "description": "finish after the first turn becomes idle",
+                "timeoutMs": 3000,
+                "run_in_background": true
+            }),
+        ),
+        text_sse("background work is running"),
+        text_sse("background completion noticed"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"start the delayed background command\r");
+    dsh.approval_ready();
+    dsh.write(b"y\r");
+    dsh.expect(b"background work is running");
+    dsh.expect(b"background completion noticed");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].contains("tool-jobs"), "{}", requests[2]);
+    assert!(requests[2].contains("background job bash-1"));
+    assert!(requests[2].contains("Read its output with job_output"));
+}
+
+#[test]
 fn foreground_shell_spills_full_output_and_returns_its_private_locator_to_the_model() {
     let server = SequenceSseServer::start(vec![
         tool_sse(

@@ -4,6 +4,7 @@ mod approval;
 mod assembler;
 mod compaction;
 mod error;
+mod job_notice;
 #[cfg(test)]
 mod phase6_tests;
 #[cfg(test)]
@@ -62,6 +63,7 @@ pub use approval::{
 pub use error::{
     AgentBuildError, AgentLoopError, AgentReleaseError, AgentRuntimeError, AgentShutdownError,
 };
+pub(crate) use job_notice::{BackgroundJobNotice, JobNoticeInbox};
 pub(crate) use tool::GoalToolCaller;
 pub(crate) use tool::{
     ActionContract, ActionDeclineReason, ToolActionControl, ToolActionDeclineFn, ToolActionOutcome,
@@ -80,6 +82,7 @@ use assembler::{AssembledAssistant, without_tool_calls};
 use compaction::{
     CompactionOutcome, CompactionScope, compact_once, pressure_reached, retained_token_target,
 };
+use job_notice::{PendingJobNotice, messages_for_notices};
 use repeat_tool_reminder::RepeatToolReminder;
 use retry::{RetryDecision, decide, policy_key};
 
@@ -805,6 +808,8 @@ pub struct AgentLoop {
     time_context: Option<TimeContextRuntime>,
     pending_workspace_touches: Vec<String>,
     repeat_tool_reminder: RepeatToolReminder,
+    job_notices: JobNoticeInbox,
+    prepared_job_wake: Option<Vec<PendingJobNotice>>,
     poisoned: bool,
 }
 
@@ -888,6 +893,8 @@ impl AgentLoop {
             time_context: None,
             pending_workspace_touches: Vec::new(),
             repeat_tool_reminder: RepeatToolReminder::default(),
+            job_notices: JobNoticeInbox::new(),
+            prepared_job_wake: None,
             poisoned: false,
         })
     }
@@ -925,6 +932,43 @@ impl AgentLoop {
     /// Install optional durable per-step clock context for this Agent process.
     pub(crate) fn install_time_context(&mut self, runtime: TimeContextRuntime) {
         self.time_context = Some(runtime);
+    }
+
+    /// Attach the exact process-local inbox owned by this Agent's tool registry.
+    pub(crate) fn install_job_notice_inbox(&mut self, inbox: JobNoticeInbox) {
+        self.job_notices = inbox;
+    }
+
+    pub(crate) fn job_notice_inbox(&self) -> JobNoticeInbox {
+        self.job_notices.clone()
+    }
+
+    /// Atomically claim one bounded idle completion wake for the terminal.
+    pub(crate) fn claim_job_notice_wake(&mut self) -> Result<Option<TurnProposal>, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if self.prepared_job_wake.is_some() {
+            return Err(AgentLoopError::Invariant(
+                "a background-job wake is already prepared",
+            ));
+        }
+        let Some(notices) = self.job_notices.claim_idle_wake() else {
+            return Ok(None);
+        };
+        match messages_for_notices(&notices, self.runtime.as_ref()) {
+            Ok(messages) => {
+                self.prepared_job_wake = Some(notices);
+                Ok(Some(TurnProposal::Enter(messages)))
+            }
+            Err(error) => {
+                self.job_notices.restore_claimed(notices);
+                Err(error)
+            }
+        }
     }
 
     /// Commit a local Goal command through the same durable Session owner.
@@ -1016,6 +1060,7 @@ impl AgentLoop {
                 pending_workspace_touches: &mut self.pending_workspace_touches,
                 repeat_tool_reminder: &mut self.repeat_tool_reminder,
                 pending_repeat_contexts: &mut pending_repeat_contexts,
+                job_notices: &self.job_notices,
             };
             compact_once(
                 &mut reservation,
@@ -1141,35 +1186,51 @@ impl AgentLoop {
             }
             _ => None,
         };
-        if let TurnProposal::Enter(messages) = &proposal {
-            if messages.len() > crate::provider::MAX_PROVIDER_MESSAGES {
-                return Err(AgentLoopError::TooManyTurnMessages {
-                    maximum: crate::provider::MAX_PROVIDER_MESSAGES,
-                    actual: messages.len(),
-                });
+        let prepared_job_wake = self.prepared_job_wake.take();
+        if let Err(error) = validate_turn_proposal(&proposal) {
+            if let Some(notices) = prepared_job_wake {
+                self.job_notices.restore_claimed(notices);
             }
-            if messages
-                .iter()
-                .any(|message| message.validate_user_event().is_err())
+            return Err(error);
+        }
+        let claimed_notices = match (&proposal, prepared_job_wake.as_ref()) {
+            (TurnProposal::Enter(messages), None)
+                if !messages.is_empty() && !cancellation.is_cancelled() =>
             {
-                return Err(AgentLoopError::InvalidTurnMessages);
+                self.job_notices.begin_turn()
             }
-            let actual = messages.iter().try_fold(0_usize, |total, message| {
-                let next = total
-                    .checked_add(message.raw().encoded_len())
-                    .unwrap_or(usize::MAX);
-                (next <= crate::provider::MAX_PROVIDER_REQUEST_BYTES).then_some(next)
-            });
-            let actual = actual.unwrap_or(crate::provider::MAX_PROVIDER_REQUEST_BYTES + 1);
-            if actual > crate::provider::MAX_PROVIDER_REQUEST_BYTES {
-                return Err(AgentLoopError::TurnInputTooLarge {
-                    maximum: crate::provider::MAX_PROVIDER_REQUEST_BYTES,
-                    actual,
-                    messages: messages.len(),
-                });
+            _ => Vec::new(),
+        };
+        if !claimed_notices.is_empty() {
+            let notice_messages =
+                match messages_for_notices(&claimed_notices, self.runtime.as_ref()) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        self.job_notices.restore_active(claimed_notices);
+                        if let Some(notices) = prepared_job_wake {
+                            self.job_notices.restore_claimed(notices);
+                        }
+                        return Err(error);
+                    }
+                };
+            if let TurnProposal::Enter(messages) = &mut proposal {
+                messages.extend(notice_messages);
             }
         }
-        self.session.materialize_if_needed().await?;
+        if let Err(error) = validate_turn_proposal(&proposal) {
+            self.job_notices.restore_active(claimed_notices);
+            if let Some(notices) = prepared_job_wake {
+                self.job_notices.restore_claimed(notices);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.session.materialize_if_needed().await {
+            self.job_notices.restore_active(claimed_notices);
+            if let Some(notices) = prepared_job_wake {
+                self.job_notices.restore_claimed(notices);
+            }
+            return Err(error.into());
+        }
         let provider = self.provider.clone();
         let tools = self.tools.clone();
         let runtime = self.runtime.clone();
@@ -1187,6 +1248,7 @@ impl AgentLoop {
             self.time_context.as_ref(),
             &mut self.pending_workspace_touches,
             &mut self.repeat_tool_reminder,
+            &self.job_notices,
             proposal,
             cancellation,
         )
@@ -1213,8 +1275,42 @@ impl AgentLoop {
         {
             self.poisoned = true;
         }
+        self.job_notices.finish_turn();
         result
     }
+}
+
+fn validate_turn_proposal(proposal: &TurnProposal) -> Result<(), AgentLoopError> {
+    let TurnProposal::Enter(messages) = proposal else {
+        return Ok(());
+    };
+    if messages.len() > crate::provider::MAX_PROVIDER_MESSAGES {
+        return Err(AgentLoopError::TooManyTurnMessages {
+            maximum: crate::provider::MAX_PROVIDER_MESSAGES,
+            actual: messages.len(),
+        });
+    }
+    if messages
+        .iter()
+        .any(|message| message.validate_user_event().is_err())
+    {
+        return Err(AgentLoopError::InvalidTurnMessages);
+    }
+    let actual = messages.iter().try_fold(0_usize, |total, message| {
+        let next = total
+            .checked_add(message.raw().encoded_len())
+            .unwrap_or(usize::MAX);
+        (next <= crate::provider::MAX_PROVIDER_REQUEST_BYTES).then_some(next)
+    });
+    let actual = actual.unwrap_or(crate::provider::MAX_PROVIDER_REQUEST_BYTES + 1);
+    if actual > crate::provider::MAX_PROVIDER_REQUEST_BYTES {
+        return Err(AgentLoopError::TurnInputTooLarge {
+            maximum: crate::provider::MAX_PROVIDER_REQUEST_BYTES,
+            actual,
+            messages: messages.len(),
+        });
+    }
+    Ok(())
 }
 
 async fn shutdown_tool_executor(tools: &dyn ToolExecutor) -> Result<(), ToolExecutorError> {
@@ -1429,6 +1525,7 @@ struct Driver<'a> {
     pending_workspace_touches: &'a mut Vec<String>,
     repeat_tool_reminder: &'a mut RepeatToolReminder,
     pending_repeat_contexts: &'a mut Vec<Message>,
+    job_notices: &'a JobNoticeInbox,
 }
 
 impl Driver<'_> {
@@ -1478,6 +1575,7 @@ async fn run_turn_inner(
     time_context: Option<&TimeContextRuntime>,
     pending_workspace_touches: &mut Vec<String>,
     repeat_tool_reminder: &mut RepeatToolReminder,
+    job_notices: &JobNoticeInbox,
     proposal: TurnProposal,
     cancellation: CancellationToken,
 ) -> Result<TurnOutcome, AgentLoopError> {
@@ -1532,6 +1630,7 @@ async fn run_turn_inner(
         pending_workspace_touches,
         repeat_tool_reminder,
         pending_repeat_contexts: &mut pending_repeat_contexts,
+        job_notices,
     };
 
     let mut reason = if cancellation.is_cancelled() {
@@ -1548,6 +1647,7 @@ async fn run_turn_inner(
                     .any(|message| matches!(message.source().kind(), MessageSourceKind::User))
                 {
                     driver.repeat_tool_reminder.reset();
+                    driver.job_notices.observe_direct_human_claim();
                 }
                 run_entered_turn(
                     &mut reservation,
@@ -2010,7 +2110,15 @@ async fn run_entered_turn(
             StepOutcome::Continue => {
                 messages.append(driver.pending_repeat_contexts);
             }
-            StepOutcome::Completed => return Ok(TurnEndReason::Completed),
+            StepOutcome::Completed => {
+                if driver.counters.steps >= driver.config.limits.max_steps_per_turn {
+                    driver.job_notices.finish_turn();
+                    return Ok(TurnEndReason::Completed);
+                }
+                if !driver.job_notices.continue_after_completed_step() {
+                    return Ok(TurnEndReason::Completed);
+                }
+            }
             StepOutcome::MaxTokens => return Ok(TurnEndReason::MaxTokens),
             StepOutcome::Cancelled => {
                 return Ok(TurnEndReason::Aborted {
@@ -2037,7 +2145,26 @@ async fn refresh_dynamic_context(
     if let Some(reason) = refresh_skill_context(session, driver, messages, cancellation).await? {
         return Ok(Some(reason));
     }
-    refresh_time_context(session, driver, messages, cancellation, turn, step)
+    if let Some(reason) = refresh_time_context(session, driver, messages, cancellation, turn, step)?
+    {
+        return Ok(Some(reason));
+    }
+    if cancellation.is_cancelled() {
+        return Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        }));
+    }
+    let notices = driver.job_notices.claim_for_active_step();
+    if !notices.is_empty() {
+        match messages_for_notices(&notices, driver.runtime) {
+            Ok(mut notice_messages) => messages.append(&mut notice_messages),
+            Err(error) => {
+                driver.job_notices.restore_active(notices);
+                return Err(error);
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn refresh_time_context(

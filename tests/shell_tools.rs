@@ -492,6 +492,13 @@ fn local_registry_exposes_background_bash_and_closed_job_schemas() {
         "started background job bash-1"
     );
     assert_eq!(phase42["rustBoundary"]["maximumActiveJobs"], 8);
+    let phase43: Value = serde_json::from_str(include_str!(
+        "fixtures/tools/upstream_phase43_background_job_notices.json"
+    ))
+    .unwrap();
+    assert_eq!(phase43["delivery"]["maximumConsecutiveWakes"], 3);
+    assert_eq!(phase43["notice"]["source"]["plugin"], "tool-jobs");
+    assert_eq!(phase43["suppression"]["ownerTeardown"], true);
 }
 
 #[test]

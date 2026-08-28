@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–42 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–43 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -50,6 +50,7 @@ for behavior that users can run today.
 | 40 | Bounded prior-Session lineage and event relationship traces | `complete` | [`validation/phase-40.md`](validation/phase-40.md) |
 | 41 | Bounded filters for prior-Session and event search | `complete` | [`validation/phase-41.md`](validation/phase-41.md) |
 | 42 | Bounded process-local background Shell jobs | `complete` | [`validation/phase-42.md`](validation/phase-42.md) |
+| 43 | Background-job completion notices and bounded idle wakeups | `complete` | [`validation/phase-43.md`](validation/phase-43.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -912,12 +913,40 @@ kill and shutdown cleanup tests; two real terminal journeys; and the normal
 local Rust gates. No real DeepSeek request, remote CI, public network or extra
 platform/stress matrix is required.
 
+## Phase 43 background-job completion notice boundary (2026-08-29)
+
+Phase 43 closes Phase 42's largest usability gap. An unreported Bash
+completion now becomes an ordinary bounded `tool-jobs` notice. A busy Agent
+claims it before the next Provider step; an idle interactive terminal opens a
+new turn under the official default wake behavior.
+
+The Agent/inbox boundary atomically decides whether a completed step continues
+or the owner becomes idle, so a completion cannot disappear between those two
+states. At most three consecutive completion turns open without direct human
+input. A claimed human message resets that count; Goal and plugin messages do
+not. After the cap, notices remain queued for the next ordinary turn.
+
+A terminal `job_output`, an explicit `job_kill`, and registry teardown claim
+the report and suppress duplicate notification. Pending delivery is capped at
+64 concrete notices plus one overflow fact. Notice messages are recorded only
+through the normal Agent step and append-only Session path; the job registry
+does not write Session state or bypass approval.
+
+Rust retains the process-local Bash-only, final-output-only and 295-second
+Phase 42 boundaries. It does not add incremental output, persistence,
+multi-Agent routing, configurable quiet delivery or other producers.
+Acceptance is local-only: fixed-source fixture; exact notice/source, queue,
+wake budget, same-turn injection, idle-turn, suppression and shutdown tests;
+one real linear-terminal wake journey; and the normal local Rust gates. No
+real DeepSeek request, remote CI, public-network product run or extra platform
+matrix is required.
+
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
 - MCP, Hooks, ambient/remote Skills, and subagents
-- Background-job completion wakeups, live incremental output, persistence, and non-Shell producers
+- Background-job live incremental output, persistence, and non-Shell producers
 - LSP diagnostics, rename/symbol/call-hierarchy operations, session-query cursors and a persistent derived search index
 - Ambient/browser-derived time zones and configurable time-context refresh intervals
 - Multiple model providers

@@ -485,6 +485,10 @@ impl LocalToolRegistry {
     pub(crate) fn skill_runtime(&self) -> SkillRuntime {
         self.skills.clone()
     }
+
+    pub(crate) fn job_notice_inbox(&self) -> crate::agent::JobNoticeInbox {
+        self.jobs.notices()
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
