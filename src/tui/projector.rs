@@ -74,6 +74,10 @@ pub(crate) struct ToolActivity {
     pub(crate) shell_exit_code: Option<i64>,
     pub(crate) shell_signal: Option<String>,
     pub(crate) shell_timed_out: Option<bool>,
+    pub(crate) shell_stdout_spill_path: Option<String>,
+    pub(crate) shell_stderr_spill_path: Option<String>,
+    pub(crate) shell_stdout_captured_bytes: Option<u64>,
+    pub(crate) shell_stderr_captured_bytes: Option<u64>,
     pub(crate) plugin_id: Option<String>,
     pub(crate) plugin_dispatched: Option<bool>,
     pub(crate) plugin_peer_settled: Option<bool>,
@@ -119,6 +123,22 @@ impl fmt::Debug for ToolActivity {
                 &self.shell_signal.as_ref().map_or(0, String::len),
             )
             .field("shell_timed_out", &self.shell_timed_out)
+            .field(
+                "shell_stdout_spill_path_bytes",
+                &self.shell_stdout_spill_path.as_ref().map_or(0, String::len),
+            )
+            .field(
+                "shell_stderr_spill_path_bytes",
+                &self.shell_stderr_spill_path.as_ref().map_or(0, String::len),
+            )
+            .field(
+                "shell_stdout_captured_bytes",
+                &self.shell_stdout_captured_bytes,
+            )
+            .field(
+                "shell_stderr_captured_bytes",
+                &self.shell_stderr_captured_bytes,
+            )
             .field(
                 "plugin_id_bytes",
                 &self.plugin_id.as_ref().map_or(0, String::len),
@@ -597,6 +617,10 @@ impl UiProjector {
             shell_exit_code: None,
             shell_signal: None,
             shell_timed_out: None,
+            shell_stdout_spill_path: None,
+            shell_stderr_spill_path: None,
+            shell_stdout_captured_bytes: None,
+            shell_stderr_captured_bytes: None,
             plugin_id: None,
             plugin_dispatched: None,
             plugin_peer_settled: None,
@@ -722,6 +746,10 @@ impl UiProjector {
                 shell_exit_code: None,
                 shell_signal: None,
                 shell_timed_out: None,
+                shell_stdout_spill_path: None,
+                shell_stderr_spill_path: None,
+                shell_stdout_captured_bytes: None,
+                shell_stderr_captured_bytes: None,
                 plugin_id: None,
                 plugin_dispatched: None,
                 plugin_peer_settled: None,
@@ -777,6 +805,12 @@ impl UiProjector {
                     tool.shell_exit_code = facts.exit_code;
                     tool.shell_signal = facts.signal.map(copy).transpose()?;
                     tool.shell_timed_out = facts.timed_out;
+                    tool.shell_stdout_spill_path =
+                        facts.stdout_spill_path.map(bounded_summary).transpose()?;
+                    tool.shell_stderr_spill_path =
+                        facts.stderr_spill_path.map(bounded_summary).transpose()?;
+                    tool.shell_stdout_captured_bytes = facts.stdout_captured_bytes;
+                    tool.shell_stderr_captured_bytes = facts.stderr_captured_bytes;
                 }
             }
             if let Some(facts) = plugin_facts(&meta) {
@@ -916,6 +950,10 @@ struct ShellFacts<'a> {
     exit_code: Option<i64>,
     signal: Option<&'a str>,
     timed_out: Option<bool>,
+    stdout_spill_path: Option<&'a str>,
+    stderr_spill_path: Option<&'a str>,
+    stdout_captured_bytes: Option<u64>,
+    stderr_captured_bytes: Option<u64>,
 }
 
 fn shell_facts(meta: &Value) -> Option<ShellFacts<'_>> {
@@ -956,9 +994,13 @@ fn shell_facts(meta: &Value) -> Option<ShellFacts<'_>> {
             exit_code,
             signal,
             timed_out: None,
+            stdout_spill_path: None,
+            stderr_spill_path: None,
+            stdout_captured_bytes: None,
+            stderr_captured_bytes: None,
         });
     }
-    const REQUIRED: &[&str] = &[
+    const BASE_REQUIRED: &[&str] = &[
         "kind",
         "started",
         "exitCode",
@@ -975,14 +1017,35 @@ fn shell_facts(meta: &Value) -> Option<ShellFacts<'_>> {
         "stdoutTruncated",
         "stderrTruncated",
     ];
-    if fields.len() != REQUIRED.len()
-        || REQUIRED.iter().any(|key| !fields.contains_key(*key))
-        || REQUIRED[4..11]
+    const SPILL_FIELDS: &[&str] = &[
+        "stdoutSpillPath",
+        "stderrSpillPath",
+        "stdoutCapturedBytes",
+        "stderrCapturedBytes",
+    ];
+    const BOOLEAN_FIELDS: &[&str] = &[
+        "timedOut",
+        "aborted",
+        "outputLimitExceeded",
+        "pipeSetupFailed",
+        "pipeReadFailed",
+        "signalDeliveryFailed",
+        "pipeDrainTimedOut",
+        "stdoutTruncated",
+        "stderrTruncated",
+    ];
+    let has_spill_fields = SPILL_FIELDS.iter().all(|key| fields.contains_key(*key));
+    let expected_fields = BASE_REQUIRED.len() + usize::from(has_spill_fields) * SPILL_FIELDS.len();
+    if fields.len() != expected_fields
+        || BASE_REQUIRED.iter().any(|key| !fields.contains_key(*key))
+        || BOOLEAN_FIELDS
             .iter()
-            .chain(REQUIRED[13..].iter())
             .any(|key| !fields.get(*key).is_some_and(Value::is_boolean))
         || !fields.get("timeoutMs").is_some_and(Value::is_u64)
         || !fields.get("workdir").is_some_and(Value::is_string)
+        || (has_spill_fields
+            && (!fields.get("stdoutCapturedBytes").is_some_and(Value::is_u64)
+                || !fields.get("stderrCapturedBytes").is_some_and(Value::is_u64)))
     {
         return None;
     }
@@ -993,11 +1056,30 @@ fn shell_facts(meta: &Value) -> Option<ShellFacts<'_>> {
     if exited == signalled {
         return None;
     }
+    let optional_path = |name: &str| match fields.get(name)? {
+        Value::Null => Some(None),
+        value => Some(Some(value.as_str().filter(|path| !path.is_empty())?)),
+    };
+    let (stdout_spill_path, stderr_spill_path, stdout_captured_bytes, stderr_captured_bytes) =
+        if has_spill_fields {
+            (
+                optional_path("stdoutSpillPath")?,
+                optional_path("stderrSpillPath")?,
+                fields.get("stdoutCapturedBytes").and_then(Value::as_u64),
+                fields.get("stderrCapturedBytes").and_then(Value::as_u64),
+            )
+        } else {
+            (None, None, None, None)
+        };
     Some(ShellFacts {
         started,
         exit_code,
         signal,
         timed_out: fields.get("timedOut").and_then(Value::as_bool),
+        stdout_spill_path,
+        stderr_spill_path,
+        stdout_captured_bytes,
+        stderr_captured_bytes,
     })
 }
 
@@ -1096,7 +1178,7 @@ mod tests {
         UiTokenUsage, UiToolFailure, UiTurnEndReason, UiUserSource,
     };
 
-    use super::{MAX_PROJECTED_TOOLS, ToolActivityState, UiProjector};
+    use super::{MAX_PROJECTED_TOOLS, ToolActivityState, UiProjector, shell_facts};
 
     fn turn() -> TurnId {
         TurnId::new(1).unwrap()
@@ -1564,6 +1646,46 @@ mod tests {
         assert_eq!(activity.started_process, Some(true));
         assert_eq!(activity.shell_exit_code, Some(1));
         assert_eq!(activity.shell_timed_out, Some(false));
+    }
+
+    #[test]
+    fn shell_metadata_accepts_legacy_results_and_only_complete_spill_extensions() {
+        let legacy = serde_json::from_str(
+            r#"{"kind":"foreground","started":true,"exitCode":0,"signal":null,"timedOut":false,"aborted":false,"outputLimitExceeded":false,"pipeSetupFailed":false,"pipeReadFailed":false,"signalDeliveryFailed":false,"pipeDrainTimedOut":false,"timeoutMs":1000,"workdir":".","stdoutTruncated":false,"stderrTruncated":false}"#,
+        )
+        .unwrap();
+        let legacy = shell_facts(&legacy).expect("old sessions remain projectable");
+        assert_eq!(legacy.stdout_spill_path, None);
+        assert_eq!(legacy.stdout_captured_bytes, None);
+
+        let extended = serde_json::from_str(
+            r#"{"kind":"foreground","started":true,"exitCode":0,"signal":null,"timedOut":false,"aborted":false,"outputLimitExceeded":false,"pipeSetupFailed":false,"pipeReadFailed":false,"signalDeliveryFailed":false,"pipeDrainTimedOut":false,"timeoutMs":1000,"workdir":".","stdoutTruncated":true,"stderrTruncated":false,"stdoutSpillPath":"/tmp/dsh-spill/stdout","stderrSpillPath":null,"stdoutCapturedBytes":80000,"stderrCapturedBytes":0}"#,
+        )
+        .unwrap();
+        let extended = shell_facts(&extended).expect("new spill facts should project");
+        assert_eq!(extended.stdout_spill_path, Some("/tmp/dsh-spill/stdout"));
+        assert_eq!(extended.stderr_spill_path, None);
+        assert_eq!(extended.stdout_captured_bytes, Some(80_000));
+
+        let partial = serde_json::json!({
+            "kind": "foreground",
+            "started": true,
+            "exitCode": 0,
+            "signal": null,
+            "timedOut": false,
+            "aborted": false,
+            "outputLimitExceeded": false,
+            "pipeSetupFailed": false,
+            "pipeReadFailed": false,
+            "signalDeliveryFailed": false,
+            "pipeDrainTimedOut": false,
+            "timeoutMs": 1000,
+            "workdir": ".",
+            "stdoutTruncated": true,
+            "stderrTruncated": false,
+            "stdoutSpillPath": "/tmp/dsh-spill/stdout"
+        });
+        assert!(shell_facts(&partial).is_none());
     }
 
     #[test]

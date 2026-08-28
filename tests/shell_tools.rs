@@ -1,5 +1,6 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::VecDeque,
     fs,
@@ -331,6 +332,13 @@ async fn run_named_tool(
 
 fn phase6_oracle() -> Value {
     serde_json::from_str(include_str!("fixtures/tools/upstream_phase6_oracle.json")).unwrap()
+}
+
+fn phase33_spill_fixture() -> Value {
+    serde_json::from_str(include_str!(
+        "fixtures/tools/upstream_phase33_shell_spill.json"
+    ))
+    .unwrap()
 }
 
 fn result_facts(session: &Session) -> ToolResultFacts {
@@ -698,6 +706,55 @@ fn canonical_foreground_results_match_the_committed_phase6_oracle() {
 }
 
 #[test]
+fn overflowing_shell_stdout_keeps_the_tail_and_exposes_the_private_full_stream() {
+    let fixture = phase33_spill_fixture();
+    assert_eq!(fixture["schemaVersion"], 1);
+    assert_eq!(
+        fixture["upstream"]["commit"],
+        "47f943859bef60e4160492346772ded9b24f765a"
+    );
+    let workspace = TempWorkspace::new("spill-canonical");
+    let registry = Arc::new(LocalToolRegistry::open(workspace.path()).unwrap());
+    let (session, _) = runtime().block_on(run_shell(
+        registry,
+        json!({
+            "command": "i=1; while [ $i -le 8000 ]; do printf 'line-%04d\\n' $i; i=$((i + 1)); done",
+            "description": "produce one bounded overflowing stdout stream"
+        }),
+        Some(ShellPolicy::Allow),
+        None,
+    ));
+    let result = result_facts(&session);
+    assert!(!result.is_error);
+    assert!(result.text.contains("line-8000"));
+    assert!(!result.text.contains("line-0001"));
+    assert!(
+        result
+            .text
+            .contains(fixture["canonical"]["notice"].as_str().unwrap())
+    );
+    let spill_path = PathBuf::from(result.meta["stdoutSpillPath"].as_str().unwrap());
+    assert_eq!(result.meta["stderrSpillPath"], Value::Null);
+    assert_eq!(result.meta["stdoutCapturedBytes"], 80_000);
+    assert_eq!(result.meta["stderrCapturedBytes"], 0);
+    let full = fs::read_to_string(&spill_path).unwrap();
+    assert!(full.starts_with("line-0001\n"));
+    assert!(full.ends_with("line-8000\n"));
+    assert_eq!(full.len(), 80_000);
+    assert_eq!(
+        fs::metadata(&spill_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let spill_directory = spill_path.parent().unwrap().to_owned();
+    assert_eq!(
+        fs::metadata(&spill_directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    fs::remove_file(spill_path).unwrap();
+    fs::remove_dir(spill_directory).unwrap();
+}
+
+#[test]
 fn workdir_preview_result_and_next_request_keep_one_call_provenance() {
     let oracle = phase6_oracle();
     assert_eq!(
@@ -1045,7 +1102,12 @@ fn rendered_shell_output_obeys_the_64_kib_compact_json_limit() {
     assert!(result.inner_text_json_bytes > 60 * 1024);
     assert_eq!(result.meta["stdoutTruncated"], true);
     assert_eq!(result.meta["stderrTruncated"], false);
-    assert!(result.text.contains("[stdout truncated; tail only]"));
+    assert!(result.text.contains("[output truncated; full output:"));
+    let spill_path = PathBuf::from(result.meta["stdoutSpillPath"].as_str().unwrap());
+    assert_eq!(fs::metadata(&spill_path).unwrap().len(), 100_000);
+    let spill_directory = spill_path.parent().unwrap().to_owned();
+    fs::remove_file(spill_path).unwrap();
+    fs::remove_dir(spill_directory).unwrap();
 }
 
 #[test]

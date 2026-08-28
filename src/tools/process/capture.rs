@@ -47,6 +47,10 @@ impl TailCapture {
         self.truncated = true;
     }
 
+    pub(super) fn snapshot(&self) -> Vec<u8> {
+        self.bytes.iter().copied().collect()
+    }
+
     pub(super) fn finish(self) -> (Vec<u8>, bool) {
         (self.bytes.into_iter().collect(), self.truncated)
     }

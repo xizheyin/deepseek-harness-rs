@@ -153,6 +153,12 @@ impl ToolCardView {
                     }
                     append_failure(&mut detail, tool);
                 }
+                if let Some(path) = tool.shell_stdout_spill_path.as_deref() {
+                    append_piece(&mut detail, &format!("stdout: {path}"));
+                }
+                if let Some(path) = tool.shell_stderr_spill_path.as_deref() {
+                    append_piece(&mut detail, &format!("stderr: {path}"));
+                }
                 return Self::new(tone, status, (!detail.is_empty()).then_some(detail));
             }
             if tool.started_process == Some(false) {
@@ -663,6 +669,33 @@ mod tests {
         assert_eq!(card.headline(), "Exit 1");
         assert!(!card.headline().contains("success"));
         assert!(!card.detail().unwrap().contains("42 tests passed"));
+    }
+
+    #[test]
+    fn shell_card_exposes_private_spill_locators() {
+        let mut projector = UiProjector::default();
+        request(&mut projector, "bash", r#"{"command":"produce output"}"#);
+        projector
+            .observe(&CommittedUiKind::ToolResult {
+                turn: turn(),
+                step: step(),
+                call_id: id("call"),
+                is_error: false,
+                failure: None,
+                content: UiOpaquePayload::from_text_for_test("tail"),
+                meta: UiOpaquePayload::from_text_for_test(
+                    r#"{"kind":"foreground","started":true,"exitCode":0,"signal":null,"timedOut":false,"aborted":false,"outputLimitExceeded":false,"pipeSetupFailed":false,"pipeReadFailed":false,"signalDeliveryFailed":false,"pipeDrainTimedOut":false,"timeoutMs":1000,"workdir":".","stdoutTruncated":true,"stderrTruncated":false,"stdoutSpillPath":"/tmp/dsh-spill/stdout","stderrSpillPath":null,"stdoutCapturedBytes":80000,"stderrCapturedBytes":0}"#,
+                ),
+                surface_replacement_target: None,
+            })
+            .unwrap();
+        let card = ToolCardView::from_activity(&projector.tools()[0]).unwrap();
+        assert_eq!(card.headline(), "Exit 0");
+        assert!(
+            card.detail()
+                .unwrap()
+                .contains("stdout: /tmp/dsh-spill/stdout")
+        );
     }
 
     #[test]

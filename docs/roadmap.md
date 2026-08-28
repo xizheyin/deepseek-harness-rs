@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–32 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–33 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -40,6 +40,7 @@ for behavior that users can run today.
 | 30 | Bounded parallel-safe tool scheduling | `complete` | [`validation/phase-30.md`](validation/phase-30.md) |
 | 31 | Advisory repeated-tool-call reminder | `complete` | [`validation/phase-31.md`](validation/phase-31.md) |
 | 32 | Fixed-upstream `str_replace_editor` file editing | `complete` | [`validation/phase-32.md`](validation/phase-32.md) |
+| 33 | Bounded private Shell output spill files | `complete` | [`validation/phase-33.md`](validation/phase-33.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -563,6 +564,36 @@ Acceptance is local-only: a source-attributed fixed fixture, focused unit and
 Agent approval tests, one real CLI loopback journey, and the normal local Rust
 gates. No public network, real model call, remote CI, additional platform
 matrix, or unrelated exhaustive stress run is required.
+
+## Phase 33 bounded Shell output spill boundary (2026-08-29)
+
+Phase 33 closes a practical fixed-upstream Shell gap: once stdout or stderr no
+longer fits the 64,000-byte in-memory tail, dsh writes every byte it actually
+captures for that stream to a randomly named owner-only file in a private
+temporary directory. The model-facing result and terminal card expose the path,
+so a later approved Bash command can inspect the missing head instead of
+guessing from the tail.
+
+The file is created lazily and never for small output. Directory and file modes
+are 0700 and 0600. Creation, writes, and final flush are best effort: failure
+keeps the old bounded tail and does not turn a successful command into a tool
+error or advertise an incomplete locator. Paths and captured-byte counts enter
+the ordinary correlated Shell result; the full bytes do not enter Session.
+
+Rust retains its existing 8 MiB combined observed-output stop, rather than the
+official 64 MiB per-stream spill followed by unbounded tail collection. If that
+stop fires, the spill contains the bounded captured prefix and is labelled
+`captured output`, not falsely called the full command output. The normal clean
+case uses the official full-output notice. Spill files are convenience
+artifacts under the OS temporary directory, not durable session storage; they
+may expire independently, and approved Shell remains the retrieval path because
+the workspace-confined `read` tool must not gain arbitrary host-file access.
+
+Acceptance is local-only: a fixed source-attributed fixture, collector/process/
+renderer/UI tests, real approved-Shell CLI output, cancellation/output-limit/
+failure cleanup cases, and the normal local Rust gates. No public network, real
+model call, remote CI, additional platform matrix, or large stress run is
+required.
 
 ## Still deferred
 

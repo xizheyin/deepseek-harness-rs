@@ -9,6 +9,7 @@ use std::{
         fd::{AsFd, AsRawFd, OwnedFd},
         unix::{ffi::OsStrExt, process::ExitStatusExt},
     },
+    path::Path,
     process::{Child, ChildStderr, ChildStdout, ExitStatus},
     sync::{
         Arc,
@@ -36,6 +37,7 @@ mod plugin;
 #[cfg(any(target_os = "linux", test))]
 mod proc_stat;
 mod spawn;
+mod spill;
 
 pub(crate) use plugin::{
     PluginCleanup, PluginCleanupReport, PluginEmergencyHandle, PluginIo, PluginLeaderState,
@@ -325,6 +327,8 @@ impl ProcessTermination {
 pub(crate) struct CapturedStream {
     bytes: Vec<u8>,
     truncated: bool,
+    spill_path: Option<std::path::PathBuf>,
+    captured_bytes: usize,
 }
 
 impl CapturedStream {
@@ -335,6 +339,14 @@ impl CapturedStream {
     pub(crate) fn truncated(&self) -> bool {
         self.truncated
     }
+
+    pub(crate) fn spill_path(&self) -> Option<&Path> {
+        self.spill_path.as_deref()
+    }
+
+    pub(crate) fn captured_bytes(&self) -> usize {
+        self.captured_bytes
+    }
 }
 
 impl fmt::Debug for CapturedStream {
@@ -343,6 +355,8 @@ impl fmt::Debug for CapturedStream {
             .debug_struct("CapturedStream")
             .field("bytes", &self.bytes.len())
             .field("truncated", &self.truncated)
+            .field("spill_path_present", &self.spill_path.is_some())
+            .field("captured_bytes", &self.captured_bytes)
             .finish()
     }
 }
@@ -661,8 +675,10 @@ struct RunningProcess {
     _guard: GroupGuard,
     stdout: Option<AsyncFd<ChildStdout>>,
     stderr: Option<AsyncFd<ChildStderr>>,
-    stdout_tail: capture::TailCapture,
-    stderr_tail: capture::TailCapture,
+    stdout_capture: spill::SpillCapture,
+    stderr_capture: spill::SpillCapture,
+    spill_directory: Option<Arc<spill::SpillDirectory>>,
+    spill_disabled: bool,
     observed: capture::ObservedBudget,
     primary: Option<ProcessPrimaryCause>,
     turn_stop: ProcessTurnStop,
@@ -707,8 +723,10 @@ impl RunningProcess {
             _guard: guard,
             stdout: None,
             stderr: None,
-            stdout_tail: capture::TailCapture::new(RETAINED_TAIL_BYTES),
-            stderr_tail: capture::TailCapture::new(RETAINED_TAIL_BYTES),
+            stdout_capture: spill::SpillCapture::new("stdout", RETAINED_TAIL_BYTES),
+            stderr_capture: spill::SpillCapture::new("stderr", RETAINED_TAIL_BYTES),
+            spill_directory: None,
+            spill_disabled: false,
             observed: capture::ObservedBudget::new(MAX_OBSERVED_BYTES),
             primary: None,
             turn_stop: ProcessTurnStop::None,
@@ -744,8 +762,8 @@ impl RunningProcess {
         if self.flags.pipe_setup_failed {
             self.stdout = None;
             self.stderr = None;
-            self.stdout_tail.mark_truncated();
-            self.stderr_tail.mark_truncated();
+            self.stdout_capture.mark_truncated();
+            self.stderr_capture.mark_truncated();
         }
     }
 
@@ -886,10 +904,10 @@ impl RunningProcess {
 
     fn close_pipes(&mut self) {
         if self.stdout.take().is_some() {
-            self.stdout_tail.mark_truncated();
+            self.stdout_capture.mark_truncated();
         }
         if self.stderr.take().is_some() {
-            self.stderr_tail.mark_truncated();
+            self.stderr_capture.mark_truncated();
         }
     }
 
@@ -969,25 +987,29 @@ impl RunningProcess {
         Ok(())
     }
 
-    fn finish_report(self) -> ProcessOutcome {
+    async fn finish_report(self) -> ProcessOutcome {
         let Some(termination) = self.final_termination else {
             return ProcessOutcome::StartedOwnershipLost {
                 turn_stop: self.turn_stop,
             };
         };
-        let (stdout, stdout_truncated) = self.stdout_tail.finish();
-        let (stderr, stderr_truncated) = self.stderr_tail.finish();
+        let stdout = self.stdout_capture.finish().await;
+        let stderr = self.stderr_capture.finish().await;
         ProcessOutcome::StartedAndQuiescent(ProcessReport {
             termination,
             primary: self.primary.unwrap_or(ProcessPrimaryCause::Natural),
             turn_stop: self.turn_stop,
             stdout: CapturedStream {
-                bytes: stdout,
-                truncated: stdout_truncated,
+                bytes: stdout.tail,
+                truncated: stdout.truncated,
+                spill_path: stdout.spill_path,
+                captured_bytes: stdout.captured_bytes,
             },
             stderr: CapturedStream {
-                bytes: stderr,
-                truncated: stderr_truncated,
+                bytes: stderr.tail,
+                truncated: stderr.truncated,
+                spill_path: stderr.spill_path,
+                captured_bytes: stderr.captured_bytes,
             },
             flags: self.flags,
         })
@@ -1040,7 +1062,7 @@ async fn drive_process(mut state: RunningProcess, control: ProcessControl) -> Pr
         state.start_scan_if_due();
         if state.phase == ProcessPhase::Draining && state.stdout.is_none() && state.stderr.is_none()
         {
-            return state.finish_report();
+            return state.finish_report().await;
         }
 
         let event = next_runner_event(&mut state, &control, &mut ticker).await;
@@ -1091,7 +1113,7 @@ async fn drive_process(mut state: RunningProcess, control: ProcessControl) -> Pr
             }
             RunnerEvent::Tick if state.phase != ProcessPhase::Observing => {}
             RunnerEvent::Tick => {
-                poll_ready_pipes_before_leader(&mut state);
+                poll_ready_pipes_before_leader(&mut state).await;
                 state.ensure_cleanup_started();
                 match observe_leader(state.leader) {
                     AnchorState::Running => {}
@@ -1120,13 +1142,13 @@ async fn drive_process(mut state: RunningProcess, control: ProcessControl) -> Pr
             RunnerEvent::Stdout(result) => {
                 #[cfg(test)]
                 let result = state.inject_pipe_read_failure(StreamKind::Stdout, result);
-                handle_pipe_result(&mut state, StreamKind::Stdout, result);
+                handle_pipe_result(&mut state, StreamKind::Stdout, result).await;
                 state.stdout_first = false;
             }
             RunnerEvent::Stderr(result) => {
                 #[cfg(test)]
                 let result = state.inject_pipe_read_failure(StreamKind::Stderr, result);
-                handle_pipe_result(&mut state, StreamKind::Stderr, result);
+                handle_pipe_result(&mut state, StreamKind::Stderr, result).await;
                 state.stdout_first = true;
             }
             RunnerEvent::Scan(result) => {
@@ -1280,7 +1302,7 @@ async fn wait_for_housekeeping(
     }
 }
 
-fn poll_ready_pipes_before_leader(state: &mut RunningProcess) {
+async fn poll_ready_pipes_before_leader(state: &mut RunningProcess) {
     let stdout_first = state.stdout_first;
     for stream in if stdout_first {
         [StreamKind::Stdout, StreamKind::Stderr]
@@ -1297,7 +1319,7 @@ fn poll_ready_pipes_before_leader(state: &mut RunningProcess) {
         };
         if let Some(result) = result {
             let got_bytes = matches!(result, Ok(PipeRead::Bytes(_)));
-            handle_pipe_result(state, stream, result);
+            handle_pipe_result(state, stream, result).await;
             if got_bytes {
                 state.stdout_first = !matches!(stream, StreamKind::Stdout);
             }
@@ -1328,16 +1350,29 @@ enum StreamKind {
     Stderr,
 }
 
-fn handle_pipe_result(
+async fn handle_pipe_result(
     state: &mut RunningProcess,
     stream: StreamKind,
     result: io::Result<PipeRead>,
 ) {
     match result {
         Ok(PipeRead::Bytes(bytes)) => {
+            let needs_spill = match stream {
+                StreamKind::Stdout => state.stdout_capture.needs_spill(bytes.len()),
+                StreamKind::Stderr => state.stderr_capture.needs_spill(bytes.len()),
+            };
+            if needs_spill && state.spill_directory.is_none() && !state.spill_disabled {
+                match spill::SpillDirectory::create().await {
+                    Ok(directory) => state.spill_directory = Some(Arc::new(directory)),
+                    Err(()) => state.spill_disabled = true,
+                }
+            }
+            let directory = (!state.spill_disabled)
+                .then(|| state.spill_directory.clone())
+                .flatten();
             match stream {
-                StreamKind::Stdout => state.stdout_tail.push(&bytes),
-                StreamKind::Stderr => state.stderr_tail.push(&bytes),
+                StreamKind::Stdout => state.stdout_capture.push(&bytes, directory).await,
+                StreamKind::Stderr => state.stderr_capture.push(&bytes, directory).await,
             }
             if state.observed.record(bytes.len()) {
                 state.flags.output_limit_exceeded = true;
@@ -1363,11 +1398,11 @@ fn handle_pipe_result(
             match stream {
                 StreamKind::Stdout => {
                     state.stdout = None;
-                    state.stdout_tail.mark_truncated();
+                    state.stdout_capture.mark_truncated();
                 }
                 StreamKind::Stderr => {
                     state.stderr = None;
-                    state.stderr_tail.mark_truncated();
+                    state.stderr_capture.mark_truncated();
                 }
             }
         }
@@ -1621,6 +1656,24 @@ mod api_tests {
         }
     }
 
+    fn remove_report_spills(report: &ProcessReport) {
+        let mut directories = Vec::new();
+        for stream in [report.stdout(), report.stderr()] {
+            let Some(path) = stream.spill_path() else {
+                continue;
+            };
+            if let Some(parent) = path.parent() {
+                directories.push(parent.to_owned());
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+        directories.sort();
+        directories.dedup();
+        for directory in directories {
+            std::fs::remove_dir(directory).unwrap();
+        }
+    }
+
     #[test]
     fn signal_names_are_locale_independent_and_have_a_numeric_fallback() {
         assert_eq!(
@@ -1760,6 +1813,11 @@ mod api_tests {
         assert_eq!(report.stderr().bytes().len(), RETAINED_TAIL_BYTES);
         assert!(report.stdout().truncated());
         assert!(report.stderr().truncated());
+        assert_eq!(report.stdout().captured_bytes(), 4 * 1024 * 1024);
+        assert_eq!(report.stderr().captured_bytes(), 4 * 1024 * 1024);
+        assert!(report.stdout().spill_path().is_some());
+        assert!(report.stderr().spill_path().is_some());
+        remove_report_spills(&report);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1777,6 +1835,12 @@ mod api_tests {
         assert!(report.flags().output_limit_exceeded());
         assert!(started.elapsed() < TERM_GRACE);
         assert!(report.stdout().truncated());
+        let spill = report.stdout().spill_path().unwrap();
+        assert_eq!(
+            std::fs::metadata(spill).unwrap().len() as usize,
+            report.stdout().captured_bytes()
+        );
+        remove_report_spills(&report);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1811,6 +1875,7 @@ mod api_tests {
         assert_eq!(report.primary(), ProcessPrimaryCause::CommandTimeout);
         assert!(report.flags().output_limit_exceeded());
         assert!(started.elapsed() < TERM_GRACE);
+        remove_report_spills(&report);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1846,6 +1911,7 @@ mod api_tests {
         assert_eq!(report.primary(), ProcessPrimaryCause::CallerCancelled);
         assert!(report.flags().output_limit_exceeded());
         assert!(started.elapsed() < TERM_GRACE);
+        remove_report_spills(&report);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1877,6 +1943,7 @@ mod api_tests {
                 .iter()
                 .all(|byte| *byte == b'E' || *byte == b'\n')
         );
+        remove_report_spills(&report);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1941,6 +2008,43 @@ mod api_tests {
         };
         assert_eq!(report.primary(), ProcessPrimaryCause::CallerCancelled);
         assert_eq!(report.turn_stop(), ProcessTurnStop::CallerCancelled);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_flushes_output_spilled_before_group_cleanup() {
+        let runner = tokio::task::spawn_blocking(ProcessRunner::open)
+            .await
+            .unwrap()
+            .unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("dsh-spill-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let ready = directory.join("ready");
+        let command = format!(
+            "head -c 80000 /dev/zero; touch {}; sleep 60",
+            shell_quote(&ready)
+        );
+        let (request, control) = runner_request(&runner, &command, Duration::from_secs(5)).await;
+        let cancellation = control.cancellation.clone();
+        let task = tokio::spawn({
+            let runner = runner.clone();
+            async move { runner.run(request, control).await }
+        });
+        wait_for_file(&ready).await;
+        cancellation.cancel();
+        let ProcessOutcome::StartedAndQuiescent(report) = task.await.unwrap() else {
+            panic!("cancelled spilling process did not settle");
+        };
+        assert_eq!(report.primary(), ProcessPrimaryCause::CallerCancelled);
+        assert_eq!(report.stdout().captured_bytes(), 80_000);
+        assert_eq!(
+            std::fs::metadata(report.stdout().spill_path().unwrap())
+                .unwrap()
+                .len(),
+            80_000
+        );
+        remove_report_spills(&report);
         std::fs::remove_dir_all(directory).unwrap();
     }
 

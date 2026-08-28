@@ -5477,6 +5477,53 @@ fn foreground_shell_runs_only_after_the_confirmed_terminal_approval() {
 }
 
 #[test]
+fn foreground_shell_spills_full_output_and_returns_its_private_locator_to_the_model() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-shell-spill",
+            "bash",
+            serde_json::json!({
+                "command": "i=1; while [ $i -le 8000 ]; do printf 'line-%04d\\n' $i; i=$((i + 1)); done",
+                "description": "produce a bounded overflowing stdout stream",
+                "timeoutMs": 25_000
+            }),
+        ),
+        text_sse("large shell output retained"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"run the bounded large-output command\r");
+    dsh.approval_ready();
+    dsh.write(b"y\r");
+    dsh.expect(b"[tool result: success]");
+    dsh.expect(b"assistant | large shell output retained");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    let content = tool_message_content(&requests[1], "call-shell-spill");
+    assert!(content.contains("line-8000"));
+    assert!(!content.contains("line-0001"));
+    let marker = "[output truncated; full output: ";
+    let locator = content
+        .split_once(marker)
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(path, _)| path)
+        .expect("tool result should return one spill locator");
+    let spill_path = std::path::PathBuf::from(locator);
+    let full = std::fs::read_to_string(&spill_path).unwrap();
+    assert!(full.starts_with("line-0001\n"));
+    assert!(full.ends_with("line-8000\n"));
+    let spill_directory = spill_path.parent().unwrap().to_owned();
+    std::fs::remove_file(spill_path).unwrap();
+    std::fs::remove_dir(spill_directory).unwrap();
+}
+
+#[test]
 fn exact_shell_process_choice_runs_a_normalized_repeat_without_a_second_prompt() {
     let command = "printf x >> shell-result.txt";
     let server = SequenceSseServer::start(vec![

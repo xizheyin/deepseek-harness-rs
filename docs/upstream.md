@@ -1875,6 +1875,32 @@ contract implemented here. Phase 32 maps mutations onto Rust's already stronger
 capability-confined, approval-gated atomic file path and records the differences
 in `docs/design/str-replace-editor.md`.
 
+## Phase 33 Shell output spill inspection — 2026-08-29
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/subprocess/subprocess-local/src/spawn.ts` and
+  `tests/spawn.spec.ts` for byte-exact tail retention, lazy spill creation,
+  prior-chunk replay, per-stream independence, cap overflow disposal, failed
+  close fallback, random exclusive 0600 files, private 0700 default directory,
+  incremental reads, and process cleanup composition;
+- `packages/shell/bash-local/src/index.ts`, README, and executor tests for the
+  64,000-byte in-memory and 67,108,864-byte spill defaults and propagation of
+  stdout/stderr locators;
+- `packages/shell/tool-bash/src/render.ts` and `tests/tools.spec.ts` for tail,
+  `[stderr]`, exact full-output notice, unavailable fallback, timeout/signal/
+  exit ordering, and the canonical foreground truncation journey;
+- `.agents/notes/implemented/architecture/2026-07-08-tool-output-spill-files.md`
+  for the distinction between early executor spill and generic final-result
+  spill, best-effort failure policy, locator lifetime, and deferred cleanup.
+
+Latest inspected master `cd5ef8148158c3a752a658978873241fdf8e2bbc`
+retains these Shell/subprocess spill defaults and exact model-facing notice.
+Phase 33 implements early foreground-Shell spill only. Rust's existing 8 MiB
+combined stop, workspace-only `read`, per-run directory, and captured-prefix
+wording at forced-stop boundaries are specified in
+`docs/design/shell-output-spill.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

@@ -1111,6 +1111,18 @@ fn process_report_result(
     started_result(StartedShellResult {
         stdout: report.stdout().bytes().to_vec(),
         stderr: report.stderr().bytes().to_vec(),
+        stdout_spill_path: report
+            .stdout()
+            .spill_path()
+            .and_then(|path| path.to_str())
+            .map(str::to_owned),
+        stderr_spill_path: report
+            .stderr()
+            .spill_path()
+            .and_then(|path| path.to_str())
+            .map(str::to_owned),
+        stdout_captured_bytes: report.stdout().captured_bytes(),
+        stderr_captured_bytes: report.stderr().captured_bytes(),
         termination,
         primary: map_primary(report.primary()),
         output_limit_exceeded: flags.output_limit_exceeded(),
@@ -1171,6 +1183,10 @@ pub(crate) enum ShellTermination {
 pub(crate) struct StartedShellResult {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_spill_path: Option<String>,
+    pub(crate) stderr_spill_path: Option<String>,
+    pub(crate) stdout_captured_bytes: usize,
+    pub(crate) stderr_captured_bytes: usize,
     pub(crate) termination: ShellTermination,
     pub(crate) primary: ShellPrimary,
     pub(crate) output_limit_exceeded: bool,
@@ -1190,6 +1206,16 @@ impl std::fmt::Debug for StartedShellResult {
             .debug_struct("StartedShellResult")
             .field("stdout_bytes", &self.stdout.len())
             .field("stderr_bytes", &self.stderr.len())
+            .field(
+                "stdout_spill_path_present",
+                &self.stdout_spill_path.is_some(),
+            )
+            .field(
+                "stderr_spill_path_present",
+                &self.stderr_spill_path.is_some(),
+            )
+            .field("stdout_captured_bytes", &self.stdout_captured_bytes)
+            .field("stderr_captured_bytes", &self.stderr_captured_bytes)
             .field("termination", &self.termination)
             .field("primary", &self.primary)
             .field("timeout_ms", &self.timeout_ms)
@@ -1211,11 +1237,18 @@ pub(crate) fn started_result(
     let stdout = String::from_utf8_lossy(&facts.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&facts.stderr).into_owned();
     let primary_marker = primary_marker(facts.primary);
+    let spill_is_full = !facts.output_limit_exceeded
+        && !facts.pipe_setup_failed
+        && !facts.pipe_read_failed
+        && !facts.pipe_drain_timed_out;
     let (text, stdout_truncated, stderr_truncated) = render_bounded_text(
         &stdout,
         &stderr,
         facts.stdout_truncated,
         facts.stderr_truncated,
+        facts.stdout_spill_path.as_deref(),
+        facts.stderr_spill_path.as_deref(),
+        spill_is_full,
         facts.pipe_setup_failed,
         facts.pipe_read_failed,
         facts.signal_delivery_failed,
@@ -1250,7 +1283,11 @@ pub(crate) fn started_result(
         "timeoutMs": facts.timeout_ms,
         "workdir": facts.workdir,
         "stdoutTruncated": stdout_truncated,
-        "stderrTruncated": stderr_truncated
+        "stderrTruncated": stderr_truncated,
+        "stdoutSpillPath": facts.stdout_spill_path,
+        "stderrSpillPath": facts.stderr_spill_path,
+        "stdoutCapturedBytes": facts.stdout_captured_bytes,
+        "stderrCapturedBytes": facts.stderr_captured_bytes
     }))
     .map_err(|_| ToolExecutorError::new("shell result metadata normalization failed"))?;
     let content = ContentBlock::text(text)
@@ -1307,6 +1344,9 @@ fn render_bounded_text(
     stderr: &str,
     raw_stdout_truncated: bool,
     raw_stderr_truncated: bool,
+    stdout_spill_path: Option<&str>,
+    stderr_spill_path: Option<&str>,
+    spill_is_full: bool,
     pipe_setup_failed: bool,
     pipe_read_failed: bool,
     signal_delivery_failed: bool,
@@ -1322,6 +1362,9 @@ fn render_bounded_text(
         stderr,
         raw_stdout_truncated,
         raw_stderr_truncated,
+        stdout_spill_path,
+        stderr_spill_path,
+        spill_is_full,
         pipe_setup_failed,
         pipe_read_failed,
         signal_delivery_failed,
@@ -1344,6 +1387,9 @@ fn render_bounded_text(
         "",
         assumed_stdout_truncated,
         assumed_stderr_truncated,
+        stdout_spill_path,
+        stderr_spill_path,
+        spill_is_full,
         pipe_setup_failed,
         pipe_read_failed,
         signal_delivery_failed,
@@ -1377,6 +1423,9 @@ fn render_bounded_text(
             &selected_stderr,
             stdout_truncated,
             stderr_truncated,
+            stdout_spill_path,
+            stderr_spill_path,
+            spill_is_full,
             pipe_setup_failed,
             pipe_read_failed,
             signal_delivery_failed,
@@ -1475,6 +1524,9 @@ fn assemble_rendered_text(
     stderr: &str,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    stdout_spill_path: Option<&str>,
+    stderr_spill_path: Option<&str>,
+    spill_is_full: bool,
     pipe_setup_failed: bool,
     pipe_read_failed: bool,
     signal_delivery_failed: bool,
@@ -1489,14 +1541,20 @@ fn assemble_rendered_text(
     let mut output = String::new();
     output.push_str(stdout);
     if stdout_truncated {
-        append_line(&mut output, "[stdout truncated; tail only]");
+        append_line(
+            &mut output,
+            &truncation_notice("stdout", stdout_spill_path, spill_is_full),
+        );
     }
     if !stderr.is_empty() || stderr_truncated {
         append_line(&mut output, "[stderr]");
         output.push('\n');
         output.push_str(stderr);
         if stderr_truncated {
-            append_line(&mut output, "[stderr truncated; tail only]");
+            append_line(
+                &mut output,
+                &truncation_notice("stderr", stderr_spill_path, spill_is_full),
+            );
         }
     }
     if output.is_empty() && !had_stream_output {
@@ -1547,6 +1605,14 @@ fn assemble_rendered_text(
     output
 }
 
+fn truncation_notice(stream: &str, spill_path: Option<&str>, spill_is_full: bool) -> String {
+    match (spill_path, spill_is_full) {
+        (Some(path), true) => format!("[output truncated; full output: {path}]"),
+        (Some(path), false) => format!("[{stream} truncated; captured output: {path}]"),
+        (None, _) => format!("[{stream} truncated; tail only]"),
+    }
+}
+
 fn append_line(output: &mut String, line: &str) {
     if !output.is_empty() && !output.ends_with('\n') {
         output.push('\n');
@@ -1580,9 +1646,15 @@ mod tests {
         termination: ShellTermination,
         primary: ShellPrimary,
     ) -> StartedShellResult {
+        let stdout = stdout.into();
+        let stderr = stderr.into();
         StartedShellResult {
-            stdout: stdout.into(),
-            stderr: stderr.into(),
+            stdout_captured_bytes: stdout.len(),
+            stderr_captured_bytes: stderr.len(),
+            stdout,
+            stderr,
+            stdout_spill_path: None,
+            stderr_spill_path: None,
             termination,
             primary,
             output_limit_exceeded: false,
@@ -1898,6 +1970,45 @@ mod tests {
         let raw_capped = started_result(raw_capped).unwrap();
         assert!(raw_capped.content()[0].raw().encoded_len() > 60 * 1024);
         assert!(raw_capped.content()[0].raw().encoded_len() <= 64 * 1024);
+    }
+
+    #[test]
+    fn renderer_distinguishes_full_and_incomplete_spill_files() {
+        let mut complete = result_with(
+            b"tail\n".to_vec(),
+            Vec::new(),
+            ShellTermination::ExitCode(0),
+            ShellPrimary::Natural,
+        );
+        complete.stdout_truncated = true;
+        complete.stdout_spill_path = Some("/tmp/dsh-spill/stdout".to_owned());
+        complete.stdout_captured_bytes = 80_000;
+        let complete = started_result(complete).unwrap();
+        assert!(
+            result_text(&complete)
+                .contains("[output truncated; full output: /tmp/dsh-spill/stdout]")
+        );
+        assert_eq!(
+            complete.meta().unwrap().as_value()["stdoutCapturedBytes"],
+            80_000
+        );
+
+        let mut limited = result_with(
+            b"tail\n".to_vec(),
+            Vec::new(),
+            ShellTermination::Signal("SIGKILL".to_owned()),
+            ShellPrimary::OutputLimit,
+        );
+        limited.stdout_truncated = true;
+        limited.stdout_spill_path = Some("/tmp/dsh-spill/stdout".to_owned());
+        limited.stdout_captured_bytes = 8 * 1024 * 1024;
+        limited.output_limit_exceeded = true;
+        let limited = started_result(limited).unwrap();
+        assert!(
+            result_text(&limited)
+                .contains("[stdout truncated; captured output: /tmp/dsh-spill/stdout]")
+        );
+        assert!(!result_text(&limited).contains("full output"));
     }
 
     #[test]
