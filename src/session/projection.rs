@@ -1102,6 +1102,10 @@ impl Projection {
         }
     }
 
+    pub(super) fn current_surface_contains(&self, seq: EventSeq) -> bool {
+        self.surface_nodes.iter().any(|node| node.seq == seq)
+    }
+
     #[cfg(test)]
     pub(crate) fn attempt_usage_totals_for_test(&self) -> (u64, u64, u64, u64, u64) {
         self.attempt.usage_totals_for_test()

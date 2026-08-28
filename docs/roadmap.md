@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–38 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–39 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -46,6 +46,7 @@ for behavior that users can run today.
 | 36 | Bounded same-workspace persisted-session search | `complete` | [`validation/phase-36.md`](validation/phase-36.md) |
 | 37 | Configured bounded stdio LSP code navigation | `complete` | [`validation/phase-37.md`](validation/phase-37.md) |
 | 38 | Durable opt-in per-step time context | `complete` | [`validation/phase-38.md`](validation/phase-38.md) |
+| 39 | Bounded exact navigation inside prior Session events | `complete` | [`validation/phase-39.md`](validation/phase-39.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -781,12 +782,51 @@ zone; and the normal local Rust gates. No real DeepSeek request, public-network
 product test, remote CI, browser, Schedule product or extra platform matrix is
 required.
 
+## Phase 39 prior-Session event navigation boundary (2026-08-29)
+
+Phase 39 extends the existing same-workspace `session_search` path with the
+fixed upstream's `session_event_search` and `session_event_read` tool names.
+The first searches semantic events inside one selected prior Session; the
+second reads one exact validated event plus optional bounded neighbor
+summaries. Together they let the model turn a short cross-session lead into
+auditable historical evidence without resuming or mutating the old Session.
+
+Both tools require an explicit canonical `session_id`. Rust deliberately keeps
+the Phase 36 authorization boundary: only normally closed, current-version,
+strictly replay-valid journals from the exact retained workspace are visible.
+The caller, another workspace, a lock-busy live process, malformed history and
+an absent id never disclose content. Unlike the upstream live-preferred corpus,
+this phase does not read the current Session or another live Agent.
+
+Search accepts one literal, case-insensitive, whitespace-flexible query, returns
+at most 20 ranked hits with 240-code-point excerpts, and classifies each event
+as current, shadowed or log-only from the same completed projection. Exact read
+accepts one safe sequence number and at most 50 neighbors on either side. The
+target is rendered as complete pretty JSON; if the complete response cannot fit
+the ordinary 64 KiB tool-result limit, the call fails rather than silently
+calling a truncated value exact.
+
+Each operation scans at most one 16 MiB journal under the existing shared-lock
+and five-second cooperative deadline, reusing the ordinary strict cold scanner.
+Cancellation waits for the blocking reader to stop. The only new durable facts
+are the current turn's ordinary correlated tool call and result. The tools are
+read-only, need no approval and gain no file, Shell, process or network
+authority.
+
+Rust defers the official optional filters/cursors, current-session cutoff,
+session/event lineage traces, live-preferred SQLite index and persistent derived
+index. Acceptance is local-only: fixed-source fixture; schema, authorization,
+ranking, surface, exact JSON, window, size, corrupt/busy/not-found, timeout and
+cancellation tests; one real two-process CLI search → event search → exact read
+journey; and the normal local Rust gates. No real DeepSeek request, remote CI,
+public network or extra platform/stress matrix is required.
+
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
 - MCP, Hooks, ambient/remote Skills, subagents, and background jobs
-- LSP diagnostics, rename/symbol/call-hierarchy operations, complete session-query/lineage reads, and a persistent derived search index
+- LSP diagnostics, rename/symbol/call-hierarchy operations, session-query filters/cursors and lineage traces, and a persistent derived search index
 - Ambient/browser-derived time zones and configurable time-context refresh intervals
 - Multiple model providers
 - Untested operating systems or sandbox claims

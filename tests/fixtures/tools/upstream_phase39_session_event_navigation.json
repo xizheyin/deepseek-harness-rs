@@ -1,0 +1,42 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "paths": [
+      "packages/session-query/tool-session-query/src/index.ts",
+      "packages/session-query/tool-session-query/src/input.ts",
+      "packages/session-query/tool-session-query/src/operations.ts",
+      "packages/session-query/tool-session-query/src/presentation.ts",
+      "packages/session-query/session-query/src/index.ts",
+      "packages/session-query/session-query/src/config.ts",
+      "packages/session-query/session-query-sqlite/src/index.ts",
+      "packages/session-query/tool-session-query/tests/tool-session-query.spec.ts"
+    ]
+  },
+  "eventSearch": {
+    "name": "session_event_search",
+    "officialRequired": ["query"],
+    "rustRequired": ["session_id", "query"],
+    "heading": "Event search results (1):",
+    "empty": "No prior event matches found.",
+    "surface": ["current", "shadowed", "log-only"]
+  },
+  "eventRead": {
+    "name": "session_event_read",
+    "officialRequired": ["seq"],
+    "rustRequired": ["session_id", "seq"],
+    "targetHeading": "Target event seq 2:",
+    "fence": "```json",
+    "beforeHeading": "Before:",
+    "afterHeading": "After:",
+    "emptySemanticText": "(no semantic text)",
+    "maxSideWindow": 50
+  },
+  "rustIntentionalDifference": {
+    "source": "strict normally closed same-workspace JSONL only",
+    "searchResults": 20,
+    "snippetCodePoints": 240,
+    "targetId": "required canonical session UUID",
+    "oversizedExactOutput": "fail without truncation"
+  }
+}

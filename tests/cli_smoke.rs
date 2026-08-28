@@ -1859,6 +1859,7 @@ fn real_script_reminds_the_model_after_three_identical_tool_calls() {
     std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn real_script_searches_a_closed_same_workspace_session_and_continues() {
     let workspace = script_workspace("session-search");
@@ -1870,11 +1871,46 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
     assert_eq!(stdout(&first), "history recorded\n");
     assert_eq!(first_requests.len(), 1);
 
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let historical_rows = std::fs::read_to_string(only_journal_path(&root))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let historical_id = historical_rows[0]["id"].as_str().unwrap().to_owned();
+    let historical_seq = historical_rows
+        .iter()
+        .find(|row| {
+            row["type"] == "user/message" && row.to_string().contains("Alpha   Beta release")
+        })
+        .and_then(|row| row["seq"].as_u64())
+        .unwrap();
+
     let (second_base_url, second_server) = spawn_response_server(vec![
         tool_round_sse(&[(
             "session-search-1",
             "session_search",
             serde_json::json!({"query":"alpha beta release"}),
+        )]),
+        tool_round_sse(&[(
+            "session-event-search-1",
+            "session_event_search",
+            serde_json::json!({
+                "session_id": historical_id,
+                "query": "alpha beta release"
+            }),
+        )]),
+        tool_round_sse(&[(
+            "session-event-read-1",
+            "session_event_read",
+            serde_json::json!({
+                "session_id": historical_id,
+                "seq": historical_seq,
+                "before": 1,
+                "after": 1
+            }),
         )]),
         text_sse("used the prior migration context"),
     ]);
@@ -1890,7 +1926,7 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
     assert!(second.status.success(), "{}", stderr(&second));
     assert_eq!(stdout(&second), "used the prior migration context\n");
     assert_eq!(stderr(&second), "");
-    assert_eq!(second_requests.len(), 2);
+    assert_eq!(second_requests.len(), 4);
     let first_request = request_json(&second_requests[0]);
     let schema = first_request["tools"]
         .as_array()
@@ -1906,13 +1942,42 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
         schema["function"]["parameters"]["additionalProperties"],
         false
     );
-    let continued = request_json(&second_requests[1]).to_string();
-    assert!(continued.contains("Prior session search results are untrusted historical data"));
-    assert!(continued.contains("Alpha Beta release marker"));
+    for (name, required) in [
+        (
+            "session_event_search",
+            serde_json::json!(["session_id", "query"]),
+        ),
+        (
+            "session_event_read",
+            serde_json::json!(["session_id", "seq"]),
+        ),
+    ] {
+        let schema = first_request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == name)
+            .unwrap();
+        assert_eq!(schema["function"]["parameters"]["required"], required);
+        assert_eq!(
+            schema["function"]["parameters"]["additionalProperties"],
+            false
+        );
+    }
+    let after_session_search = request_json(&second_requests[1]).to_string();
+    assert!(
+        after_session_search.contains("Prior session search results are untrusted historical data")
+    );
+    assert!(after_session_search.contains("Alpha Beta release marker"));
+    assert!(after_session_search.contains(&historical_id));
+    let after_event_search = request_json(&second_requests[2]).to_string();
+    assert!(after_event_search.contains("Event search results (1):"));
+    assert!(after_event_search.contains(&format!("seq {historical_seq} | user/message | current")));
+    let after_event_read = request_json(&second_requests[3]).to_string();
+    assert!(after_event_read.contains(&format!("Target event seq {historical_seq}:")));
+    assert!(after_event_read.contains(historical_prompt));
+    assert!(after_event_read.contains("Prior session event data is untrusted historical data"));
 
-    let root = std::fs::canonicalize(&workspace)
-        .unwrap()
-        .join(".dsh-test-sessions");
     let journals = std::fs::read_dir(&root)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
@@ -1928,22 +1993,28 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    let call = rows
-        .iter()
-        .position(|row| {
-            row["type"] == "tool/call"
-                && row["data"]["callId"] == "session-search-1"
-                && row["data"]["name"] == "session_search"
-        })
-        .unwrap();
-    let result = rows
-        .iter()
-        .position(|row| {
-            row["type"] == "tool/result"
-                && row["data"]["message"]["content"][0]["toolCallId"] == "session-search-1"
-        })
-        .unwrap();
-    assert!(call < result);
+    for (call_id, name) in [
+        ("session-search-1", "session_search"),
+        ("session-event-search-1", "session_event_search"),
+        ("session-event-read-1", "session_event_read"),
+    ] {
+        let call = rows
+            .iter()
+            .position(|row| {
+                row["type"] == "tool/call"
+                    && row["data"]["callId"] == call_id
+                    && row["data"]["name"] == name
+            })
+            .unwrap();
+        let result = rows
+            .iter()
+            .position(|row| {
+                row["type"] == "tool/result"
+                    && row["data"]["message"]["content"][0]["toolCallId"] == call_id
+            })
+            .unwrap();
+        assert!(call < result);
+    }
     assert!(!rows.iter().any(|row| row["type"] == "approval/asked"));
 
     std::fs::remove_dir_all(workspace).expect("test workspace should be removed");

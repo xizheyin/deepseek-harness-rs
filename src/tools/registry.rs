@@ -363,6 +363,18 @@ impl LocalToolRegistry {
                     source,
                 }
             })?);
+            schemas.push(session_search::event_search_schema().map_err(|source| {
+                ToolRegistryBuildError::InvalidSchema {
+                    tool: session_search::SESSION_EVENT_SEARCH_TOOL_NAME,
+                    source,
+                }
+            })?);
+            schemas.push(session_search::event_read_schema().map_err(|source| {
+                ToolRegistryBuildError::InvalidSchema {
+                    tool: session_search::SESSION_EVENT_READ_TOOL_NAME,
+                    source,
+                }
+            })?);
         }
         if lsp_config.is_some() {
             schemas.push(lsp::schema()?);
@@ -533,10 +545,16 @@ impl ToolExecutor for LocalToolRegistry {
             let skills = self.skills.clone();
             return Box::pin(async move { dispatch_skill(skills, &request, cancellation).await });
         }
-        if request.name() == SESSION_SEARCH_TOOL_NAME {
+        if session_search::is_tool(request.name()) {
             let runtime = self.session_search.clone();
             return Box::pin(async move {
-                session_search::execute(runtime, request.arguments().as_value(), cancellation).await
+                session_search::execute_named(
+                    runtime,
+                    request.name(),
+                    request.arguments().as_value(),
+                    cancellation,
+                )
+                .await
             });
         }
         if request.name() == LSP_TOOL_NAME {
@@ -644,9 +662,10 @@ impl ToolExecutor for LocalToolRegistry {
                 let result = dispatch_skill(skills, &request, cancellation).await?;
                 return Ok(ToolPreparation::Complete(result));
             }
-            if request.name() == SESSION_SEARCH_TOOL_NAME {
-                let result = session_search::execute(
+            if session_search::is_tool(request.name()) {
+                let result = session_search::execute_named(
                     session_search,
+                    request.name(),
                     request.arguments().as_value(),
                     cancellation,
                 )

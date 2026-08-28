@@ -2145,3 +2145,50 @@ boundary. Every enabled step gets a fresh reading, so the optional upstream
 positive interval is deferred. The implementation uses an exact pinned
 IANA/DST-aware dependency rather than changing global `TZ`; dependency purpose,
 features and MSRV are recorded in the design and validation evidence.
+
+## Phase 39 prior-Session event navigation — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The following fixed-commit sources
+and tests were inspected before design or implementation:
+
+- `packages/session-query/tool-session-query/src/index.ts` for the exact
+  `session_event_search` and `session_event_read` names, descriptions, schemas,
+  timeouts and shared prompt guidance;
+- `packages/session-query/tool-session-query/src/{input,operations}.ts` for
+  query/range normalization, current-step cutoff, target authorization,
+  cancellation and service calls;
+- `packages/session-query/tool-session-query/src/{presentation,service-boundary,workspace-access}.ts`
+  for search/read text, workspace privacy and sanitized errors;
+- `packages/session-query/session-query/src/{index,types,config,extraction,documents,filters}.ts`
+  for exact read windows, the default 50-event side bound, semantic extraction,
+  surface vocabulary and source-independent reads;
+- `packages/session-query/session-query-sqlite/src/{index,query}.ts` for literal
+  FTS data, match-span/document-length/time/sequence ranking, 240-code-point
+  snippets and cursor generations;
+- `packages/session-query/tool-session-query/tests/{tool-session-query,sqlite-integration}.spec.ts`
+  plus the service and SQLite focused tests for invalid arguments, full fenced
+  target JSON, semantic/log-only neighbors, target-not-found, authorization,
+  malformed sources, timeout and cancellation.
+
+Fixed upstream searches one live-preferred logical Session, can omit
+`session_id` for the caller, excludes the currently executing step, supports
+metadata filters and cursor-backed provider pages, and renders type, surface,
+UTC time and a bounded snippet. Exact read returns the complete target event
+plus optional neighbor summaries; its service default allows 50 events on each
+side. Workspace authorization is rechecked before and after the source
+observation, and provider diagnostics are sanitized from model output.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Its observable tool schemas,
+operations and presentation are unchanged; the only direct tool-package change
+replaces literal prompt-section order `113` with the central
+`FIRST_PARTY_SECTION_ORDER.TOOL_SESSION_QUERY` constant. The service gained a
+shared corpus-observation API, which does not change these two model-facing
+contracts.
+
+Rust Phase 39 deliberately reuses Phase 36's smaller persisted-only boundary.
+It requires an explicit canonical id, refuses the caller and all busy/live or
+cross-workspace sources, and exposes no filters/cursors or SQLite index. It
+retains the official literal semantic search, surface labels, exact target JSON,
+neighbor summaries, strict workspace authorization and stable cancellation.

@@ -388,6 +388,10 @@ impl ColdScan {
         self.projection.is_quiescent_for_search()
     }
 
+    pub(super) fn current_surface_contains(&self, seq: EventSeq) -> bool {
+        self.projection.current_surface_contains(seq)
+    }
+
     pub(crate) fn physical_sha256(&self) -> &[u8; 32] {
         &self.physical_sha256
     }
