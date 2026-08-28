@@ -3193,6 +3193,11 @@ impl Session {
         }
     }
 
+    /// Shallow handles for the messages on the current model-visible surface.
+    pub(crate) fn visible_messages(&self) -> Vec<Message> {
+        self.projection.messages()
+    }
+
     /// The next globally continuous durable sequence number.
     #[must_use]
     pub fn next_seq(&self) -> Option<EventSeq> {

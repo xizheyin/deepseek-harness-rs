@@ -2990,6 +2990,120 @@ fn todo_write_prints_the_complete_bounded_list_in_zero_escape_linear_mode() {
 }
 
 #[test]
+fn workspace_instructions_persist_reconcile_and_do_not_duplicate_on_resume() {
+    let first_server = SequenceSseServer::start(vec![text_sse("Workspace guidance received.")]);
+    let workspace = TestWorkspace::new();
+    std::fs::write(
+        workspace.0.join("AGENTS.md"),
+        "Use the focused workspace instruction fixture.",
+    )
+    .unwrap();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &first_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"inspect the instruction order\r");
+    dsh.expect(b"Workspace guidance received.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = first_server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 1);
+    let users = user_contents(&requests[0]);
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0], "inspect the instruction order");
+    assert!(users[1].contains("Instructions from: AGENTS.md"));
+    assert!(users[1].contains("Use the focused workspace instruction fixture."));
+    let entries = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let filename = entries[0].file_name().into_string().unwrap();
+    let session_id = filename.strip_suffix(".jsonl").unwrap().to_owned();
+
+    std::fs::write(
+        workspace.0.join("AGENTS.md"),
+        "Use the replacement workspace instruction fixture.",
+    )
+    .unwrap();
+    let second_server = SequenceSseServer::start(vec![text_sse("Replacement received.")]);
+    let mut resumed = PtyHarness::spawn_resume_color_cargo(
+        &second_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+        &session_id,
+    );
+    resumed.expect("❯".as_bytes());
+    resumed.write(b"reconcile changed instructions\r");
+    resumed.expect(b"Replacement received.");
+    resumed.expect(b"Turn complete");
+    let (status, _) = resumed.exit_cleanly();
+    let requests = second_server.finish();
+    assert!(status.success());
+    let users = user_contents(&requests[0]);
+    assert_eq!(users[users.len() - 2], "reconcile changed instructions");
+    assert!(
+        users
+            .last()
+            .unwrap()
+            .contains("Updated instructions from: AGENTS.md")
+    );
+    assert!(
+        users
+            .last()
+            .unwrap()
+            .contains("Use the replacement workspace instruction fixture.")
+    );
+
+    let third_server = SequenceSseServer::start(vec![text_sse("No duplicate received.")]);
+    let mut unchanged = PtyHarness::spawn_resume_color_cargo(
+        &third_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+        &session_id,
+    );
+    unchanged.expect("❯".as_bytes());
+    unchanged.write(b"reuse unchanged instructions\r");
+    unchanged.expect(b"No duplicate received.");
+    unchanged.expect(b"Turn complete");
+    let (status, _) = unchanged.exit_cleanly();
+    let requests = third_server.finish();
+    assert!(status.success());
+    assert_eq!(
+        user_contents(&requests[0])
+            .iter()
+            .filter(|content| content.contains("<system-reminder>"))
+            .count(),
+        2
+    );
+
+    let rows = std::fs::read_to_string(session_root.path().join(filename))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    let user_rows = rows
+        .iter()
+        .filter(|row| row["type"] == "user/message")
+        .collect::<Vec<_>>();
+    assert_eq!(user_rows.len(), 5);
+    assert_eq!(user_rows[0]["data"]["source"]["kind"], "user");
+    assert_eq!(user_rows[1]["data"]["source"]["kind"], "agent-instructions");
+    assert_eq!(user_rows[1]["data"]["source"]["baseline"], true);
+    assert_eq!(user_rows[3]["data"]["source"]["kind"], "agent-instructions");
+    assert_eq!(
+        user_rows[3]["data"]["source"]["changes"][0]["action"],
+        "replace"
+    );
+}
+
+#[test]
 fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
     let first_server = SequenceSseServer::start(vec![

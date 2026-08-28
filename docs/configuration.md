@@ -1,9 +1,9 @@
 # Configuration
 
 `dsh-rs` keeps configuration deliberately small. The installed command is
-`dsh`; it reads command-line flags and process environment variables. Phase 10
-adds one explicit local tool-plugin file, but there is still no project-wide
-auto-discovery, global profile, or hot reload.
+`dsh`; it reads command-line flags, process environment variables, and bounded
+workspace instruction files. Phase 10 adds one explicit local tool-plugin file,
+but there is still no general global profile or hot reload.
 
 ## Required credential
 
@@ -38,6 +38,7 @@ Run `dsh --help` for exact syntax and mutually exclusive combinations.
 | `DEEPSEEK_API_KEY` | Required when a model request is made |
 | `DEEPSEEK_BASE_URL` | Optional trusted base URL; HTTPS only, except loopback HTTP for offline tests |
 | `DSH_SESSION_ROOT` | Optional absolute Session directory override |
+| `DSH_HOME` | Optional absolute home for user-level `AGENTS.md`; defaults to `$HOME/.dsh` |
 | `XDG_STATE_HOME` | Linux state base when `DSH_SESSION_ROOT` is absent |
 | `NO_COLOR` | Presence disables ANSI and selects linear presentation |
 | `TERM=dumb` | Also selects the linear presentation |
@@ -53,6 +54,20 @@ resize rescue; below that it restores the terminal and fails closed.
 The HTTP client does not follow redirects and ignores system proxy settings.
 Choosing a custom HTTPS endpoint still grants that endpoint the API key and
 model-visible request content.
+
+## Workspace instructions
+
+Before the first model request, `dsh` reads `$DSH_HOME/AGENTS.md` (or
+`$HOME/.dsh/AGENTS.md`) and then `AGENTS.md`, `CLAUDE.md`, `AGENTS.local.md`,
+and `CLAUDE.local.md` from the exact opened workspace root. The rendered
+message is capped at 65,536 UTF-8 bytes and each source at 1 MiB. It is written
+to Session history after the direct prompt; a resume reuses unchanged context
+and appends confirmed additions, replacements, or removals.
+
+`DSH_HOME` must be absolute to be used. Instruction files are guidance, not an
+approval or sandbox mechanism. Rust deliberately refuses instruction-file
+symlinks and never walks above `--workspace`. Nested instruction discovery
+after a file-tool call is not implemented yet.
 
 ## Local subprocess tool plugins
 

@@ -757,6 +757,7 @@ pub struct AgentLoop {
     config: AgentLoopConfig,
     request_header_logged: bool,
     exact_shell_grants: approval::ExactShellGrantStore,
+    pending_workspace_context: Option<Message>,
     poisoned: bool,
 }
 
@@ -833,6 +834,7 @@ impl AgentLoop {
             config,
             request_header_logged: false,
             exact_shell_grants: approval::ExactShellGrantStore::new(),
+            pending_workspace_context: None,
             poisoned: false,
         })
     }
@@ -840,6 +842,16 @@ impl AgentLoop {
     #[must_use]
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// Install one lower-authority context message after the next claimed input.
+    pub(crate) fn install_workspace_context(&mut self, context: Option<Message>) {
+        debug_assert!(
+            context
+                .as_ref()
+                .is_none_or(|message| message.validate_user_event().is_ok())
+        );
+        self.pending_workspace_context = context;
     }
 
     /// Commit a local Goal command through the same durable Session owner.
@@ -904,7 +916,7 @@ impl AgentLoop {
     /// recovery; async closing work cannot be performed from `Drop`.
     pub async fn run_turn(
         &mut self,
-        proposal: TurnProposal,
+        mut proposal: TurnProposal,
         cancellation: CancellationToken,
     ) -> Result<TurnOutcome, AgentLoopError> {
         if self.poisoned {
@@ -913,6 +925,13 @@ impl AgentLoop {
         if self.session.state().open_turn().is_some() {
             return Err(AgentLoopError::SessionNotIdle);
         }
+        let inserted_workspace_context = match (&mut proposal, &self.pending_workspace_context) {
+            (TurnProposal::Enter(messages), Some(context)) if !messages.is_empty() => {
+                messages.push(context.clone());
+                Some(context.id().as_str().to_owned())
+            }
+            _ => None,
+        };
         if let TurnProposal::Enter(messages) = &proposal {
             if messages.len() > crate::provider::MAX_PROVIDER_MESSAGES {
                 return Err(AgentLoopError::TooManyTurnMessages {
@@ -958,6 +977,14 @@ impl AgentLoop {
             cancellation,
         )
         .await;
+        if inserted_workspace_context.as_deref().is_some_and(|id| {
+            self.session
+                .visible_messages()
+                .iter()
+                .any(|message| message.id().as_str() == id)
+        }) {
+            self.pending_workspace_context = None;
+        }
         if result.is_err()
             || session_has_unresolved_tool_calls(&self.session)
             || !self.session.state().pending_approvals().is_empty()

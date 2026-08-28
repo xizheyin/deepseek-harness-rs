@@ -19,6 +19,7 @@ use crate::{
     tools::{LocalToolRegistry, PluginConfig, WorkspaceFileCatalogue},
     user_question::{UserQuestionBroker, UserQuestionReceiver},
     workspace_authority::WorkspaceAuthority,
+    workspace_instructions::prepare_workspace_instructions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -171,6 +172,11 @@ pub(super) async fn assemble_session(
         interactive.then(|| WorkspaceFileCatalogue::from_authority(authority.clone()));
     let goal = interactive.then(|| GoalRuntime::from_replay(session.state().goal_replay()));
     let plan_mode = PlanModeRuntime::new(session.state().plan_mode_active());
+    let workspace_context =
+        match prepare_workspace_instructions(&session, &authority, &cancellation).await {
+            Ok(context) => context,
+            Err(_) => return Err(AssemblyFailure::new(AssemblyError::Agent, session)),
+        };
     let (user_questions, question_receiver) = if interactive {
         let (broker, receiver) = UserQuestionBroker::new();
         (Some(broker), Some(receiver))
@@ -253,13 +259,14 @@ pub(super) async fn assemble_session(
             .with_file_change_policy(file_change_policy)
             .with_shell_policy(shell_policy)
             .with_plugin_policy(plugin_policy);
-        let agent = match AgentLoop::new_preserving_session(session, provider, tools, config) {
+        let mut agent = match AgentLoop::new_preserving_session(session, provider, tools, config) {
             Ok(agent) => agent,
             Err((_error, session)) => {
                 let _ = registry.shutdown().await;
                 return Err(AssemblyFailure::new(AssemblyError::Agent, session));
             }
         };
+        agent.install_workspace_context(workspace_context);
         Ok(AgentAssembly::Interactive(InteractiveAssembly {
             agent,
             events,
@@ -279,7 +286,10 @@ pub(super) async fn assemble_session(
             .with_shell_policy(ShellPolicy::Deny)
             .with_plugin_policy(PluginPolicy::Deny);
         match AgentLoop::new_preserving_session(session, provider, tools, config) {
-            Ok(agent) => Ok(AgentAssembly::Script(agent)),
+            Ok(mut agent) => {
+                agent.install_workspace_context(workspace_context);
+                Ok(AgentAssembly::Script(agent))
+            }
             Err((_error, session)) => {
                 let _ = registry.shutdown().await;
                 Err(AssemblyFailure::new(AssemblyError::Agent, session))

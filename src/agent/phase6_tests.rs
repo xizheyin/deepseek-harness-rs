@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures_util::stream;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -1161,6 +1161,124 @@ fn user() -> Message {
         MessageSource::user().unwrap(),
     )
     .unwrap()
+}
+
+fn workspace_context() -> Message {
+    Message::user(
+        "workspace-instructions-0",
+        vec![
+            ContentBlock::text(
+                "<system-reminder>\nInstructions from: AGENTS.md\n\nrule\n</system-reminder>",
+            )
+            .unwrap(),
+        ],
+        MessageSource::from_value(json!({
+            "kind": "agent-instructions",
+            "form": "instructions",
+            "baseline": true,
+            "baselineIdentity": "fixture",
+            "changes": [{
+                "action": "set",
+                "scope": ".\u{0000}AGENTS.md",
+                "path": "AGENTS.md",
+                "digest": "fixture"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn workspace_context_enters_after_the_claimed_prompt_once() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response(),
+        text_response(),
+    ]));
+    let mut agent = agent(
+        "workspace-context-order",
+        provider.clone(),
+        Arc::new(super::NoTools),
+        None,
+    );
+    agent.install_workspace_context(Some(workspace_context()));
+
+    agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(
+        requests[0][0].source().kind(),
+        crate::model::MessageSourceKind::User
+    ));
+    assert_eq!(
+        requests[0][1].source().raw().as_value()["kind"],
+        "agent-instructions"
+    );
+    assert_eq!(
+        requests[1]
+            .iter()
+            .filter(|message| { message.source().raw().as_value()["kind"] == "agent-instructions" })
+            .count(),
+        1
+    );
+    let user_sources = agent
+        .session()
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::UserMessage { message } => {
+                Some(message.source().raw().as_value()["kind"].clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_sources[..2],
+        [
+            Value::String("user".to_owned()),
+            Value::String("agent-instructions".to_owned())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cancellation_before_step_entry_does_not_consume_workspace_context() {
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response()]));
+    let mut agent = agent(
+        "workspace-context-cancel",
+        provider.clone(),
+        Arc::new(super::NoTools),
+        None,
+    );
+    agent.install_workspace_context(Some(workspace_context()));
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let cancelled = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), cancellation)
+        .await
+        .unwrap();
+    assert!(matches!(cancelled.reason(), TurnEndReason::Aborted { .. }));
+    assert!(agent.pending_workspace_context.is_some());
+    assert!(provider.requests().is_empty());
+
+    agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(agent.pending_workspace_context.is_none());
+    assert_eq!(
+        provider.requests()[0][1].source().raw().as_value()["kind"],
+        "agent-instructions"
+    );
 }
 
 fn tool_response() -> Vec<StreamChunk> {

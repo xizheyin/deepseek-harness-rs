@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–24 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–25 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -32,6 +32,7 @@ for behavior that users can run today.
 | 22 | Draft-preserving user-question pager | `complete` | [`validation/phase-22.md`](validation/phase-22.md) |
 | 23 | Durable terminal Plan Mode and reviewed exit | `complete` | [`validation/phase-23.md`](validation/phase-23.md) |
 | 24 | Durable model Todo list and terminal standing plan | `complete` | [`validation/phase-24.md`](validation/phase-24.md) |
+| 25 | Durable startup/resume workspace instructions | `complete` | [`validation/phase-25.md`](validation/phase-25.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -357,6 +358,30 @@ only Session/UI state, need no filesystem/Shell approval, and cannot bypass the
 existing tool, cancellation, result, or persistence pipeline. Input is capped
 at 64 items and 512 UTF-8 bytes per trimmed line. Acceptance remains local-only
 and focused as requested.
+
+## Phase 25 workspace-instruction boundary (2026-08-29)
+
+Phase 25 closes the highest-value remaining default-context gap: official dsh
+loads `AGENTS.md`-compatible guidance before the first model request, while
+dsh-rs currently ignores it. The phase adds a bounded initial and resume-time
+baseline from the user-global instruction and the exact opened workspace root,
+using the official candidate order, same-directory trimmed-content dedup,
+`<system-reminder>` framing, most-specific-first budget policy, structured
+source facts, and direct-prompt-then-instructions durable ordering.
+
+On resume, an unchanged compatible visible baseline is reused rather than
+duplicated. Confirmed additions, replacements, removals, and budget changes are
+appended as new user-role instruction facts; history is never rewritten. A
+temporarily unreadable or oversized candidate is not treated as deleted.
+
+Rust keeps the exact opened workspace as its authority boundary instead of
+walking above it to a parent `.git`, and refuses instruction-file symlinks
+rather than letting repository text point at an arbitrary host file. This is a
+deliberate privacy difference from upstream. Dynamic discovery of nested
+instructions after a successful `read`/`apply_patch`, and same-process rearming
+after compaction, require the tool-result boundary and remain the next explicit
+gap rather than being approximated by shell parsing or a file watcher. Local,
+focused acceptance remains in force.
 
 ## Still deferred
 

@@ -10,6 +10,7 @@ mod resident_credit;
 mod tui;
 mod user_question;
 mod workspace_authority;
+mod workspace_instructions;
 
 pub mod agent;
 pub mod cli;

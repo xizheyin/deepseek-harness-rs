@@ -1645,6 +1645,31 @@ officially supported single-active configuration because this CLI has no
 parallel product workers, and records its extra resource bounds in
 `docs/design/todo-tool.md`.
 
+## Phase 25 workspace-instruction inspection — 2026-08-29
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/context/agent-instructions/src/{config,files,render,state,index,invariant}.ts`
+  and its README for discovery, bounded reads, ordering, deduplication,
+  rendering, structured source facts, first-step injection, resume
+  reconciliation, cancellation, and touch-driven dynamic refresh;
+- `packages/context/agent-instructions/tests/agent-instructions.spec.ts` for
+  user-global/root-to-cwd precedence, local overlays, root markers, candidates,
+  duplicate collapse, framing-escape, suffix-preserving byte budgets, durable
+  ordering, repeat-resume reuse, unavailable-source retention, additions,
+  replacements, removals, and compaction rearming;
+- `packages/context/agent-instructions/tests/agent-instructions.e2e.ts` for the
+  optional real-model baseline, nested-read, and changed-file journeys;
+- `apps/cli/config/agent-presets/code/agent.cordis.yml` for the shipped 65,536
+  byte render budget and default enablement in the fixed code preset.
+
+Latest `origin/master` `cd5ef8148158c3a752a658978873241fdf8e2bbc`
+retains these semantics. Its production change in this package preserves any
+extra downstream pre-step decision fields when inserting the instruction
+message; the remaining changes reorganize and expand documentation/tests.
+Rust Phase 25 records its exact-workspace-root and no-symlink privacy choices,
+plus the deferred tool-touch seam, in `docs/design/workspace-instructions.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:
