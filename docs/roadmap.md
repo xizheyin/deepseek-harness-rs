@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–26 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–27 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -34,6 +34,7 @@ for behavior that users can run today.
 | 24 | Durable model Todo list and terminal standing plan | `complete` | [`validation/phase-24.md`](validation/phase-24.md) |
 | 25 | Durable startup/resume workspace instructions | `complete` | [`validation/phase-25.md`](validation/phase-25.md) |
 | 26 | Tool-driven nested workspace-instruction refresh | `complete` | [`validation/phase-26.md`](validation/phase-26.md) |
+| 27 | Idle manual `/compact` command | `complete` | [`validation/phase-27.md`](validation/phase-27.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -127,7 +128,7 @@ tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
 The current green checkpoints implement bounded assistant-message markup,
 source-preserving 2–8-column pipe tables, six closed process-local semantic
-themes with transactional redraw, a closed nine-command completion palette, a
+themes with transactional redraw, a closed ten-command completion palette, a
 generator-provenanced semantic card for the real single-file `apply_patch`
 approval preview, bounded workspace-file suggestions, and bounded primary-screen Inspect/Review panels. Inspect
 shows only current-turn committed metadata and retained reasoning; Review keeps
@@ -403,6 +404,33 @@ second database. Discovery stays within the exact opened workspace, retains
 the Phase 25 no-symlink policy, batches at most the existing per-step tool-call
 limit, and retains the existing 1 MiB per-source and 65,536-byte rendered
 limits. Acceptance is local-only and focused as requested.
+
+## Phase 27 manual compaction boundary (2026-08-29)
+
+Phase 27 exposes the existing bounded summary machinery as the official idle
+`/compact` command. It selects a balanced older prefix even below automatic
+pressure, sends one tool-free compaction request, and on success appends a
+standalone `compaction/start → summary → checkpoint → end` transaction whose
+owner is `turn: null`. It does not create or consume an Agent turn.
+
+No compactable history is a local successful no-op. Arguments are rejected
+locally. Provider failure, invalid or non-shrinking output, cancellation, and
+timeout close the started bracket with an error and leave the visible
+conversation unchanged. The command is accepted only from an idle terminal.
+Enhanced active input reports busy instead of becoming model input or a queued
+prompt; the linear path retains its existing rule that it does not accept
+ordinary input while a turn runs. Phase 27 reuses the current request, output,
+time, Session, and provider bounds and adds no background task.
+
+Rust records its existing complete pre-request dispatch snapshot with a
+`manual` trigger even though upstream's manual start omits that extension.
+This preserves the repository rule that model-visible input is logged before
+the request. Rust does not yet have upstream's generic durable `command/run` and
+`command/done` envelope for its other local slash commands. This phase keeps a
+bounded `sourceCommandId` on every started manual compaction event instead of
+adding a one-command-only generic event family. Exact source paths and this
+intentional difference are recorded in `docs/upstream.md`,
+`docs/design/manual-compaction.md`, and `docs/compatibility.md`.
 
 ## Still deferred
 

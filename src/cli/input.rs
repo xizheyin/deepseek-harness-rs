@@ -101,6 +101,8 @@ pub(super) enum IdleInput {
     Motion(MotionCommand),
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
+    Compact,
+    CompactUsage,
     Exit,
     Submit(String),
 }
@@ -119,11 +121,18 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     if let Some(plan) = PlanModeCommand::parse(command) {
         return IdleInput::Plan(plan);
     }
+    if command
+        .strip_prefix("/compact")
+        .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+    {
+        return IdleInput::CompactUsage;
+    }
     match command {
         "" => IdleInput::Redraw,
         "/help" => IdleInput::Help,
         "/inspect" => IdleInput::Inspect,
         "/review" => IdleInput::Review,
+        "/compact" => IdleInput::Compact,
         "/exit" | "/quit" => IdleInput::Exit,
         _ => IdleInput::Submit(record.to_owned()),
     }
@@ -266,6 +275,11 @@ mod tests {
         assert_eq!(classify_idle_record("  /help \t", true), IdleInput::Help);
         assert_eq!(classify_idle_record(" /inspect ", true), IdleInput::Inspect);
         assert_eq!(classify_idle_record(" /review ", true), IdleInput::Review);
+        assert_eq!(classify_idle_record(" /compact ", true), IdleInput::Compact);
+        assert_eq!(
+            classify_idle_record("/compact now", true),
+            IdleInput::CompactUsage
+        );
         assert_eq!(
             classify_idle_record(" /theme paper ", true),
             IdleInput::Theme(ThemeCommand::Select(ThemePalette::Paper))

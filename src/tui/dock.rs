@@ -1241,15 +1241,15 @@ mod tests {
                 24,
                 80,
                 vec![
-                    "/help", "/inspect", "/review", "/focus", "/theme", "/motion", "/exit",
-                    "/quit", "/goal",
+                    "/inspect", "/review", "/focus", "/theme", "/motion", "/exit", "/quit",
+                    "/goal", "/compact",
                 ],
             ),
             (
                 15,
                 80,
                 vec![
-                    "/review", "/focus", "/theme", "/motion", "/exit", "/quit", "/goal",
+                    "/focus", "/theme", "/motion", "/exit", "/quit", "/goal", "/compact",
                 ],
             ),
             (12, 80, vec!["/motion", "/exit", "/quit", "/goal"]),
@@ -1281,10 +1281,10 @@ mod tests {
                     )
                 })
                 .map(|line| {
-                    expected
+                    crate::tui::command_palette::CommandId::ALL
                         .iter()
-                        .find(|command| line.text.contains(**command))
-                        .copied()
+                        .map(|command| command.command())
+                        .find(|command| line.text.contains(command))
                         .unwrap()
                 })
                 .collect::<Vec<_>>();

@@ -37,7 +37,10 @@ const MAX_COMPACTION_STREAM_BYTES: usize = 10 * 1024 * 1024;
 const COMPACTION_INSTRUCTION: &str = "Summarize the selected older conversation prefix for another coding agent. Preserve concrete user requirements, decisions, file paths, commands, code changes, test results, unresolved work, and tool outcomes. Do not call tools. Return only a concise factual summary; do not add commentary about summarizing.";
 
 pub(super) enum CompactionOutcome {
-    Progress,
+    Progress {
+        history_items: usize,
+        shadowed_tokens: u64,
+    },
     NoProgress,
     AdvisoryFailure(crate::model::LlmFailure),
     Cancelled,
@@ -47,7 +50,76 @@ pub(super) enum CompactionOutcome {
 struct CompactionClose {
     claim: EventClaim,
     compaction_id: CompactionId,
-    turn: TurnId,
+    scope: CompactionScope,
+}
+
+#[derive(Clone)]
+pub(super) enum CompactionScope {
+    Automatic {
+        turn: TurnId,
+        trigger: CompactionTrigger,
+    },
+    Manual {
+        source_command_id: String,
+    },
+}
+
+impl CompactionScope {
+    fn trigger(&self) -> CompactionTrigger {
+        match self {
+            Self::Automatic { trigger, .. } => *trigger,
+            Self::Manual { .. } => CompactionTrigger::Manual,
+        }
+    }
+
+    fn source_command_id(&self) -> Option<&str> {
+        match self {
+            Self::Automatic { .. } => None,
+            Self::Manual { source_command_id } => Some(source_command_id),
+        }
+    }
+
+    fn timeout_failure(&self) -> Result<crate::model::LlmFailure, AgentLoopError> {
+        match self {
+            Self::Automatic { .. } => {
+                failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out")
+            }
+            Self::Manual { .. } => failure_reason(
+                "AGENT_COMPACTION_TIMEOUT",
+                "the manual context summary timed out",
+            ),
+        }
+    }
+
+    fn start(
+        &self,
+        compaction_id: CompactionId,
+        dispatch: ModelVisibleDispatchSnapshot,
+    ) -> Result<CompactionStartEvent, crate::session::EventValidationError> {
+        match self {
+            Self::Automatic { turn, .. } => {
+                CompactionStartEvent::new(compaction_id, None, *turn, dispatch)
+            }
+            Self::Manual { source_command_id } => {
+                CompactionStartEvent::manual(compaction_id, source_command_id.clone(), dispatch)
+            }
+        }
+    }
+
+    fn end(
+        &self,
+        compaction_id: CompactionId,
+        error: Option<crate::model::LlmFailure>,
+    ) -> Result<CompactionEndEvent, crate::session::EventValidationError> {
+        match self {
+            Self::Automatic { turn, .. } => {
+                CompactionEndEvent::new(compaction_id, None, *turn, error)
+            }
+            Self::Manual { source_command_id } => {
+                CompactionEndEvent::manual(compaction_id, source_command_id.clone(), error)
+            }
+        }
+    }
 }
 
 pub(super) fn pressure_reached(total_tokens: u64, context_window: u64) -> bool {
@@ -66,8 +138,7 @@ pub(super) fn retained_token_target(context_window: Option<u64>) -> u64 {
 pub(super) async fn compact_once(
     reservation: &mut SessionReservation<'_>,
     driver: &mut Driver<'_>,
-    turn: TurnId,
-    trigger: CompactionTrigger,
+    scope: CompactionScope,
     retain_tokens: u64,
     cancellation: &CancellationToken,
     budget_failure: &crate::model::LlmFailure,
@@ -76,10 +147,7 @@ pub(super) async fn compact_once(
         return Ok(CompactionOutcome::Cancelled);
     }
     if tokio::time::Instant::now() >= driver.deadline {
-        return Ok(CompactionOutcome::TurnError(failure_reason(
-            "AGENT_TURN_TIMEOUT",
-            "the agent turn timed out",
-        )?));
+        return Ok(CompactionOutcome::TurnError(scope.timeout_failure()?));
     }
     if driver
         .counters
@@ -195,7 +263,7 @@ pub(super) async fn compact_once(
         return Ok(CompactionOutcome::NoProgress);
     };
     let Ok(dispatch) = ModelVisibleDispatchSnapshot::new(ModelVisibleDispatchInput {
-        trigger,
+        trigger: scope.trigger(),
         source_surface_generation,
         shadowed_range: candidate.range,
         shadowed_seqs: candidate.shadowed_seqs.clone(),
@@ -213,17 +281,17 @@ pub(super) async fn compact_once(
         return Ok(CompactionOutcome::NoProgress);
     };
     let compaction_id = CompactionId::new(compaction_id);
-    let Ok(start) = CompactionStartEvent::new(compaction_id.clone(), None, turn, dispatch) else {
+    let Ok(start) = scope.start(compaction_id.clone(), dispatch) else {
         return Ok(CompactionOutcome::NoProgress);
     };
-    let Ok(failure) = failure_reason(
-        "AGENT_COMPACTION_FAILED",
-        "the automatic context summary did not complete",
-    ) else {
+    let failure_message = match &scope {
+        CompactionScope::Automatic { .. } => "the automatic context summary did not complete",
+        CompactionScope::Manual { .. } => "the manual context summary did not complete",
+    };
+    let Ok(failure) = failure_reason("AGENT_COMPACTION_FAILED", failure_message) else {
         return Ok(CompactionOutcome::NoProgress);
     };
-    let Ok(failure_end) = CompactionEndEvent::new(compaction_id.clone(), None, turn, Some(failure))
-    else {
+    let Ok(failure_end) = scope.end(compaction_id.clone(), Some(failure)) else {
         return Ok(CompactionOutcome::NoProgress);
     };
     let close =
@@ -244,7 +312,7 @@ pub(super) async fn compact_once(
     let mut close = CompactionClose {
         claim: close,
         compaction_id: compaction_id.clone(),
-        turn,
+        scope: scope.clone(),
     };
     let start_receipt = match reservation
         .append_settled(NewEvent::log(EventKind::compaction_start(start)))
@@ -285,10 +353,7 @@ pub(super) async fn compact_once(
         .await;
     }
     if tokio::time::Instant::now() >= driver.deadline {
-        let outcome = CompactionOutcome::TurnError(failure_reason(
-            "AGENT_TURN_TIMEOUT",
-            "the agent turn timed out",
-        )?);
+        let outcome = CompactionOutcome::TurnError(scope.timeout_failure()?);
         return close_failed_bracket(reservation, &mut close, driver, outcome).await;
     }
 
@@ -363,10 +428,7 @@ pub(super) async fn compact_once(
             .await;
         }
         CollectedSummaryOutcome::TimedOut => {
-            let outcome = CompactionOutcome::TurnError(failure_reason(
-                "AGENT_TURN_TIMEOUT",
-                "the agent turn timed out",
-            )?);
+            let outcome = CompactionOutcome::TurnError(scope.timeout_failure()?);
             return close_failed_bracket(reservation, &mut close, driver, outcome).await;
         }
         CollectedSummaryOutcome::Invalid => {
@@ -389,17 +451,14 @@ pub(super) async fn compact_once(
         .await;
     }
     if tokio::time::Instant::now() >= driver.deadline {
-        let outcome = CompactionOutcome::TurnError(failure_reason(
-            "AGENT_TURN_TIMEOUT",
-            "the agent turn timed out",
-        )?);
+        let outcome = CompactionOutcome::TurnError(scope.timeout_failure()?);
         return close_failed_bracket(reservation, &mut close, driver, outcome).await;
     }
     let summary_output_tokens = usage.as_ref().map(|usage| usage.output_tokens().get());
 
     let summary_event = CompactionSummaryEvent::new(CompactionSummaryInput {
         compaction_id: compaction_id.clone(),
-        source_command_id: None,
+        source_command_id: scope.source_command_id().map(str::to_owned),
         summary: summary.clone(),
         raw_output,
         shadowed_range: candidate.range,
@@ -467,10 +526,7 @@ pub(super) async fn compact_once(
         .await;
     }
     if tokio::time::Instant::now() >= driver.deadline {
-        let outcome = CompactionOutcome::TurnError(failure_reason(
-            "AGENT_TURN_TIMEOUT",
-            "the agent turn timed out",
-        )?);
+        let outcome = CompactionOutcome::TurnError(scope.timeout_failure()?);
         return close_failed_bracket(reservation, &mut close, driver, outcome).await;
     }
 
@@ -482,20 +538,29 @@ pub(super) async fn compact_once(
         checkpoint_content.push(ContentBlock::text(COMPACTION_CHECKPOINT_PREFIX)?);
         checkpoint_content.extend(summary);
         checkpoint_content.push(ContentBlock::text(COMPACTION_CHECKPOINT_SUFFIX)?);
-        let checkpoint = Message::user(
-            next_id(driver.runtime, AgentIdKind::Message)?,
-            checkpoint_content,
-            MessageSource::from_value(json!({
+        let checkpoint_source = match scope.source_command_id() {
+            Some(source_command_id) => json!({
                 "kind": "plugin",
                 "plugin": COMPACTION_CHECKPOINT_SOURCE,
                 "compactionId": compaction_id.as_str(),
-            }))?,
+                "sourceCommandId": source_command_id,
+            }),
+            None => json!({
+                "kind": "plugin",
+                "plugin": COMPACTION_CHECKPOINT_SOURCE,
+                "compactionId": compaction_id.as_str(),
+            }),
+        };
+        let checkpoint = Message::user(
+            next_id(driver.runtime, AgentIdKind::Message)?,
+            checkpoint_content,
+            MessageSource::from_value(checkpoint_source)?,
         )?;
         let checkpoint_tokens = reservation
             .session()
             .estimated_message_tokens(&checkpoint)
             .map_err(|_| AgentLoopError::Invariant("compaction checkpoint pricing failed"))?;
-        let success_end = CompactionEndEvent::new(compaction_id.clone(), None, turn, None)?;
+        let success_end = scope.end(compaction_id.clone(), None)?;
         let mut sources = Vec::new();
         sources
             .try_reserve_exact(candidate.shadowed_seqs.len() + 2)
@@ -521,6 +586,7 @@ pub(super) async fn compact_once(
         )
         .await;
     }
+    let history_items = candidate.shadowed_seqs.len();
     sources.push(summary_receipt.seq());
     sources.extend(candidate.shadowed_seqs);
     let checkpoint_event = NewEvent::surface(
@@ -578,7 +644,10 @@ pub(super) async fn compact_once(
     // after the checkpoint has already replaced the surface. The replacement
     // is still real progress, so the ordinary request is rebuilt either way.
     match dispatch_barrier(reservation).await? {
-        DispatchBarrier::Ready => Ok(CompactionOutcome::Progress),
+        DispatchBarrier::Ready => Ok(CompactionOutcome::Progress {
+            history_items,
+            shadowed_tokens: candidate.shadowed_token_count,
+        }),
         DispatchBarrier::ObserverUnavailable => {
             driver.observer_unavailable = true;
             Ok(CompactionOutcome::TurnError(failure_reason(
@@ -621,18 +690,22 @@ async fn close_failed_bracket(
     let preferred_failure = match &outcome {
         CompactionOutcome::Cancelled => Some(failure_reason(
             "AGENT_COMPACTION_CANCELLED",
-            "the automatic context summary was cancelled",
+            match close.scope {
+                CompactionScope::Automatic { .. } => "the automatic context summary was cancelled",
+                CompactionScope::Manual { .. } => "the manual context summary was cancelled",
+            },
         )?),
         CompactionOutcome::AdvisoryFailure(failure) | CompactionOutcome::TurnError(failure) => {
             Some(failure.clone())
         }
-        CompactionOutcome::Progress | CompactionOutcome::NoProgress => None,
+        CompactionOutcome::Progress { .. } | CompactionOutcome::NoProgress => None,
     };
     if let Some(failure) = preferred_failure {
-        let preferred =
-            CompactionEndEvent::new(close.compaction_id.clone(), None, close.turn, Some(failure))
-                .ok()
-                .map(|end| NewEvent::log(EventKind::compaction_end(end)));
+        let preferred = close
+            .scope
+            .end(close.compaction_id.clone(), Some(failure))
+            .ok()
+            .map(|end| NewEvent::log(EventKind::compaction_end(end)));
         if let Some(preferred) = preferred {
             match reservation
                 .settle_settled(&mut close.claim, preferred)

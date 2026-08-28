@@ -73,7 +73,9 @@ pub use tool::{
 };
 
 use assembler::{AssembledAssistant, without_tool_calls};
-use compaction::{CompactionOutcome, compact_once, pressure_reached, retained_token_target};
+use compaction::{
+    CompactionOutcome, CompactionScope, compact_once, pressure_reached, retained_token_target,
+};
 use retry::{RetryDecision, decide, policy_key};
 
 pub const MAX_AGENT_STEPS_PER_TURN: usize = 64;
@@ -749,6 +751,19 @@ impl TurnOutcome {
     }
 }
 
+/// User-facing result of one idle manual context reduction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualCompactionOutcome {
+    NoHistory,
+    Compacted {
+        history_items: usize,
+        shadowed_tokens: u64,
+    },
+    Unchanged,
+    Cancelled,
+    Failed,
+}
+
 /// Stateful owner of one session and its request-header lifecycle.
 pub struct AgentLoop {
     session: Session,
@@ -895,6 +910,116 @@ impl AgentLoop {
         mutation
             .commit()
             .map_err(|_| AgentLoopError::Invariant("committed Plan Mode state was not installable"))
+    }
+
+    /// Run one standalone `/compact` transaction without opening an Agent turn.
+    pub(crate) async fn compact_now(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<ManualCompactionOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        self.session.materialize_if_needed().await?;
+        match self.session.compaction_candidate(0) {
+            Ok(Some(candidate))
+                if candidate.shadowed_token_count > 0 && !candidate.messages.is_empty() => {}
+            Ok(_) => return Ok(ManualCompactionOutcome::NoHistory),
+            Err(_) => {
+                return Err(AgentLoopError::Invariant(
+                    "manual compaction selection failed",
+                ));
+            }
+        }
+
+        let provider = self.provider.clone();
+        let tools = self.tools.clone();
+        let runtime = self.runtime.clone();
+        let config = self.config.clone();
+        let source_command_id = next_id(runtime.as_ref(), AgentIdKind::Message)?;
+        let budget_failure = failure_reason(
+            "AGENT_EVENT_BUDGET",
+            "the session has no safe room for manual compaction",
+        )?;
+        let session_limit_failure = failure_reason(
+            "AGENT_SESSION_LIMIT",
+            "the durable session reached its storage limit",
+        )?;
+        let result = {
+            let mut reservation = self.session.reservation();
+            let mut driver = Driver {
+                provider: provider.as_ref(),
+                tools: tools.as_ref(),
+                runtime: runtime.as_ref(),
+                config: &config,
+                request_header_logged: &mut self.request_header_logged,
+                exact_shell_grants: &mut self.exact_shell_grants,
+                pending_shell_grant: None,
+                counters: Counters::default(),
+                final_message: None,
+                observer_unavailable: false,
+                session_limit_failure,
+                durable_limit: None,
+                deadline: Instant::now() + config.limits.turn_duration,
+                goal_tool_caller: GoalToolCaller::Untrusted,
+                workspace_instructions: self.workspace_instructions.as_ref(),
+                pending_workspace_touches: &mut self.pending_workspace_touches,
+            };
+            compact_once(
+                &mut reservation,
+                &mut driver,
+                CompactionScope::Manual { source_command_id },
+                0,
+                &cancellation,
+                &budget_failure,
+            )
+            .await
+        };
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        let outcome = result?;
+        if matches!(outcome, CompactionOutcome::Progress { .. }) {
+            if let Some(runtime) = self.workspace_instructions.clone() {
+                match runtime
+                    .prepare(
+                        &self.session,
+                        &self.pending_workspace_touches,
+                        &cancellation,
+                    )
+                    .await
+                {
+                    Ok(context) => {
+                        self.pending_workspace_touches.clear();
+                        if let Some(context) = context {
+                            self.pending_workspace_context = Some(context);
+                        }
+                    }
+                    Err(_) => {
+                        self.poisoned = true;
+                        return Err(AgentLoopError::Invariant(
+                            "workspace instructions could not be rearmed after manual compaction",
+                        ));
+                    }
+                }
+            }
+        }
+        match outcome {
+            CompactionOutcome::Progress {
+                history_items,
+                shadowed_tokens,
+            } => Ok(ManualCompactionOutcome::Compacted {
+                history_items,
+                shadowed_tokens,
+            }),
+            CompactionOutcome::NoProgress => Ok(ManualCompactionOutcome::Unchanged),
+            CompactionOutcome::AdvisoryFailure(_) => Ok(ManualCompactionOutcome::Failed),
+            CompactionOutcome::Cancelled => Ok(ManualCompactionOutcome::Cancelled),
+            CompactionOutcome::TurnError(_) => Ok(ManualCompactionOutcome::Failed),
+        }
     }
 
     /// Stop tool-owned workers, then return the still-active Session.
@@ -1596,8 +1721,7 @@ async fn run_entered_turn(
                 let outcome = compact_once(
                     reservation,
                     driver,
-                    turn,
-                    trigger,
+                    CompactionScope::Automatic { turn, trigger },
                     retained_token_target(context_window),
                     cancellation,
                     budget_failure,
@@ -1605,7 +1729,7 @@ async fn run_entered_turn(
                 .await?;
                 summary_attempted |= driver.counters.attempts > attempts_before_summary;
                 match outcome {
-                    CompactionOutcome::Progress => {
+                    CompactionOutcome::Progress { .. } => {
                         if let Some(reason) = pre_step_stop(driver, cancellation)? {
                             unstarted.release(reservation)?;
                             return Ok(reason);

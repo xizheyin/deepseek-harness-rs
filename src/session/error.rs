@@ -211,6 +211,8 @@ pub enum TransitionError {
     CompactionSuccessWithoutReplacement,
     #[error("durable compaction/start requires a complete dispatch snapshot")]
     DurableCompactionDispatchRequired,
+    #[error("manual compaction/start requires an idle null-turn command envelope")]
+    ManualCompactionEnvelopeInvalid,
     #[error("durable compaction/end cannot use the legacy string error shape")]
     DurableLegacyCompactionError,
     #[error("compaction dispatch does not match current Session facts: {0}")]

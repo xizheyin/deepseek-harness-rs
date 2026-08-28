@@ -1494,12 +1494,18 @@ impl Projection {
             }
             .into());
         }
-        let recipe = match start.dispatch() {
-            Some(dispatch) => Some(self.validate_compaction_dispatch(seq, dispatch)?),
-            None if admission != ValidationAdmission::CompatibilityReplay => {
+        let recipe = match (start.turn(), start.source_command_id(), start.dispatch()) {
+            (None, Some(_), Some(dispatch)) if matches!(self.boundary, Boundary::Idle) => {
+                Some(self.validate_compaction_dispatch(seq, dispatch)?)
+            }
+            (None, _, _) if admission != ValidationAdmission::CompatibilityReplay => {
+                return Err(TransitionError::ManualCompactionEnvelopeInvalid.into());
+            }
+            (Some(_), _, Some(dispatch)) => Some(self.validate_compaction_dispatch(seq, dispatch)?),
+            (Some(_), _, None) if admission != ValidationAdmission::CompatibilityReplay => {
                 return Err(TransitionError::DurableCompactionDispatchRequired.into());
             }
-            None => None,
+            _ => None,
         };
         Ok(OpenCompaction {
             id: start.compaction_id().clone(),
@@ -1610,7 +1616,8 @@ impl Projection {
             .map_err(context_budget_surface_error)?;
         match (dispatch.trigger(), &self.boundary) {
             (CompactionTrigger::Pressure | CompactionTrigger::HardLimit, Boundary::Turn { .. })
-            | (CompactionTrigger::ContextOverflow, Boundary::Step { .. }) => {}
+            | (CompactionTrigger::ContextOverflow, Boundary::Step { .. })
+            | (CompactionTrigger::Manual, Boundary::Idle) => {}
             (CompactionTrigger::Pressure | CompactionTrigger::HardLimit, _) => {
                 return Err(TransitionError::CompactionDispatchMismatch(
                     "pressure and hard-limit compaction require an open turn without a step",
@@ -1620,6 +1627,12 @@ impl Projection {
             (CompactionTrigger::ContextOverflow, _) => {
                 return Err(TransitionError::CompactionDispatchMismatch(
                     "context-overflow compaction requires an open step",
+                )
+                .into());
+            }
+            (CompactionTrigger::Manual, _) => {
+                return Err(TransitionError::CompactionDispatchMismatch(
+                    "manual compaction requires an idle Session",
                 )
                 .into());
             }
@@ -4169,7 +4182,7 @@ mod tests {
                 .unwrap_err(),
             crate::session::AppendError::Validation(
                 crate::session::EventValidationError::Transition(
-                    TransitionError::DurableCompactionDispatchRequired
+                    TransitionError::ManualCompactionEnvelopeInvalid
                 )
             )
         ));

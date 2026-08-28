@@ -1696,6 +1696,37 @@ crate-private built-in result fact instead of recognizing a tool by its public
 name alone. The intentional exact-workspace and no-instruction-symlink privacy
 differences from Phase 25 remain unchanged.
 
+## Phase 27 manual `/compact` inspection — 2026-08-29
+
+Pinned production and tests inspected:
+
+- `packages/compaction/command-compact/src/index.ts` and
+  `packages/compaction/command-compact/tests/command-compact.spec.ts`;
+- `packages/compaction/command-compact/README.md`;
+- `packages/compaction/compaction-basic/src/{index,region}.ts` and
+  `packages/compaction/compaction-basic/tests/manual-compaction.spec.ts`;
+- `packages/compaction/compaction/src/types.ts`.
+
+The exact command is `/compact` with no arguments. Arguments return a usage
+error without calling the backend. With no compactable balanced older prefix,
+the command succeeds with `No compactable history yet.` and produces no
+compaction marker. A successful manual run may occur below automatic pressure,
+retains a recent balanced tail, reports the shadowed history-item and token
+counts, and does not consume a turn number.
+
+Manual lifecycle events use `turn: null` and one `sourceCommandId`. The start
+has no automatic dispatch payload. Summary, replacement checkpoint, and end
+are adjacent and flushed before the command completes. Failure or cancellation
+closes the bracket with an error and leaves the previous surface unchanged.
+The command is idle-only: an active turn, queued wakeup, or another live
+compaction returns busy. Command input and output remain outside the
+model-visible surface. Upstream additionally surrounds the transaction with
+generic log-only `command/run` and `command/done` facts.
+
+Current master `cd5ef8148158c3a752a658978873241fdf8e2bbc` keeps the production
+`command-compact/src/index.ts` behavior unchanged; its tests and docs add more
+explicit coverage but do not change the command contract used here.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

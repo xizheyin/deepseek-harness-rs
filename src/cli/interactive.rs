@@ -7,7 +7,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::AgentLoop,
+    agent::{AgentLoop, ManualCompactionOutcome},
     goal::{GoalCommand, GoalError, GoalRound, GoalRuntime},
     plan_mode::{PlanModeCommand, PlanModeError, PlanModeRuntime},
     session::{
@@ -579,6 +579,7 @@ async fn run_enhanced(
                                 | EnhancedSubmission::Motion(_)
                                 | EnhancedSubmission::Goal(_)
                                 | EnhancedSubmission::Plan(_)
+                                | EnhancedSubmission::CompactUsage
                         );
                     let (mut draft, mut cursor) = if let Some(round) = &goal_round {
                         (round.prompt().to_owned(), 0)
@@ -637,7 +638,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/compact | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -676,6 +677,14 @@ async fn run_enhanced(
                                 )
                                 .await;
                             }
+                            CommandId::Compact => {
+                                let (outcome, signal) =
+                                    run_manual_compaction(&mut agent, signals).await?;
+                                notice = Some(manual_compaction_notice(&outcome));
+                                if !matches!(signal, None | Some(UiSignal::Interrupt)) {
+                                    pending_signal = signal;
+                                }
+                            }
                             CommandId::Exit | CommandId::Quit => {
                                 break Ok(InteractiveExit::Ordinary(0));
                             }
@@ -690,6 +699,9 @@ async fn run_enhanced(
                             apply_goal_command(&mut agent, &goal, command, &mut notice).await;
                         }
                         EnhancedSubmission::Plan(_) => return Err(InteractiveError::Agent),
+                        EnhancedSubmission::CompactUsage => {
+                            notice = Some("Usage: /compact (no arguments)".to_owned());
+                        }
                         EnhancedSubmission::Prompt => {
                             let prompt = copy_enhanced_prompt(&draft)?;
                             presenter.observe_external_line_start();
@@ -1170,6 +1182,7 @@ enum EnhancedSubmission {
     Motion(MotionCommand),
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
+    CompactUsage,
     Prompt,
 }
 
@@ -1183,12 +1196,57 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         EnhancedSubmission::Goal(goal)
     } else if let Some(plan) = PlanModeCommand::parse(command) {
         EnhancedSubmission::Plan(plan)
+    } else if command
+        .strip_prefix("/compact")
+        .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+    {
+        EnhancedSubmission::CompactUsage
     } else if let Some(theme) = ThemeCommand::parse(command) {
         EnhancedSubmission::Theme(theme)
     } else if let Some(motion) = MotionCommand::parse(command) {
         EnhancedSubmission::Motion(motion)
     } else {
         EnhancedSubmission::Prompt
+    }
+}
+
+async fn run_manual_compaction(
+    agent: &mut AgentLoop,
+    signals: &mut SignalStreams,
+) -> Result<(ManualCompactionOutcome, Option<UiSignal>), InteractiveError> {
+    let cancellation = CancellationToken::new();
+    let future = agent.compact_now(cancellation.clone());
+    tokio::pin!(future);
+    let mut stopped = SignalLatch::default();
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut future => break result,
+            signal = signals.next() => {
+                stopped.observe(DriverMode::Interactive, signal);
+                cancellation.cancel();
+            }
+        }
+    };
+    signals.drain_ready(DriverMode::Interactive, &mut stopped);
+    Ok((
+        result.map_err(|_| InteractiveError::Agent)?,
+        stopped.observed(),
+    ))
+}
+
+fn manual_compaction_notice(outcome: &ManualCompactionOutcome) -> String {
+    match outcome {
+        ManualCompactionOutcome::NoHistory => "No compactable history yet.".to_owned(),
+        ManualCompactionOutcome::Compacted {
+            history_items,
+            shadowed_tokens,
+        } => format!("Compacted {history_items} history items (~{shadowed_tokens} tokens)."),
+        ManualCompactionOutcome::Unchanged => {
+            "Compaction did not produce a smaller summary. Conversation unchanged.".to_owned()
+        }
+        ManualCompactionOutcome::Cancelled => "Compaction cancelled.".to_owned(),
+        ManualCompactionOutcome::Failed => "Compaction failed. Conversation unchanged.".to_owned(),
     }
 }
 
@@ -1726,7 +1784,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
+                "/compact · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -2738,6 +2796,44 @@ async fn run_linear(
                         if let Some(signal) =
                             write_dynamic_notice(message, &mut presenter, &terminal, signals)
                                 .await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::Compact => {
+                        let (outcome, signal) = run_manual_compaction(&mut agent, signals).await?;
+                        let message = format!("[{}]\n", manual_compaction_notice(&outcome));
+                        if let Some(write_signal) =
+                            write_dynamic_notice(message, &mut presenter, &terminal, signals)
+                                .await?
+                        {
+                            if let Some(write_signal) =
+                                handle_idle_signal(write_signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(write_signal));
+                            }
+                        }
+                        if let Some(signal) = signal.filter(|signal| *signal != UiSignal::Interrupt)
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::CompactUsage => {
+                        if let Some(signal) = write_notice(
+                            "[Usage: /compact (no arguments)]\n",
+                            &mut presenter,
+                            &terminal,
+                            signals,
+                        )
+                        .await?
                         {
                             if let Some(signal) =
                                 handle_idle_signal(signal, &terminal, signals).await?
@@ -5788,7 +5884,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -5818,6 +5914,13 @@ fn handle_active_input(
                             let _ = input.take_draft_for_turn()?;
                             apply_active_goal_command(goal, Ok(GoalCommand::Show), notice);
                         }
+                        CommandId::Compact => {
+                            let _ = input.take_draft_for_turn()?;
+                            *notice = Some(
+                                "Compaction busy · wait for the current turn or press Ctrl+C"
+                                    .to_owned(),
+                            );
+                        }
                     }
                     return Ok(ActiveInputOutcome::Redraw);
                 }
@@ -5842,6 +5945,11 @@ fn handle_active_input(
                         "Plan Mode error · wait for the current turn or press Ctrl+C before changing mode"
                             .to_owned(),
                     );
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::CompactUsage => {
+                    let _ = input.take_draft_for_turn()?;
+                    *notice = Some("Usage: /compact (no arguments)".to_owned());
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Empty => {
@@ -7425,6 +7533,10 @@ mod tests {
         assert_eq!(
             super::classify_enhanced_submission("/not-local"),
             super::EnhancedSubmission::Prompt
+        );
+        assert_eq!(
+            super::classify_enhanced_submission("/compact now"),
+            super::EnhancedSubmission::CompactUsage
         );
     }
 

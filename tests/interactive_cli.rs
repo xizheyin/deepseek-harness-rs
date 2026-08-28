@@ -428,7 +428,6 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
 
     dsh.write(b"/");
     dsh.expect(b"> /quit");
-    dsh.expect(b"/help");
     dsh.expect(b"/inspect");
     dsh.expect(b"/review");
     dsh.expect(b"/focus");
@@ -436,6 +435,8 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
     dsh.expect(b"/motion");
     dsh.expect(b"/exit");
     dsh.expect(b"/quit");
+    dsh.expect(b"/goal");
+    dsh.expect(b"/compact");
     dsh.expect("Enter complete · Esc close".as_bytes());
     dsh.write(b"\x1b[A");
     dsh.expect(b"> /exit");
@@ -2991,6 +2992,69 @@ fn todo_write_prints_the_complete_bounded_list_in_zero_escape_linear_mode() {
     assert!(status.success());
     assert!(!transcript.contains(&0x1b));
     assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn manual_compact_runs_one_idle_request_and_persists_a_null_turn_transaction() {
+    let server = SequenceSseServer::start(vec![
+        text_sse(&"older assistant work ".repeat(240)),
+        text_sse("preserve the earlier request and completed work"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    let prompt = format!("remember this older requirement {}", "x".repeat(900));
+    dsh.write(prompt.as_bytes());
+    dsh.write(b"\r");
+    dsh.expect(b"Turn complete");
+    dsh.write(b"/compact\r");
+    dsh.expect(b"Compacted 1 history items (~");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(last_user_content(&requests[1]).contains("Summarize the selected older"));
+
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let rows = std::fs::read_to_string(entry.path())
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    let start = rows
+        .iter()
+        .position(|row| row["type"] == "compaction/start")
+        .unwrap();
+    assert_eq!(
+        rows[start..start + 4]
+            .iter()
+            .map(|row| row["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "compaction/start",
+            "compaction/summary",
+            "user/message",
+            "compaction/end",
+        ]
+    );
+    assert!(rows[start]["data"]["turn"].is_null());
+    assert_eq!(rows[start]["data"]["dispatch"]["trigger"], "manual");
+    assert!(rows[start + 3]["data"]["turn"].is_null());
+    assert_eq!(
+        rows[start]["data"]["sourceCommandId"],
+        rows[start + 3]["data"]["sourceCommandId"]
+    );
 }
 
 #[test]

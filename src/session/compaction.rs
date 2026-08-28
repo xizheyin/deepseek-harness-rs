@@ -67,13 +67,14 @@ impl fmt::Display for CompactionId {
     }
 }
 
-/// Why the Session started one automatic compaction.
+/// Why the Session started one bounded compaction request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompactionTrigger {
     Pressure,
     ContextOverflow,
     HardLimit,
+    Manual,
 }
 
 /// Inclusive endpoints in current-surface order.
@@ -594,6 +595,22 @@ impl CompactionStartEvent {
         Ok(value)
     }
 
+    /// Build the standalone bracket used by a human `/compact` command.
+    pub fn manual(
+        compaction_id: CompactionId,
+        source_command_id: String,
+        dispatch: ModelVisibleDispatchSnapshot,
+    ) -> Result<Self, EventValidationError> {
+        let value = Self {
+            compaction_id,
+            source_command_id: Some(source_command_id),
+            turn: CompactionOwner(None),
+            dispatch: Some(dispatch),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), EventValidationError> {
         self.compaction_id.validate()?;
         validate_source_command_id(self.source_command_id.as_deref())?;
@@ -917,6 +934,22 @@ impl CompactionEndEvent {
             compaction_id,
             source_command_id,
             turn: CompactionOwner(Some(turn)),
+            error: error.map(CompactionEndError::Failure),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    /// Close the standalone bracket used by a human `/compact` command.
+    pub fn manual(
+        compaction_id: CompactionId,
+        source_command_id: String,
+        error: Option<LlmFailure>,
+    ) -> Result<Self, EventValidationError> {
+        let value = Self {
+            compaction_id,
+            source_command_id: Some(source_command_id),
+            turn: CompactionOwner(None),
             error: error.map(CompactionEndError::Failure),
         };
         value.validate()?;

@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     AgentIdKind, AgentLimits, AgentLoop, AgentLoopConfig, AgentLoopError, AgentRuntime,
     ApprovalFuture, ApprovalPrompt, ApprovalProvider, ApprovalRequest, ExactShellGrantIdentity,
-    FileChangePolicy, MutationDeclineReason, NoApprovalProvider, PluginPolicy,
-    PreparedToolMutation, ShellPolicy, ToolCommitOutcome, ToolExecutionFuture,
+    FileChangePolicy, ManualCompactionOutcome, MutationDeclineReason, NoApprovalProvider,
+    PluginPolicy, PreparedToolMutation, ShellPolicy, ToolCommitOutcome, ToolExecutionFuture,
     ToolExecutionRequest, ToolExecutionResult, ToolExecutor, ToolExecutorError, ToolPreparation,
     ToolPreparationFuture, TurnProposal, action_policy,
     tool::{
@@ -2759,6 +2759,301 @@ async fn pressure_summary_compacts_once_and_continues_the_same_input() {
     drop(agent);
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn manual_compaction_runs_below_pressure_without_consuming_a_turn() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("older assistant work ".repeat(200)),
+        text_response_with("the older work and requirements were preserved"),
+    ]));
+    let mut agent = agent(
+        "memory-manual-compaction",
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        None,
+    );
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "manual-history",
+                    vec![ContentBlock::text("older user requirements ".repeat(200)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let next_turn = agent.session().state().next_turn();
+
+    let outcome = agent.compact_now(CancellationToken::new()).await.unwrap();
+    assert!(
+        matches!(
+            &outcome,
+            ManualCompactionOutcome::Compacted {
+                history_items: 1,
+                shadowed_tokens: 1..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(agent.session().state().next_turn(), next_turn);
+    assert_eq!(
+        provider.purposes(),
+        vec![RequestPurpose::Conversation, RequestPurpose::Compaction]
+    );
+    assert!(agent.session().visible_messages().iter().any(|message| {
+        matches!(
+            message.source().kind(),
+            crate::model::MessageSourceKind::Plugin { plugin, .. } if plugin == "compact"
+        )
+    }));
+
+    let rows = agent
+        .session()
+        .events()
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect::<Vec<_>>();
+    let start = rows
+        .iter()
+        .position(|row| row["type"] == "compaction/start")
+        .unwrap();
+    assert_eq!(
+        rows[start..start + 4]
+            .iter()
+            .map(|row| row["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "compaction/start",
+            "compaction/summary",
+            "user/message",
+            "compaction/end",
+        ]
+    );
+    assert!(rows[start]["data"]["turn"].is_null());
+    assert_eq!(rows[start]["data"]["dispatch"]["trigger"], "manual");
+    let source_command_id = rows[start]["data"]["sourceCommandId"].as_str().unwrap();
+    assert!(!source_command_id.is_empty());
+    assert_eq!(
+        rows[start + 1]["data"]["sourceCommandId"],
+        source_command_id
+    );
+    assert_eq!(
+        rows[start + 3]["data"]["sourceCommandId"],
+        source_command_id
+    );
+    assert!(rows[start + 3]["data"]["turn"].is_null());
+    let replayed = Session::replay(agent.session().events()).unwrap();
+    assert_eq!(replayed.state().next_turn(), next_turn);
+    assert_eq!(replayed.messages(), agent.session().visible_messages());
+}
+
+#[tokio::test]
+async fn manual_compaction_rearms_workspace_instructions_before_the_next_turn() {
+    let workspace = std::env::temp_dir().join(format!(
+        "dsh-manual-compaction-rearm-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workspace);
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("AGENTS.md"), "keep the manual compact rule").unwrap();
+    let authority = WorkspaceAuthority::open(&workspace).unwrap();
+    let runtime = WorkspaceInstructionRuntime::from_authority_without_home(&authority);
+    let session = Session::new("memory-manual-compaction-rearm").unwrap();
+    let context = runtime
+        .prepare(&session, &[], &CancellationToken::new())
+        .await
+        .unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("older assistant work ".repeat(200)),
+        text_response_with("the older request and workspace rule were preserved"),
+        text_response_with("continued with the rearmed rule"),
+    ]));
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema()])
+        .unwrap()
+        .with_shell_policy(ShellPolicy::Allow);
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+    agent.install_workspace_context(context);
+    agent.install_workspace_instruction_runtime(runtime);
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "manual-rearm-history",
+                    vec![ContentBlock::text("older user requirements ".repeat(200)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        agent.compact_now(CancellationToken::new()).await.unwrap(),
+        ManualCompactionOutcome::Compacted { .. }
+    ));
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "manual-rearm-next",
+                    vec![ContentBlock::text("continue after manual compact").unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].iter().any(|message| {
+        message.source().raw().as_value()["kind"] == "agent-instructions"
+            && message.content().iter().any(|block| {
+                matches!(
+                    block.kind(),
+                    ContentBlockKind::Text { text }
+                        if text.contains("keep the manual compact rule")
+                )
+            })
+    }));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[tokio::test]
+async fn manual_compaction_with_no_older_history_is_a_provider_free_noop() {
+    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    let mut agent = agent(
+        "memory-manual-compaction-empty",
+        provider.clone(),
+        Arc::new(LargePrunableTools),
+        None,
+    );
+
+    assert_eq!(
+        agent.compact_now(CancellationToken::new()).await.unwrap(),
+        ManualCompactionOutcome::NoHistory
+    );
+    assert!(provider.purposes().is_empty());
+    assert!(agent.session().events().is_empty());
+}
+
+#[tokio::test]
+async fn failed_manual_summary_closes_the_bracket_and_preserves_the_surface() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        text_response_with("older assistant work ".repeat(200)),
+        provider_error_response("SUMMARY_SERVER"),
+    ]));
+    let mut agent = agent(
+        "memory-manual-compaction-failure",
+        provider,
+        Arc::new(LargePrunableTools),
+        None,
+    );
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "manual-failure-history",
+                    vec![ContentBlock::text("older user requirements ".repeat(200)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let before = agent.session().visible_messages();
+
+    assert_eq!(
+        agent.compact_now(CancellationToken::new()).await.unwrap(),
+        ManualCompactionOutcome::Failed
+    );
+    assert_eq!(agent.session().visible_messages(), before);
+    let rows = agent
+        .session()
+        .events()
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect::<Vec<_>>();
+    let start = rows
+        .iter()
+        .rposition(|row| row["type"] == "compaction/start")
+        .unwrap();
+    assert_eq!(rows[start + 1]["type"], "compaction/end");
+    assert_eq!(rows[start + 1]["data"]["error"]["code"], "SUMMARY_SERVER");
+}
+
+#[tokio::test]
+async fn cancelling_manual_compaction_closes_the_null_turn_bracket_without_replacing_history() {
+    let cancellation = CancellationToken::new();
+    let provider = Arc::new(
+        ScriptedProvider::new(vec![
+            text_response_with("older assistant work ".repeat(200)),
+            text_response_with("must not become a checkpoint"),
+        ])
+        .with_cancel_on_compaction(cancellation.clone()),
+    );
+    let mut agent = agent(
+        "memory-manual-compaction-cancel",
+        provider,
+        Arc::new(LargePrunableTools),
+        None,
+    );
+    agent
+        .run_turn(
+            TurnProposal::Enter(vec![
+                Message::user(
+                    "manual-cancel-history",
+                    vec![ContentBlock::text("older user requirements ".repeat(200)).unwrap()],
+                    MessageSource::user().unwrap(),
+                )
+                .unwrap(),
+            ]),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let before = agent.session().visible_messages();
+
+    assert_eq!(
+        agent.compact_now(cancellation).await.unwrap(),
+        ManualCompactionOutcome::Cancelled
+    );
+    assert_eq!(agent.session().visible_messages(), before);
+    let rows = agent
+        .session()
+        .events()
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect::<Vec<_>>();
+    let start = rows
+        .iter()
+        .rposition(|row| row["type"] == "compaction/start")
+        .unwrap();
+    assert_eq!(rows[start + 1]["type"], "compaction/end");
+    assert!(rows[start + 1]["data"]["turn"].is_null());
+    assert_eq!(
+        rows[start + 1]["data"]["error"]["code"],
+        "AGENT_COMPACTION_CANCELLED"
+    );
 }
 
 #[cfg(unix)]
