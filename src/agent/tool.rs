@@ -28,6 +28,16 @@ pub type ToolPreparationFuture<'a> =
 pub type ToolShutdownFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), ToolExecutorError>> + Send + 'a>>;
 
+/// Scheduling contract sampled before one model-requested tool starts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToolExecutionMode {
+    /// Run alone and form a barrier between parallel-safe groups.
+    #[default]
+    Exclusive,
+    /// The tool's preparation/body may overlap other explicitly safe calls.
+    Parallel,
+}
+
 /// Bounded planning fact sampled before the Agent reserves durable tool events.
 ///
 /// External executors can request the ordinary profile. The crate-controlled
@@ -114,6 +124,11 @@ impl ToolClaimProfile {
     #[must_use]
     pub(crate) fn is_user_question(&self) -> bool {
         self.kind == ToolClaimKind::UserQuestion
+    }
+
+    #[must_use]
+    pub(crate) fn permits_parallel_execution(&self) -> bool {
+        self.kind == ToolClaimKind::Standard
     }
 
     pub(crate) fn action_contract(&self) -> Option<ActionContract> {
@@ -1130,6 +1145,15 @@ pub trait ToolExecutor: Send + Sync {
     /// tool round.
     fn claim_profile(&self, _tool_name: &str) -> ToolClaimProfile {
         ToolClaimProfile::standard()
+    }
+
+    /// Classify one immutable-schema tool name for scheduling.
+    ///
+    /// The default is fail-closed. Implementations opting in must return
+    /// promptly, avoid side effects, and guarantee that concurrent bodies
+    /// commute. Stateful or argument-dependent tools should stay exclusive.
+    fn execution_mode(&self, _tool_name: &str) -> ToolExecutionMode {
+        ToolExecutionMode::Exclusive
     }
 
     /// Build and promptly return a lazy future. Implementations must not perform

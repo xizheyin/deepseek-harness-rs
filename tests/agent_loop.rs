@@ -1,27 +1,29 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use deepseek_harness_cli::{
     agent::{
         AgentIdKind, AgentLimits, AgentLoop, AgentLoopConfig, AgentRuntime, AgentShutdownError,
         MAX_AGENT_ATTEMPTS_PER_TURN, MAX_AGENT_FIXED_REQUEST_BYTES,
-        MAX_AGENT_OUTPUT_TOKENS_PER_REQUEST, MAX_AGENT_REPORTED_OUTPUT_TOKENS,
-        MAX_AGENT_RETRIES_PER_STEP, MAX_AGENT_STEPS_PER_TURN, MAX_AGENT_TOOL_ARGUMENT_BYTES,
-        MAX_AGENT_TOOL_CALLS_PER_STEP, MAX_AGENT_TOOL_CALLS_PER_TURN, MAX_AGENT_TOOL_DURATION,
-        MAX_AGENT_TOOL_RESULT_BYTES, MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES,
-        MAX_AGENT_TURN_DURATION, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult,
-        ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture,
-        ToolShutdownFuture, TurnProposal,
+        MAX_AGENT_OUTPUT_TOKENS_PER_REQUEST, MAX_AGENT_PARALLEL_TOOL_CALLS,
+        MAX_AGENT_REPORTED_OUTPUT_TOKENS, MAX_AGENT_RETRIES_PER_STEP, MAX_AGENT_STEPS_PER_TURN,
+        MAX_AGENT_TOOL_ARGUMENT_BYTES, MAX_AGENT_TOOL_CALLS_PER_STEP,
+        MAX_AGENT_TOOL_CALLS_PER_TURN, MAX_AGENT_TOOL_DURATION, MAX_AGENT_TOOL_RESULT_BYTES,
+        MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES, MAX_AGENT_TURN_DURATION, ToolExecutionFuture,
+        ToolExecutionMode, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
+        ToolExecutorError, ToolPreparation, ToolPreparationFuture, ToolShutdownFuture,
+        TurnProposal,
     },
     model::{
         ContentBlock, ContentBlockKind, ContentBlockType, FinishReason, LlmCallConfig,
-        LlmCallConfigAdapterDefaults, LlmFailure, Message, MessageSource, ModelError,
-        PositiveFiniteNumber, StreamChunk, TokenUsage, ToolSchema,
+        LlmCallConfigAdapterDefaults, LlmFailure, Message, MessageSource, MessageSourceKind,
+        ModelError, PositiveFiniteNumber, StreamChunk, TokenUsage, ToolSchema,
     },
     provider::{
         ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
@@ -353,6 +355,114 @@ struct NotifyingReadyTools {
     entered: Arc<Notify>,
 }
 
+struct ParallelGatedTools {
+    gates: HashMap<String, Arc<Notify>>,
+    entered: Arc<Notify>,
+    started: Mutex<Vec<String>>,
+    settled: Mutex<Vec<String>>,
+}
+
+struct ParallelInfrastructureTools {
+    gates: HashMap<String, Arc<Notify>>,
+    failed_call_id: String,
+    entered: Arc<Notify>,
+    started: Mutex<Vec<String>>,
+    settled: Mutex<Vec<String>>,
+}
+
+impl ParallelGatedTools {
+    fn new(call_ids: &[&str]) -> Self {
+        Self {
+            gates: call_ids
+                .iter()
+                .map(|call_id| ((*call_id).to_owned(), Arc::new(Notify::new())))
+                .collect(),
+            entered: Arc::new(Notify::new()),
+            started: Mutex::new(Vec::new()),
+            settled: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn release(&self, call_id: &str) {
+        self.gates.get(call_id).unwrap().notify_one();
+    }
+
+    async fn wait_for_started(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = self.entered.notified();
+                if self.started.lock().unwrap().len() >= count {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("parallel tools did not start in time");
+    }
+
+    async fn wait_for_settled(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = self.entered.notified();
+                if self.settled.lock().unwrap().len() >= count {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("parallel tools did not settle in time");
+    }
+}
+
+impl ParallelInfrastructureTools {
+    fn new(call_ids: &[&str], failed_call_id: &str) -> Self {
+        Self {
+            gates: call_ids
+                .iter()
+                .map(|call_id| ((*call_id).to_owned(), Arc::new(Notify::new())))
+                .collect(),
+            failed_call_id: failed_call_id.to_owned(),
+            entered: Arc::new(Notify::new()),
+            started: Mutex::new(Vec::new()),
+            settled: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn release(&self, call_id: &str) {
+        self.gates.get(call_id).unwrap().notify_one();
+    }
+
+    async fn wait_for_started(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = self.entered.notified();
+                if self.started.lock().unwrap().len() >= count {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("parallel infrastructure tools did not start in time");
+    }
+
+    async fn wait_for_settled(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notified = self.entered.notified();
+                if self.settled.lock().unwrap().len() >= count {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("parallel infrastructure tools did not settle in time");
+    }
+}
+
 struct FailingShutdownTools {
     calls: Arc<AtomicUsize>,
 }
@@ -661,6 +771,84 @@ impl ToolExecutor for NotifyingReadyTools {
     }
 }
 
+impl ToolExecutor for ParallelGatedTools {
+    fn execution_mode(&self, tool_name: &str) -> ToolExecutionMode {
+        if tool_name == "calculator" {
+            ToolExecutionMode::Parallel
+        } else {
+            ToolExecutionMode::Exclusive
+        }
+    }
+
+    fn execute(
+        &self,
+        request: ToolExecutionRequest,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        let call_id = request.call_id().to_string();
+        let gate = self.gates.get(&call_id).cloned();
+        Box::pin(async move {
+            self.started.lock().unwrap().push(call_id.clone());
+            self.entered.notify_waiters();
+            if let Some(gate) = gate {
+                tokio::select! {
+                    () = gate.notified() => {}
+                    () = cancellation.cancelled() => {
+                        return Err(ToolExecutorError::new("cancelled gated read"));
+                    }
+                }
+            }
+            self.settled.lock().unwrap().push(call_id.clone());
+            self.entered.notify_waiters();
+            ToolExecutionResult::success(vec![
+                ContentBlock::text(format!("done-{call_id}")).unwrap(),
+            ])
+            .map_err(|error| ToolExecutorError::new(error.to_string()))
+        })
+    }
+}
+
+impl ToolExecutor for ParallelInfrastructureTools {
+    fn execution_mode(&self, tool_name: &str) -> ToolExecutionMode {
+        if tool_name == "calculator" {
+            ToolExecutionMode::Parallel
+        } else {
+            ToolExecutionMode::Exclusive
+        }
+    }
+
+    fn execute(
+        &self,
+        request: ToolExecutionRequest,
+        cancellation: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        let call_id = request.call_id().to_string();
+        let gate = self.gates.get(&call_id).cloned();
+        Box::pin(async move {
+            self.started.lock().unwrap().push(call_id.clone());
+            self.entered.notify_waiters();
+            if let Some(gate) = gate {
+                tokio::select! {
+                    () = gate.notified() => {}
+                    () = cancellation.cancelled() => {
+                        return Err(ToolExecutorError::new("cancelled infrastructure probe"));
+                    }
+                }
+            }
+            self.settled.lock().unwrap().push(call_id.clone());
+            self.entered.notify_waiters();
+            if call_id == self.failed_call_id {
+                Err(ToolExecutorError::new("private executor failure"))
+            } else {
+                ToolExecutionResult::success(vec![
+                    ContentBlock::text(format!("done-{call_id}")).unwrap(),
+                ])
+                .map_err(|error| ToolExecutorError::new(error.to_string()))
+            }
+        })
+    }
+}
+
 fn user(text: &str) -> Message {
     user_with_id("user-1", text)
 }
@@ -724,6 +912,17 @@ fn many_tool_response(count: usize) -> Vec<StreamChunk> {
     for index in 0..count {
         let call_id = format!("call-{index}");
         let block = ContentBlock::tool_call(call_id.as_str(), "calculator", "{}").unwrap();
+        chunks.push(StreamChunk::block_start(index as u64, ContentBlockType::ToolCall).unwrap());
+        chunks.push(StreamChunk::block_end(index as u64, block).unwrap());
+    }
+    chunks.push(StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap());
+    chunks
+}
+
+fn named_tool_round_response(calls: &[(&str, &str)]) -> Vec<StreamChunk> {
+    let mut chunks = Vec::with_capacity(calls.len() * 2 + 1);
+    for (index, (call_id, name)) in calls.iter().enumerate() {
+        let block = ContentBlock::tool_call(*call_id, *name, "{}").unwrap();
         chunks.push(StreamChunk::block_start(index as u64, ContentBlockType::ToolCall).unwrap());
         chunks.push(StreamChunk::block_end(index as u64, block).unwrap());
     }
@@ -1232,6 +1431,23 @@ fn config() -> AgentLoopConfig {
         .unwrap()
 }
 
+fn config_with_tool_names(names: &[&str]) -> AgentLoopConfig {
+    let tools = names
+        .iter()
+        .map(|name| {
+            ToolSchema::new(
+                *name,
+                format!("test tool {name}"),
+                deepseek_harness_cli::model::JsonValue::new(json!({"type":"object"})).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(tools)
+        .unwrap()
+}
+
 fn todo_config() -> AgentLoopConfig {
     let schema = ToolSchema::new(
         "todo_write",
@@ -1497,6 +1713,311 @@ async fn one_tool_result_becomes_the_next_steps_model_context() {
     assert_eq!(requests[0].len(), 1);
     assert_eq!(requests[1].len(), 3);
     assert_eq!(agent.session().messages().len(), 4);
+}
+
+#[tokio::test]
+async fn parallel_safe_tools_use_a_rolling_cap_and_commit_results_in_model_order() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        many_tool_response(3),
+        text_response("done"),
+    ]));
+    let tools = Arc::new(ParallelGatedTools::new(&["call-0", "call-1", "call-2"]));
+    let limits = AgentLimits::default()
+        .with_max_parallel_tool_calls(2)
+        .unwrap();
+    let mut agent = AgentLoop::with_runtime(
+        session("parallel-rolling"),
+        provider.clone(),
+        tools.clone(),
+        Arc::new(FixedRuntime::default()),
+        config().with_limits(limits),
+    )
+    .unwrap();
+
+    let (outcome, ()) = tokio::join! {
+        agent.run_turn(
+            TurnProposal::Enter(vec![user("read three things")]),
+            CancellationToken::new(),
+        ),
+        async {
+            tools.wait_for_started(2).await;
+            assert_eq!(tools.started.lock().unwrap().as_slice(), ["call-0", "call-1"]);
+            tools.release("call-1");
+            tools.wait_for_settled(1).await;
+            tools.wait_for_started(3).await;
+            assert_eq!(
+                tools.started.lock().unwrap().as_slice(),
+                ["call-0", "call-1", "call-2"]
+            );
+            tools.release("call-0");
+            tools.wait_for_settled(2).await;
+            tools.release("call-2");
+        },
+    };
+    let outcome = outcome.unwrap();
+    assert_eq!(outcome.reason(), &TurnEndReason::Completed);
+
+    let order = agent
+        .session()
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::ToolCall { call_id, .. } => Some(format!("call:{call_id}")),
+            EventKind::ToolResult { message, .. } => {
+                let MessageSourceKind::Tool { call_id } = message.source().kind() else {
+                    return None;
+                };
+                Some(format!("result:{call_id}"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order,
+        [
+            "call:call-0",
+            "call:call-1",
+            "call:call-2",
+            "result:call-0",
+            "result:call-1",
+            "result:call-2",
+        ]
+    );
+    let requests = provider.requests();
+    let results = requests[1]
+        .iter()
+        .flat_map(Message::content)
+        .filter_map(|block| match block.kind() {
+            ContentBlockKind::ToolResult { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results, ["call-0", "call-1", "call-2"]);
+}
+
+#[tokio::test]
+async fn exclusive_tools_are_barriers_between_parallel_safe_groups() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        named_tool_round_response(&[
+            ("call-0", "calculator"),
+            ("call-1", "exclusive"),
+            ("call-2", "calculator"),
+        ]),
+        text_response("done"),
+    ]));
+    let tools = Arc::new(ParallelGatedTools::new(&["call-0", "call-2"]));
+    let mut agent = AgentLoop::with_runtime(
+        session("parallel-barrier"),
+        provider,
+        tools.clone(),
+        Arc::new(FixedRuntime::default()),
+        config_with_tool_names(&["calculator", "exclusive"]),
+    )
+    .unwrap();
+
+    let (outcome, ()) = tokio::join! {
+        agent.run_turn(
+            TurnProposal::Enter(vec![user("respect the barrier")]),
+            CancellationToken::new(),
+        ),
+        async {
+            tools.wait_for_started(1).await;
+            assert_eq!(tools.started.lock().unwrap().as_slice(), ["call-0"]);
+            tools.release("call-0");
+            tools.wait_for_started(3).await;
+            assert_eq!(
+                tools.started.lock().unwrap().as_slice(),
+                ["call-0", "call-1", "call-2"]
+            );
+            tools.release("call-2");
+        },
+    };
+    assert_eq!(outcome.unwrap().reason(), &TurnEndReason::Completed);
+
+    let order = agent
+        .session()
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::ToolCall { call_id, .. } => Some(format!("call:{call_id}")),
+            EventKind::ToolResult { message, .. } => {
+                let MessageSourceKind::Tool { call_id } = message.source().kind() else {
+                    return None;
+                };
+                Some(format!("result:{call_id}"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order,
+        [
+            "call:call-0",
+            "result:call-0",
+            "call:call-1",
+            "result:call-1",
+            "call:call-2",
+            "result:call-2",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cancelling_parallel_tools_drains_started_calls_and_skips_pool_refill() {
+    let cancellation = CancellationToken::new();
+    let provider = Arc::new(FakeProvider::new(vec![many_tool_response(4)]));
+    let tools = Arc::new(ParallelGatedTools::new(&[
+        "call-0", "call-1", "call-2", "call-3",
+    ]));
+    let limits = AgentLimits::default()
+        .with_max_parallel_tool_calls(2)
+        .unwrap();
+    let mut agent = AgentLoop::with_runtime(
+        session("parallel-cancel"),
+        provider,
+        tools.clone(),
+        Arc::new(FixedRuntime::default()),
+        config().with_limits(limits),
+    )
+    .unwrap();
+    let turn_cancellation = cancellation.clone();
+
+    let handle = tokio::spawn(async move {
+        let outcome = agent
+            .run_turn(
+                TurnProposal::Enter(vec![user("cancel the parallel tools")]),
+                turn_cancellation,
+            )
+            .await
+            .unwrap();
+        (agent, outcome)
+    });
+    tools.wait_for_started(2).await;
+    cancellation.cancel();
+    let (agent, outcome) = handle.await.unwrap();
+
+    assert!(matches!(outcome.reason(), TurnEndReason::Aborted { .. }));
+    assert_eq!(
+        tools.started.lock().unwrap().as_slice(),
+        ["call-0", "call-1"]
+    );
+    let calls = agent
+        .session()
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind(), EventKind::ToolCall { .. }))
+        .count();
+    let codes = agent
+        .session()
+        .events()
+        .iter()
+        .filter_map(|event| match event.kind() {
+            EventKind::ToolResult {
+                error: Some(error), ..
+            } => Some(error.code.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls, 4);
+    assert_eq!(codes.iter().filter(|code| **code == "ABORTED").count(), 2);
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|code| **code == "ABORTED_BEFORE_DISPATCH")
+            .count(),
+        2
+    );
+    assert_eq!(agent.session().state().open_turn(), None);
+}
+
+#[tokio::test]
+async fn parallel_infrastructure_failure_drains_started_calls_before_returning() {
+    let provider = Arc::new(FakeProvider::new(vec![many_tool_response(3)]));
+    let tools = Arc::new(ParallelInfrastructureTools::new(
+        &["call-0", "call-1", "call-2"],
+        "call-0",
+    ));
+    let limits = AgentLimits::default()
+        .with_max_parallel_tool_calls(2)
+        .unwrap();
+    let mut agent = AgentLoop::with_runtime(
+        session("parallel-infrastructure"),
+        provider,
+        tools.clone(),
+        Arc::new(FixedRuntime::default()),
+        config().with_limits(limits),
+    )
+    .unwrap();
+
+    let handle = tokio::spawn(async move {
+        let outcome = agent
+            .run_turn(
+                TurnProposal::Enter(vec![user("fail one parallel tool")]),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        (agent, outcome)
+    });
+    tools.wait_for_started(2).await;
+    tools.release("call-0");
+    tools.wait_for_settled(1).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !handle.is_finished(),
+        "the second started tool must be drained"
+    );
+    tools.release("call-1");
+    tools.wait_for_settled(2).await;
+    let (agent, outcome) = handle.await.unwrap();
+
+    assert!(matches!(
+        outcome.reason(),
+        TurnEndReason::Error { error } if error.code() == "AGENT_TOOL_EXECUTOR"
+    ));
+    assert_eq!(
+        tools.started.lock().unwrap().as_slice(),
+        ["call-0", "call-1"]
+    );
+    assert_eq!(
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter(|event| matches!(event.kind(), EventKind::ToolCall { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(
+        agent
+            .session()
+            .events()
+            .iter()
+            .filter(|event| matches!(event.kind(), EventKind::ToolResult { .. }))
+            .count(),
+        0
+    );
+    assert_eq!(agent.session().state().open_turn(), None);
+}
+
+#[test]
+fn parallel_tool_limit_matches_the_upstream_default_and_rust_ceiling() {
+    assert_eq!(AgentLimits::default().max_parallel_tool_calls(), 10);
+    assert!(
+        AgentLimits::default()
+            .with_max_parallel_tool_calls(1)
+            .is_ok()
+    );
+    assert!(
+        AgentLimits::default()
+            .with_max_parallel_tool_calls(0)
+            .is_err()
+    );
+    assert!(
+        AgentLimits::default()
+            .with_max_parallel_tool_calls(MAX_AGENT_TOOL_CALLS_PER_STEP + 1)
+            .is_err()
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -3345,6 +3866,11 @@ fn agent_limit_builders_enforce_every_public_hard_ceiling() {
         with_max_tool_calls_per_turn,
         0,
         MAX_AGENT_TOOL_CALLS_PER_TURN
+    );
+    check_usize_limit!(
+        with_max_parallel_tool_calls,
+        1,
+        MAX_AGENT_PARALLEL_TOOL_CALLS
     );
     check_usize_limit!(
         with_max_tool_argument_bytes,

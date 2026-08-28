@@ -69,6 +69,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 能力 | 当前实现 |
 | --- | --- |
 | 多步骤 Agent Loop | 流式接收 DeepSeek 响应，关联 reasoning、文本、工具调用、结果、usage 和结束原因 |
+| 只读工具并行（实验性） | 同一步中的独立 `read`、`web_search`、`web_fetch` 最多 10 个并行；结果仍按模型原顺序进入会话，其他工具保持独占执行 |
 | 代码理解 | 工作区内的 `list`、`glob`、`grep` 和 `read`，输出和扫描范围均有上限 |
 | 联网工具（实验性） | `web_search` 并发执行 1–4 个 DeepSeek 原生查询并公平合并最多 8 个来源；`web_fetch` 匿名读取一个经过公网地址校验的 HTTP(S) 页面；两者均无需额外审批 |
 | 项目指令（实验性） | 有界加载用户级、根目录及已触达嵌套目录的 `AGENTS.md` / `CLAUDE.md`，写入会话并在恢复或文件工具成功后检查变化 |
@@ -164,6 +165,12 @@ Plan Mode 并让你先发消息。也可以在空闲时用 `/plan off` 手动退
 安全转换的结构不会原样交给模型。非 UTF-8 页面只支持 ASCII、ISO-8859-1/Windows-1252
 这组常见标签。搜索和抓取都是只读能力，因此不会弹出文件、Shell 或插件审批；网页文字仍
 可能包含恶意提示，模型只应把它当资料，并引用相关 URL。
+
+如果模型在同一个步骤里发出多个互不依赖的 `read`、`web_search` 或 `web_fetch`，`dsh`
+会在最多 10 个在途调用的上限内重叠等待，以减少文件或网络往返时间。调用意图仍先写入
+Session，结果和下一次模型上下文仍按模型给出的调用顺序提交。`list`、`glob`、`grep`、
+补丁、Shell、插件、Goal、Plan、Todo 和提问不会并行，并且会成为前后两组只读调用之间的
+顺序栅栏；这不是后台任务，也不会让一个 Agent 同时运行多个回合。
 
 当模型确实缺少必须由你决定的信息时，可以调用 `ask_user_question`。一次调用最多包含
 3 个问题，终端按顺序逐个显示。每题可以提供 2–4 个单选项，也可以不提供选项而直接
@@ -372,6 +379,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | Phase 27 | 已完成：空闲 `/compact`、独立空 turn 压缩事务、失败/取消不改写对话；仅做本机必要验证 |
 | Phase 28 | 已完成：固定上游单查询 `web_search`、独立 DeepSeek 搜索端点、有界来源和取消/超时；仅做本机必要验证 |
 | Phase 29 | 已完成：最新版上游的多查询合并与安全公网 `web_fetch`；仅做本机必要验证 |
+| Phase 30 | 已完成：有界的只读工具滚动并行、独占栅栏、顺序结果与取消/故障收尾；仅做本机必要验证 |
 
 Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHub-hosted
 `macos-14` arm64 和 `ubuntu-24.04` x86_64 的完整仓库检查、v0.1 安装版旅程与插件
@@ -385,6 +393,7 @@ Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHu
 - 当前只支持从源码安装，包没有发布到 crates.io，也没有预编译下载或 Homebrew formula；
 - Provider 只有 DeepSeek；不支持 MCP、Hooks、Skills、子智能体或后台任务；
 - `web_fetch` 只做匿名、无脚本的公网 HTTP(S) 文本读取，不使用登录态、Cookie、代理、JavaScript 或浏览器会话；跨源跳转必须由模型再次明确调用；
+- 并行调度只对白名单中的 `read`、`web_search`、`web_fetch` 生效；它不会并发写入、Shell、插件、人工交互或多个 Agent 回合；
 - Plan Mode 是提示词约束，不是沙箱；不支持图片，也不能在正在运行的同一回合里用命令切换模式；
 - 模型任务列表是整表替换、最多 64 项且只能有一个进行中任务；它不启动并行 worker，也没有 Web 折叠控件；
 - 项目指令只发现用户级、工作区根目录和可信内置文件工具已触达的嵌套目录，不读取符号链接；跨进程恢复只能从仍可见的会话事实重建嵌套范围；
@@ -439,7 +448,9 @@ DeepSeek。三条命令也会在发布 CI 中运行。贡献前请阅读
 - [Phase 10 插件设计](docs/design/subprocess-tool-plugins.md)
 - [Phase 10 验收进度](docs/validation/phase-10.md)
 - [Phase 29 Web 工具设计](docs/design/web-fetch.md)
+- [Phase 30 并行工具调度设计](docs/design/parallel-tool-scheduling.md)
 - [Phase 29 本机验收记录](docs/validation/phase-29.md)
+- [Phase 30 本机验收记录](docs/validation/phase-30.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 

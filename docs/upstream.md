@@ -1792,6 +1792,35 @@ HTML/charset implementation, ordinary tool call/result Session facts, and the
 generic terminal card. These differences and their local tests are specified
 in `docs/design/web-fetch.md`.
 
+## Phase 30 parallel-safe tool scheduling inspection — 2026-08-29
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/core/agent-loop/src/{tool-calls,constants,index}.ts` and its README
+  for exclusive barriers, the bounded rolling pool, default cap ten, live
+  classification, model-order finalization, cancellation drain, undispatched
+  synthetic results, and scheduler-failure quiescence;
+- `packages/core/agent-loop/tests/tool-calls.spec.ts` for concurrent starts,
+  safe/exclusive/safe groups, rolling refill, cap one, out-of-order settlement,
+  result/context order, cancellation before/during dispatch, skipped calls, and
+  failure drain; `tests/tool-order.spec.ts` separately confirms canonical tool
+  schema order and is not changed by execution concurrency;
+- `packages/core/tools/src/index.ts` and its README for fail-closed
+  `isConcurrencySafe(args)`: only exact `true` is parallel, while absent,
+  invalid, unknown, or throwing classification is exclusive;
+- `packages/fs/tool-fs/src/{read,read-image}.ts` and README plus
+  `packages/web/tool-web/src/{search,fetch}.ts` and README for the fixed built-in
+  opt-ins. Fixed list/glob/grep, mutations, Shell, Goal, Todo, questions, and
+  compaction commands do not opt in.
+
+Latest inspected master `cd5ef8148158c3a752a658978873241fdf8e2bbc`
+retains `tool-calls.ts` and `constants.ts` unchanged. Its current standard
+preset still composes file read and Web tools under this scheduler; unrelated
+default background jobs, Skills, subagents, and workflows remain explicitly
+outside the Rust product scope. Phase 30 therefore targets only the core
+parallel-safe scheduler and records Rust's immutable name-based classifier and
+fixed-per-Agent cap in `docs/design/parallel-tool-scheduling.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

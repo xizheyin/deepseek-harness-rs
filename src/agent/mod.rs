@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -68,8 +68,9 @@ pub(crate) use tool::{
 pub use tool::{
     MutationDeclineReason, NoTools, PreparedToolAction, PreparedToolActionSetup,
     PreparedToolMutation, ToolClaimProfile, ToolCommitDisposition, ToolCommitFn, ToolCommitOutcome,
-    ToolDeclineFn, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
-    ToolExecutorError, ToolPreparation, ToolPreparationFuture, ToolShutdownFuture,
+    ToolDeclineFn, ToolExecutionFuture, ToolExecutionMode, ToolExecutionRequest,
+    ToolExecutionResult, ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture,
+    ToolShutdownFuture,
 };
 
 use assembler::{AssembledAssistant, without_tool_calls};
@@ -83,6 +84,8 @@ pub const MAX_AGENT_ATTEMPTS_PER_TURN: usize = 64;
 pub const MAX_AGENT_RETRIES_PER_STEP: usize = 8;
 pub const MAX_AGENT_TOOL_CALLS_PER_STEP: usize = 64;
 pub const MAX_AGENT_TOOL_CALLS_PER_TURN: usize = 256;
+/// Maximum in-flight calls allowed for an explicitly parallel-safe group.
+pub const MAX_AGENT_PARALLEL_TOOL_CALLS: usize = MAX_AGENT_TOOL_CALLS_PER_STEP;
 pub const MAX_AGENT_OUTPUT_TOKENS_PER_REQUEST: u64 = 1_000_000;
 pub const MAX_AGENT_REPORTED_OUTPUT_TOKENS: u64 = 4_000_000;
 pub const MAX_AGENT_TURN_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
@@ -110,6 +113,7 @@ pub struct AgentLimits {
     max_retries_per_step: usize,
     max_tool_calls_per_step: usize,
     max_tool_calls_per_turn: usize,
+    max_parallel_tool_calls: usize,
     max_output_tokens_per_request: u64,
     max_reported_output_tokens_per_turn: u64,
     turn_duration: Duration,
@@ -127,6 +131,7 @@ impl Default for AgentLimits {
             max_retries_per_step: 8,
             max_tool_calls_per_step: 16,
             max_tool_calls_per_turn: 64,
+            max_parallel_tool_calls: 10,
             max_output_tokens_per_request: MAX_AGENT_OUTPUT_TOKENS_PER_REQUEST,
             max_reported_output_tokens_per_turn: 1_000_000,
             turn_duration: Duration::from_secs(30 * 60),
@@ -181,6 +186,17 @@ impl AgentLimits {
             MAX_AGENT_TOOL_CALLS_PER_TURN,
         )?;
         self.max_tool_calls_per_turn = value;
+        Ok(self)
+    }
+
+    pub fn with_max_parallel_tool_calls(mut self, value: usize) -> Result<Self, AgentBuildError> {
+        validate_usize_limit(
+            "max_parallel_tool_calls",
+            value,
+            1,
+            MAX_AGENT_PARALLEL_TOOL_CALLS,
+        )?;
+        self.max_parallel_tool_calls = value;
         Ok(self)
     }
 
@@ -283,6 +299,11 @@ impl AgentLimits {
     #[must_use]
     pub fn max_tool_calls_per_turn(&self) -> usize {
         self.max_tool_calls_per_turn
+    }
+
+    #[must_use]
+    pub fn max_parallel_tool_calls(&self) -> usize {
+        self.max_parallel_tool_calls
     }
 
     #[must_use]
@@ -2955,6 +2976,48 @@ struct PlannedTool {
     result_claim: EventClaim,
 }
 
+#[derive(Clone)]
+struct ToolRunPlan {
+    call: ToolCall,
+    claim_profile: ToolClaimProfile,
+    dispatch: ToolDispatchBinding,
+}
+
+impl From<&PlannedTool> for ToolRunPlan {
+    fn from(plan: &PlannedTool) -> Self {
+        Self {
+            call: plan.call.clone(),
+            claim_profile: plan.claim_profile.clone(),
+            dispatch: plan.dispatch.clone(),
+        }
+    }
+}
+
+trait ToolPlanView {
+    fn call(&self) -> &ToolCall;
+    fn claim_profile(&self) -> &ToolClaimProfile;
+}
+
+impl ToolPlanView for PlannedTool {
+    fn call(&self) -> &ToolCall {
+        &self.call
+    }
+
+    fn claim_profile(&self) -> &ToolClaimProfile {
+        &self.claim_profile
+    }
+}
+
+impl ToolPlanView for ToolRunPlan {
+    fn call(&self) -> &ToolCall {
+        &self.call
+    }
+
+    fn claim_profile(&self) -> &ToolClaimProfile {
+        &self.claim_profile
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_tool_round(
     reservation: &mut SessionReservation<'_>,
@@ -3098,9 +3161,51 @@ async fn commit_tool_round(
     let mut infrastructure_failure = None;
     let mut latched_stop = ToolStop::None;
     let mut pending_goal_wrapup = None;
-    for index in 0..planned.len() {
-        let (completed, remaining) = planned.split_at_mut(index + 1);
-        let plan = &mut completed[index];
+    let mut index = 0_usize;
+    while index < planned.len() {
+        if infrastructure_failure.is_none()
+            && !cancelled
+            && !driver.observer_unavailable
+            && driver.durable_limit.is_none()
+            && !cancellation.is_cancelled()
+            && planned_execution_mode(driver.tools, &planned[index]) == ToolExecutionMode::Parallel
+        {
+            let group_end = (index + 1..planned.len())
+                .find(|candidate| {
+                    planned_execution_mode(driver.tools, &planned[*candidate])
+                        != ToolExecutionMode::Parallel
+                })
+                .unwrap_or(planned.len());
+            let outcome = run_parallel_tool_group(
+                reservation,
+                driver,
+                turn,
+                step,
+                &mut planned[index..group_end],
+                cancellation,
+            )
+            .await?;
+            concludes_turn |= outcome.concludes_turn;
+            cancelled |= outcome.cancelled;
+            latched_stop = latch_tool_stop(latched_stop, outcome.latched_stop);
+            if let Some(error) = outcome.infrastructure_failure {
+                if let Some(local_index) = outcome.memory_unresolved_index {
+                    release_parallel_unresolved(reservation, &mut planned, index + local_index)?;
+                    return Ok(StepResolution::with_stop(
+                        StepOutcome::Error(error),
+                        latched_stop,
+                    ));
+                }
+                infrastructure_failure = Some(error);
+            }
+            index = group_end;
+            continue;
+        }
+
+        let current_index = index;
+        index += 1;
+        let (completed, remaining) = planned.split_at_mut(current_index + 1);
+        let plan = &mut completed[current_index];
         let actual_call_seq = reservation
             .settle_exact_settled(&mut plan.call_claim)
             .await?
@@ -3165,7 +3270,12 @@ async fn commit_tool_round(
                 ToolStop::None,
             )
         } else {
-            run_one_tool(driver, plan, cancellation).await
+            run_one_tool(
+                ToolRunEnvironment::from_driver(driver),
+                ToolRunPlan::from(&*plan),
+                cancellation.clone(),
+            )
+            .await
         };
         match result {
             ToolRun::Completed {
@@ -3504,7 +3614,7 @@ async fn commit_tool_round(
                 )?);
             }
         }
-        if (index + 1) % AGENT_READY_WORK_BUDGET == 0 {
+        if index % AGENT_READY_WORK_BUDGET == 0 {
             // A group of immediately-ready tool bodies must still give the
             // owning CLI a chance to deliver cancellation before the next one.
             tokio::task::yield_now().await;
@@ -3672,20 +3782,423 @@ enum ResultSettlement {
     PreferredRequired,
 }
 
-async fn run_one_tool(
-    driver: &Driver<'_>,
-    plan: &PlannedTool,
+fn planned_execution_mode(tools: &dyn ToolExecutor, plan: &PlannedTool) -> ToolExecutionMode {
+    if !plan.claim_profile.permits_parallel_execution() {
+        return ToolExecutionMode::Exclusive;
+    }
+    match catch_unwind(AssertUnwindSafe(|| {
+        tools.execution_mode(plan.call.name.as_str())
+    })) {
+        Ok(ToolExecutionMode::Parallel) => ToolExecutionMode::Parallel,
+        Ok(ToolExecutionMode::Exclusive) | Err(_) => ToolExecutionMode::Exclusive,
+    }
+}
+
+struct ParallelToolGroupOutcome {
+    cancelled: bool,
+    concludes_turn: bool,
+    infrastructure_failure: Option<LlmFailure>,
+    latched_stop: ToolStop,
+    memory_unresolved_index: Option<usize>,
+}
+
+struct ParallelCommitOutcome {
+    cancelled: bool,
+    concludes_turn: bool,
+    infrastructure_failure: Option<LlmFailure>,
+    stop: ToolStop,
+    memory_unresolved: bool,
+}
+
+async fn run_parallel_tool_group(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    turn: TurnId,
+    step: StepId,
+    group: &mut [PlannedTool],
     cancellation: &CancellationToken,
+) -> Result<ParallelToolGroupOutcome, AgentLoopError> {
+    let mut outcome = ParallelToolGroupOutcome {
+        cancelled: false,
+        concludes_turn: false,
+        infrastructure_failure: None,
+        latched_stop: ToolStop::None,
+        memory_unresolved_index: None,
+    };
+    let mut slots: Vec<Option<ToolRun>> = (0..group.len()).map(|_| None).collect();
+    let mut in_flight = FuturesUnordered::new();
+    let mut next_to_start = 0_usize;
+    let mut next_to_commit = 0_usize;
+    let mut stop_starting = false;
+
+    loop {
+        while !stop_starting
+            && next_to_start < group.len()
+            && in_flight.len() < driver.config.limits.max_parallel_tool_calls
+        {
+            if driver.durable_limit.is_some()
+                || driver.observer_unavailable
+                || cancellation.is_cancelled()
+                || Instant::now() >= driver.deadline
+            {
+                stop_starting = true;
+                break;
+            }
+            let plan = &mut group[next_to_start];
+            let barrier = commit_tool_call_intent(reservation, plan, turn, step).await?;
+            if barrier == DispatchBarrier::ObserverUnavailable {
+                driver.observer_unavailable = true;
+                slots[next_to_start] = Some(prestart_failure(
+                    plan,
+                    "ABORTED_BEFORE_DISPATCH",
+                    "tool was not started because the live session observer became unavailable",
+                    ToolStop::None,
+                ));
+                stop_starting = true;
+            } else {
+                let environment = ToolRunEnvironment::from_driver(driver);
+                let run_plan = ToolRunPlan::from(&*plan);
+                let child = cancellation.clone();
+                let local_index = next_to_start;
+                in_flight.push(async move {
+                    (
+                        local_index,
+                        run_one_tool(environment, run_plan, child).await,
+                    )
+                });
+            }
+            next_to_start += 1;
+        }
+
+        commit_ready_parallel_results(
+            reservation,
+            driver,
+            group,
+            &mut slots,
+            &mut next_to_commit,
+            &mut outcome,
+            &mut stop_starting,
+        )
+        .await?;
+
+        if outcome.memory_unresolved_index.is_some() {
+            stop_starting = true;
+        }
+        if cancellation.is_cancelled() {
+            outcome.cancelled = true;
+            outcome.latched_stop = latch_tool_stop(outcome.latched_stop, ToolStop::Cancelled);
+            stop_starting = true;
+        } else if Instant::now() >= driver.deadline {
+            outcome.latched_stop = latch_tool_stop(outcome.latched_stop, ToolStop::TurnTimeout);
+            if outcome.infrastructure_failure.is_none() {
+                outcome.infrastructure_failure = Some(failure_reason(
+                    "AGENT_TURN_TIMEOUT",
+                    "the agent turn timed out",
+                )?);
+            }
+            stop_starting = true;
+        }
+
+        if in_flight.is_empty() {
+            if stop_starting || next_to_start == group.len() {
+                break;
+            }
+            continue;
+        }
+
+        let Some((settled_index, run)) = in_flight.next().await else {
+            return Err(AgentLoopError::Invariant(
+                "parallel tool pool lost an in-flight future",
+            ));
+        };
+        if tool_run_stops_parallel_group(&run) {
+            stop_starting = true;
+        }
+        slots[settled_index] = Some(run);
+    }
+
+    // The loop exits only after every started future settles. Commit every
+    // remaining model-ordered slot unless an in-memory infrastructure failure
+    // intentionally preserves the unresolved started-call prefix.
+    commit_ready_parallel_results(
+        reservation,
+        driver,
+        group,
+        &mut slots,
+        &mut next_to_commit,
+        &mut outcome,
+        &mut stop_starting,
+    )
+    .await?;
+
+    if outcome.memory_unresolved_index.is_none() {
+        while next_to_start < group.len() {
+            let plan = &mut group[next_to_start];
+            let _ = commit_tool_call_intent(reservation, plan, turn, step).await?;
+            settle_model_error(
+                reservation,
+                plan,
+                turn,
+                step,
+                "ABORTED_BEFORE_DISPATCH",
+                "tool was not started because the turn was stopping",
+            )
+            .await?;
+            next_to_start += 1;
+        }
+    }
+
+    Ok(outcome)
+}
+
+async fn commit_ready_parallel_results(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    group: &mut [PlannedTool],
+    slots: &mut [Option<ToolRun>],
+    next_to_commit: &mut usize,
+    outcome: &mut ParallelToolGroupOutcome,
+    stop_starting: &mut bool,
+) -> Result<(), AgentLoopError> {
+    while outcome.memory_unresolved_index.is_none() && *next_to_commit < slots.len() {
+        let Some(run) = slots[*next_to_commit].take() else {
+            break;
+        };
+        let committed =
+            settle_parallel_tool_run(reservation, driver, &mut group[*next_to_commit], run).await?;
+        outcome.cancelled |= committed.cancelled;
+        outcome.concludes_turn |= committed.concludes_turn;
+        outcome.latched_stop = latch_tool_stop(outcome.latched_stop, committed.stop);
+        if let Some(failure) = committed.infrastructure_failure {
+            outcome.infrastructure_failure.get_or_insert(failure);
+            *stop_starting = true;
+        }
+        if committed.cancelled || committed.stop != ToolStop::None {
+            *stop_starting = true;
+        }
+        if committed.memory_unresolved {
+            outcome.memory_unresolved_index = Some(*next_to_commit);
+        }
+        *next_to_commit += 1;
+        if *next_to_commit % AGENT_READY_WORK_BUDGET == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
+async fn settle_parallel_tool_run(
+    reservation: &mut SessionReservation<'_>,
+    driver: &mut Driver<'_>,
+    plan: &mut PlannedTool,
+    run: ToolRun,
+) -> Result<ParallelCommitOutcome, AgentLoopError> {
+    match run {
+        ToolRun::Completed {
+            result,
+            settlement,
+            stop,
+        } => {
+            let requested_conclusion = result.concludes_turn();
+            let committed =
+                settle_tool_result(reservation, driver, plan, result, settlement).await?;
+            Ok(ParallelCommitOutcome {
+                cancelled: stop == ToolStop::Cancelled,
+                concludes_turn: requested_conclusion && committed,
+                infrastructure_failure: (stop == ToolStop::TurnTimeout)
+                    .then(|| failure_reason("AGENT_TURN_TIMEOUT", "the agent turn timed out"))
+                    .transpose()?,
+                stop,
+                memory_unresolved: false,
+            })
+        }
+        ToolRun::ModelError { code, message } => {
+            settle_model_error(
+                reservation,
+                plan,
+                plan_turn(plan, reservation)?,
+                plan_step(plan, reservation)?,
+                code,
+                message,
+            )
+            .await?;
+            Ok(ParallelCommitOutcome {
+                cancelled: code == "ABORTED",
+                concludes_turn: false,
+                infrastructure_failure: None,
+                stop: if code == "ABORTED" {
+                    ToolStop::Cancelled
+                } else {
+                    ToolStop::None
+                },
+                memory_unresolved: false,
+            })
+        }
+        ToolRun::TurnTimeout => {
+            let turn = plan_turn(plan, reservation)?;
+            let step = plan_step(plan, reservation)?;
+            let preferred = tool_error_event(
+                turn,
+                step,
+                &plan.result_message_id,
+                &plan.call,
+                plan.call_seq,
+                "ABORTED",
+                "AbortError",
+                "tool was stopped because the agent turn timed out",
+            )?;
+            reservation
+                .settle_settled(&mut plan.result_claim, preferred)
+                .await?;
+            Ok(ParallelCommitOutcome {
+                cancelled: false,
+                concludes_turn: false,
+                infrastructure_failure: Some(failure_reason(
+                    "AGENT_TURN_TIMEOUT",
+                    "the agent turn timed out",
+                )?),
+                stop: ToolStop::TurnTimeout,
+                memory_unresolved: false,
+            })
+        }
+        ToolRun::Infrastructure { stop } | ToolRun::ActionUnresolved { stop } => {
+            settle_parallel_infrastructure(reservation, plan, stop).await
+        }
+        ToolRun::Goal(mutation) => {
+            drop(mutation);
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+        ToolRun::PlanExit { exit, result } => {
+            drop((exit, result));
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+        ToolRun::TodoWrite { todos, result } => {
+            drop((todos, result));
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+        ToolRun::Mutation(mutation) => {
+            drop(mutation);
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+        ToolRun::Action(action) => {
+            drop(action);
+            settle_parallel_infrastructure(reservation, plan, ToolStop::None).await
+        }
+    }
+}
+
+async fn settle_parallel_infrastructure(
+    reservation: &mut SessionReservation<'_>,
+    plan: &mut PlannedTool,
+    stop: ToolStop,
+) -> Result<ParallelCommitOutcome, AgentLoopError> {
+    let memory_unresolved = !reservation.session().is_durable();
+    if !memory_unresolved {
+        let turn = plan_turn(plan, reservation)?;
+        let step = plan_step(plan, reservation)?;
+        settle_unknown_tool_outcome(reservation, plan, turn, step).await?;
+    }
+    Ok(ParallelCommitOutcome {
+        cancelled: stop == ToolStop::Cancelled,
+        concludes_turn: false,
+        infrastructure_failure: Some(failure_reason(
+            "AGENT_TOOL_EXECUTOR",
+            "the parallel-safe tool executor failed before producing a result",
+        )?),
+        stop,
+        memory_unresolved,
+    })
+}
+
+fn tool_run_stops_parallel_group(run: &ToolRun) -> bool {
+    match run {
+        ToolRun::Completed { stop, .. } => *stop != ToolStop::None,
+        ToolRun::ModelError { code, .. } => *code == "ABORTED",
+        ToolRun::Goal(_)
+        | ToolRun::PlanExit { .. }
+        | ToolRun::TodoWrite { .. }
+        | ToolRun::Mutation(_)
+        | ToolRun::Action(_)
+        | ToolRun::Infrastructure { .. }
+        | ToolRun::ActionUnresolved { .. }
+        | ToolRun::TurnTimeout => true,
+    }
+}
+
+async fn commit_tool_call_intent(
+    reservation: &mut SessionReservation<'_>,
+    plan: &mut PlannedTool,
+    turn: TurnId,
+    step: StepId,
+) -> Result<DispatchBarrier, AgentLoopError> {
+    let actual_call_seq = reservation
+        .settle_exact_settled(&mut plan.call_claim)
+        .await?
+        .seq();
+    plan.call_seq = actual_call_seq;
+    reservation.rebind_claim_fallback(
+        &mut plan.result_claim,
+        tool_prestart_error_event(
+            &plan.claim_profile,
+            turn,
+            step,
+            &plan.result_message_id,
+            &plan.call,
+            actual_call_seq,
+            "TOOL_OUTPUT_BUDGET_EXCEEDED",
+            plan.call.name.as_str(),
+            "tool output could not fit safely in the session",
+        )?,
+    )?;
+    dispatch_barrier(reservation).await
+}
+
+fn release_parallel_unresolved(
+    reservation: &mut SessionReservation<'_>,
+    planned: &mut [PlannedTool],
+    unresolved_from: usize,
+) -> Result<(), AgentLoopError> {
+    for plan in &mut planned[unresolved_from..] {
+        if plan.call_seq.get() == crate::session::MAX_SAFE_INTEGER {
+            reservation.release(&mut plan.call_claim)?;
+        }
+        reservation.release(&mut plan.result_claim)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ToolRunEnvironment<'a> {
+    tools: &'a dyn ToolExecutor,
+    declared_tools: &'a [ToolSchema],
+    limits: &'a AgentLimits,
+    turn_deadline: Instant,
+}
+
+impl<'a> ToolRunEnvironment<'a> {
+    fn from_driver(driver: &Driver<'a>) -> Self {
+        Self {
+            tools: driver.tools,
+            declared_tools: &driver.config.tools,
+            limits: &driver.config.limits,
+            turn_deadline: driver.deadline,
+        }
+    }
+}
+
+async fn run_one_tool(
+    environment: ToolRunEnvironment<'_>,
+    plan: ToolRunPlan,
+    cancellation: CancellationToken,
 ) -> ToolRun {
     let call = &plan.call;
-    if !driver
-        .config
-        .tools
+    if !environment
+        .declared_tools
         .iter()
         .any(|tool| tool.name() == call.name)
     {
         return prestart_failure(
-            plan,
+            &plan,
             "UNKNOWN_TOOL",
             "the requested tool was not declared for this model call",
             ToolStop::None,
@@ -3696,9 +4209,9 @@ async fn run_one_tool(
     } else {
         call.arguments.clone()
     };
-    if raw.len() > driver.config.limits.max_tool_argument_bytes {
+    if raw.len() > environment.limits.max_tool_argument_bytes {
         return prestart_failure(
-            plan,
+            &plan,
             "TOOL_ARGUMENTS_TOO_LARGE",
             "tool arguments exceed the configured size limit",
             ToolStop::None,
@@ -3711,7 +4224,7 @@ async fn run_one_tool(
         Some(parsed) => parsed,
         None => {
             return prestart_failure(
-                plan,
+                &plan,
                 "INVALID_TOOL_ARGUMENTS",
                 "tool arguments are not valid bounded JSON",
                 ToolStop::None,
@@ -3729,48 +4242,48 @@ async fn run_one_tool(
     if cancellation.is_cancelled() {
         child.cancel();
         return prestart_failure(
-            plan,
+            &plan,
             "ABORTED_BEFORE_DISPATCH",
             "tool was not started because the turn was stopping",
             ToolStop::Cancelled,
         );
     }
-    if Instant::now() >= driver.deadline {
+    if Instant::now() >= environment.turn_deadline {
         child.cancel();
         return prestart_failure(
-            plan,
+            &plan,
             "ABORTED_BEFORE_DISPATCH",
             "tool was not started because the agent turn timed out",
             ToolStop::TurnTimeout,
         );
     }
     let future = match catch_unwind(AssertUnwindSafe(|| {
-        driver.tools.prepare(request, child.clone())
+        environment.tools.prepare(request, child.clone())
     })) {
         Ok(future) => future,
         Err(_) => {
             child.cancel();
             return ToolRun::Infrastructure {
-                stop: sample_tool_stop(cancellation, driver.deadline),
+                stop: sample_tool_stop(&cancellation, environment.turn_deadline),
             };
         }
     };
     let guarded = AssertUnwindSafe(future).catch_unwind();
     tokio::pin!(guarded);
-    let tool_deadline = Instant::now() + driver.config.limits.tool_duration;
+    let tool_deadline = Instant::now() + environment.limits.tool_duration;
     let interrupted = tokio::select! {
         biased;
         _ = cancellation.cancelled() => {
             prestart_failure(
-                plan,
+                &plan,
                 "ABORTED_BEFORE_DISPATCH",
                 "tool was not started because the turn was stopping",
                 ToolStop::Cancelled,
             )
         }
-        _ = tokio::time::sleep_until(driver.deadline) => {
+        _ = tokio::time::sleep_until(environment.turn_deadline) => {
             prestart_failure(
-                plan,
+                &plan,
                 "ABORTED_BEFORE_DISPATCH",
                 "tool was not started because the agent turn timed out",
                 ToolStop::TurnTimeout,
@@ -3778,7 +4291,7 @@ async fn run_one_tool(
         }
         _ = tokio::time::sleep_until(tool_deadline), if !plan.claim_profile.is_user_question() => {
             prestart_failure(
-                plan,
+                &plan,
                 "TOOL_TIMEOUT",
                 "tool preparation exceeded its configured timeout",
                 ToolStop::None,
@@ -3788,16 +4301,16 @@ async fn run_one_tool(
             if cancellation.is_cancelled() {
                 child.cancel();
                 return prestart_failure(
-                    plan,
+                    &plan,
                     "ABORTED_BEFORE_DISPATCH",
                     "tool was not started because the turn was stopping",
                     ToolStop::Cancelled,
                 );
             }
-            if Instant::now() >= driver.deadline {
+            if Instant::now() >= environment.turn_deadline {
                 child.cancel();
                 return prestart_failure(
-                    plan,
+                    &plan,
                     "ABORTED_BEFORE_DISPATCH",
                     "tool was not started because the agent turn timed out",
                     ToolStop::TurnTimeout,
@@ -3806,7 +4319,7 @@ async fn run_one_tool(
             if Instant::now() >= tool_deadline {
                 child.cancel();
                 return prestart_failure(
-                    plan,
+                    &plan,
                     "TOOL_TIMEOUT",
                     "tool preparation exceeded its configured timeout",
                     ToolStop::None,
@@ -3881,7 +4394,7 @@ async fn run_one_tool(
                 Ok(Err(_)) | Err(_) => {
                     child.cancel();
                     ToolRun::Infrastructure {
-                        stop: sample_tool_stop(cancellation, driver.deadline),
+                        stop: sample_tool_stop(&cancellation, environment.turn_deadline),
                     }
                 }
             }
@@ -3901,12 +4414,12 @@ async fn run_one_tool(
 }
 
 fn prestart_failure(
-    plan: &PlannedTool,
+    plan: &impl ToolPlanView,
     code: &'static str,
     message: &'static str,
     stop: ToolStop,
 ) -> ToolRun {
-    if !plan.claim_profile.is_owned_action() {
+    if !plan.claim_profile().is_owned_action() {
         return match stop {
             ToolStop::TurnTimeout => ToolRun::TurnTimeout,
             ToolStop::Cancelled => ToolRun::ModelError {
@@ -3919,9 +4432,9 @@ fn prestart_failure(
     let failure_name = if matches!(code, "ABORTED" | "ABORTED_BEFORE_DISPATCH") {
         "AbortError"
     } else {
-        plan.call.name.as_str()
+        plan.call().name.as_str()
     };
-    let result = match plan.claim_profile.action_contract() {
+    let result = match plan.claim_profile().action_contract() {
         Some(ActionContract::Shell) => shell_prestart_result(code, failure_name, message, None),
         Some(ActionContract::Plugin { plugin_id }) => {
             plugin_prestart_result(plugin_id.as_str(), code, failure_name, message)

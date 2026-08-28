@@ -5,8 +5,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{
-        ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
-        ToolExecutorError, ToolShutdownFuture,
+        ToolExecutionFuture, ToolExecutionMode, ToolExecutionRequest, ToolExecutionResult,
+        ToolExecutor, ToolExecutorError, ToolShutdownFuture,
     },
     goal::{GoalBlockReason, GoalError, GoalRuntime, GoalUpdate, MAX_GOAL_OBJECTIVE_BYTES},
     model::{ContentBlock, JsonValue, ToolSchema},
@@ -85,6 +85,14 @@ impl ReadOnlyToolRegistry {
 }
 
 impl ToolExecutor for ReadOnlyToolRegistry {
+    fn execution_mode(&self, tool_name: &str) -> ToolExecutionMode {
+        if tool_name == "read" {
+            ToolExecutionMode::Parallel
+        } else {
+            ToolExecutionMode::Exclusive
+        }
+    }
+
     fn execute(
         &self,
         request: ToolExecutionRequest,
@@ -339,6 +347,14 @@ impl LocalToolRegistry {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl ToolExecutor for LocalToolRegistry {
+    fn execution_mode(&self, tool_name: &str) -> ToolExecutionMode {
+        if matches!(tool_name, "read" | "web_search" | "web_fetch") {
+            ToolExecutionMode::Parallel
+        } else {
+            ToolExecutionMode::Exclusive
+        }
+    }
+
     fn claim_profile(&self, tool_name: &str) -> ToolClaimProfile {
         if tool_name == "bash" {
             ToolClaimProfile::shell_action()
@@ -559,6 +575,14 @@ async fn dispatch_web_fetch(
 
 #[cfg(unix)]
 impl ToolExecutor for WorkspaceToolRegistry {
+    fn execution_mode(&self, tool_name: &str) -> ToolExecutionMode {
+        if tool_name == "read" {
+            ToolExecutionMode::Parallel
+        } else {
+            ToolExecutionMode::Exclusive
+        }
+    }
+
     fn execute(
         &self,
         request: ToolExecutionRequest,
@@ -1846,8 +1870,8 @@ mod tests {
     use crate::tools::workspace::Workspace;
     use crate::{
         agent::{
-            GoalToolCaller, ToolDispatchBinding, ToolExecutionRequest, ToolExecutor,
-            ToolPreparation,
+            GoalToolCaller, ToolDispatchBinding, ToolExecutionMode, ToolExecutionRequest,
+            ToolExecutor, ToolPreparation,
         },
         goal::GoalRuntime,
         model::{CallId, ContentBlockKind, JsonValue},
@@ -1984,6 +2008,21 @@ mod tests {
             schema.parameters().as_value()["required"],
             serde_json::json!(["queries"])
         );
+        for name in ["read", "web_search", "web_fetch"] {
+            assert_eq!(registry.execution_mode(name), ToolExecutionMode::Parallel);
+        }
+        for name in [
+            "list",
+            "glob",
+            "grep",
+            "apply_patch",
+            "bash",
+            "goal_create",
+            "todo_write",
+            "unknown",
+        ] {
+            assert_eq!(registry.execution_mode(name), ToolExecutionMode::Exclusive);
+        }
 
         let request = goal_request(
             "web_search",

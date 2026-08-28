@@ -341,6 +341,64 @@ fn spawn_http_error_server(
     (base_url, worker)
 }
 
+fn spawn_two_request_barrier_server(
+    body: &'static str,
+) -> (String, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("loopback listener should become nonblocking");
+    let base_url = format!(
+        "http://{}",
+        listener
+            .local_addr()
+            .expect("loopback listener should have an address")
+    );
+    let worker = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut connections = Vec::with_capacity(2);
+        let mut requests = Vec::with_capacity(2);
+        while connections.len() < 2 {
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "both web tool calls must connect before either response is released"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("loopback accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("request read should be bounded");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("response write should be bounded");
+            requests.push(
+                String::from_utf8(read_http_request(&mut stream)).expect("request should be UTF-8"),
+            );
+            connections.push(stream);
+        }
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        for mut stream in connections {
+            stream
+                .write_all(response.as_bytes())
+                .and_then(|()| stream.flush())
+                .expect("barrier response should write");
+        }
+        requests
+    });
+    (base_url, worker)
+}
+
 fn read_http_request(stream: &mut impl Read) -> Vec<u8> {
     const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
@@ -1600,6 +1658,89 @@ fn real_script_web_search_uses_the_separate_bounded_provider_and_continues() {
         })
         .unwrap();
     assert!(call < result);
+    assert!(!rows.iter().any(|row| row["type"] == "approval/asked"));
+
+    std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
+}
+
+#[test]
+fn real_script_overlaps_independent_web_tool_calls_and_preserves_model_order() {
+    const SEARCH_BODY: &str = r#"{"content":[{"type":"text","citations":[{"url":"https://example.test/parallel","cited_text":"parallel bounded excerpt"}]},{"type":"web_search_tool_result","content":[{"type":"web_search_result","url":"https://example.test/parallel","title":"Parallel source"}]}]}"#;
+
+    let (base_url, model_server) = spawn_response_server(vec![
+        tool_round_sse(&[
+            (
+                "web-parallel-1",
+                "web_search",
+                serde_json::json!({"queries":["first independent query"]}),
+            ),
+            (
+                "web-parallel-2",
+                "web_search",
+                serde_json::json!({"queries":["second independent query"]}),
+            ),
+        ]),
+        text_sse("parallel searches completed"),
+    ]);
+    let (search_base_url, search_server) = spawn_two_request_barrier_server(SEARCH_BODY);
+    let workspace = script_workspace("parallel-web-search");
+    let mut command = prompt_script_command(&base_url, &workspace, "search two independent topics");
+    command
+        .env("DEEPSEEK_SEARCH_BASE_URL", &search_base_url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = OwnedScriptChild::new(command.spawn().expect("dsh should spawn"))
+        .wait_with_output(Duration::from_secs(10));
+    let model_requests = model_server.join().expect("model server should join");
+    let search_requests = search_server.join().expect("search server should join");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "parallel searches completed\n");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(search_requests.len(), 2);
+
+    let second_request = request_json(&model_requests[1]);
+    let result_ids = second_request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["tool_call_id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(result_ids, ["web-parallel-1", "web-parallel-2"]);
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let journal_path = std::fs::read_dir(&root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let rows = std::fs::read_to_string(journal_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let event_position = |kind: &str, call_id: &str| {
+        rows.iter()
+            .position(|row| {
+                row["type"] == kind
+                    && if kind == "tool/call" {
+                        row["data"]["callId"] == call_id
+                    } else {
+                        row["data"]["message"]["content"][0]["toolCallId"] == call_id
+                    }
+            })
+            .unwrap()
+    };
+    let first_call = event_position("tool/call", "web-parallel-1");
+    let second_call = event_position("tool/call", "web-parallel-2");
+    let first_result = event_position("tool/result", "web-parallel-1");
+    let second_result = event_position("tool/result", "web-parallel-2");
+    assert!(first_call < second_call);
+    assert!(second_call < first_result);
+    assert!(first_result < second_result);
     assert!(!rows.iter().any(|row| row["type"] == "approval/asked"));
 
     std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
