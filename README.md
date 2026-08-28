@@ -18,7 +18,7 @@
 </div>
 
 > [!WARNING]
-> `dsh` 当前是 `0.1.0-alpha.0` 预发布版本，源码安装候选已通过 Phase 0–9
+> `dsh` 当前是 `0.1.0-alpha.0` 预发布版本，源码安装候选已通过 Phase 0–10
 > 验收，但尚无受支持的稳定发行版、预编译包或 crates.io 发布。
 
 `dsh-rs` 是项目名，安装后的命令是 `dsh`。这是一个独立的社区开源项目，Agent 内核以固定版本的
@@ -30,7 +30,7 @@ TypeScript 源码的逐行翻译。
   <img src="docs/assets/dsh-overview.png" alt="dsh-rs 在终端中读取文件、展示补丁并完成修改" width="1128">
 </p>
 
-<p align="center"><sub>Phase 9 旧版滚动输出界面的真实安装证据；模型响应来自离线 loopback fixture，不调用真实 API，也不消耗额度。Phase 11 增强界面的新截图仍待最终验收生成。</sub></p>
+<p align="center"><sub>Phase 11 增强界面的真实安装版 PTY 证据；模型响应来自离线 loopback fixture，不调用真实 API，也不消耗额度。</sub></p>
 
 ## 快速开始
 
@@ -167,7 +167,13 @@ Reject 的审批界面取得绝对优先权。线性后备继续使用整行命�
   <img src="docs/assets/dsh-approval.png" alt="dsh-rs 补丁审批选择器，默认选中 Reject，可移动到 Allow once" width="1128">
 </p>
 
-<p align="center"><sub>这也是 Phase 9 旧版选择器截图；Phase 11 增强审批截图将在安装版截图门禁完成后替换。</sub></p>
+<p align="center"><sub>Phase 11 的真实补丁预览与默认 Reject 审批界面；截图来自同一个安装版候选。</sub></p>
+
+<p align="center">
+  <img src="docs/assets/dsh-review.png" alt="dsh-rs Review 面板，展示最近一个可信回合的汇总和工具结果" width="1128">
+</p>
+
+<p align="center"><sub>Review 是只读摘要，不会伪造完整历史 diff 或命令记录；Esc 返回 Focus。</sub></p>
 
 ### 一次性脚本调用
 
@@ -282,7 +288,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | 当前版本 | `0.1.0-alpha.0`，预发布 |
 | Phase 0–9 | 已完成：v0.1 源码安装候选、终端体验、离线验收和双平台矩阵均已通过 |
 | Phase 10 | 已完成：受限的本地子进程工具插件、两个真实示例和故障矩阵已通过双平台验收 |
-| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据、assistant 有限 Markdown/代码/围栏 diff/简单表格、真实补丁语义预览、只读 Inspect/Review、6 套内置语义主题、8 条本地命令面板、有界工作区文件建议、Reduced Motion 和 Session picker 已有生产路径；截图、真实终端与双平台验收未完成 |
+| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据、assistant 有限 Markdown/代码/围栏 diff/简单表格、真实补丁语义预览、只读 Inspect/Review、6 套内置语义主题、8 条本地命令面板、有界工作区文件建议、Reduced Motion 和 Session picker 已有生产路径；本地安装版截图与旅程已通过，真实终端模拟器和同版本双平台验收未完成 |
 
 Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHub-hosted
 `macos-14` arm64 和 `ubuntu-24.04` x86_64 的完整仓库检查、v0.1 安装版旅程与插件
@@ -297,7 +303,7 @@ Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHu
 - `apply_patch` 一次只处理一个文件，Shell 只运行有界的前台命令，且获批 Shell 不是沙箱；
 - 会话恢复面向正常退出后的继续工作，不是数据库级持久化或备份；
 - 自动压缩每个 turn 最多尝试一次摘要，不保证摘要无损或事实完美；
-- Phase 11 的 Inspect 只保留当前回合，Review 只保留最近一个可信关联的摘要；它们不重建恢复点之前的历史，也不提供完整 canonical diff 或完整命令记录；主题选择只属于当前进程，恢复会话时重新使用 Adaptive，窄 Dock 可能截断主题列表；表格只支持上面列出的有限子集，命令面板也只包含上面列出的 8 条本地命令；文件建议只插入扫描时得到的相对路径字面量，不读取内容，也不保证文件在选择时仍存在；Session picker 只显示会话头中的工作区名、创建时间和短 ID，不扫描最后一条消息；最终安装版验收和截图仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
+- Phase 11 的 Inspect 只保留当前回合，Review 只保留最近一个可信关联的摘要；它们不重建恢复点之前的历史，也不提供完整 canonical diff 或完整命令记录；主题选择只属于当前进程，恢复会话时重新使用 Adaptive，窄 Dock 可能截断主题列表；表格只支持上面列出的有限子集，命令面板也只包含上面列出的 8 条本地命令；文件建议只插入扫描时得到的相对路径字面量，不读取内容，也不保证文件在选择时仍存在；Session picker 只显示会话头中的工作区名、创建时间和短 ID，不扫描最后一条消息；本轮同版本 macOS/Ubuntu 与真实终端模拟器验收仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
 - Auto 暂不在 tmux、GNU Screen、Zellij、未知终端或初始小于 44×12 的窗口启用增强界面；已进入增强模式后可缩到 12×5，继续缩小会安全恢复并退出；
 - primary-screen resize/reflow/copy 目前只有确定性终端模型和 PTY 字节证据，真实 iTerm/Terminal/VS Code 矩阵仍待完成；
 - Windows 以及未列入发布矩阵的 Unix 平台尚未支持。

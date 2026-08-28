@@ -5,8 +5,8 @@
 `in-progress`
 
 Phase 11 is the user-approved TUI v2 extension. This record intentionally has
-no final release candidate, Phase 11 completion claim, screenshot digest, or
-platform success yet. A production-reachable enhanced composer, inline Dock,
+no final release candidate, Phase 11 completion claim, real-emulator result, or
+same-candidate platform success yet. A production-reachable enhanced composer, inline Dock,
 truth-safe final tool cards, and joined turn receipt now exist on conservative
 terminal profiles; the strict Phase 9 linear path remains the fallback. Phase
 11 now also has bounded assistant-only Markdown/code/fenced-diff presentation
@@ -17,9 +17,10 @@ bounded source-preserving tables, a closed eight-command completion palette,
 bounded workspace-file suggestions, and process-local Reduced Motion now
 transactionally share that ledger. An explicit process-local `auto-edit` mode
 now removes repeated built-in patch prompts without granting Shell or plugin
-authority. It is still partial because the Session picker, installed Phase 11 acceptance,
-real screenshots, real-emulator evidence, and same-candidate dual-platform CI
-are not complete.
+authority. The bounded Session picker, local installed Phase 11 acceptance,
+and three real-PTY screenshot captures are now green. It is still partial
+because real-emulator evidence and same-candidate dual-platform CI are not
+complete.
 
 ## Frozen boundary
 
@@ -28,8 +29,8 @@ the DeepSeek Harness semantic baseline and the existing Session, approval,
 cancellation, plugin, and process-cleanup contracts. The default experience is
 an inline, native-scrollback Focus view with a bounded dynamic dock; explicit
 Inspect and Review use a bounded read-only panel in that same primary screen.
-Only a future Session picker may consider the alternate screen after a separate
-ownership proof. `--tui linear` is the implemented zero-ESC,
+The implemented Session picker remains on the primary screen and shares the
+same ownership rules. `--tui linear` is the implemented zero-ESC,
 no-dynamic-control accessible path.
 
 The implementation work is divided into these checkpoints:
@@ -41,9 +42,10 @@ The implementation work is divided into these checkpoints:
 4. bounded assistant markup and semantic canonical-patch approval preview;
 5. bounded Focus/Inspect/Review, context estimates, and compaction facts;
 6. themes (green), tables (green), commands (green), file suggestions (green),
-   Reduced Motion (green), then Session picker;
-7. installed-binary PTY journey, real screenshots, clean-target repository
-   gates, independent review, and macOS/Ubuntu CI.
+   Reduced Motion (green), and Session picker (green);
+7. installed-binary PTY journey and real screenshots (green locally), then
+   clean-target repository gates, independent review, real-emulator evidence,
+   and same-candidate macOS/Ubuntu CI.
 
 ## Semantic foundation slice — 2026-08-19
 

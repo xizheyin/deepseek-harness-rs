@@ -124,9 +124,10 @@ workspace capability and never read content. Reduced Motion now provides a
 process-local flag/command, bounded turn-owned clock, and preemptible screen
 transaction without changing Session or Provider facts. Bare interactive
 `--resume` now provides a bounded header-only Session picker and hands only the
-confirmed ID to the existing recovery lifecycle. Screenshots, real-emulator
-evidence, and final same-candidate platform validation still prevent Phase 11
-completion.
+confirmed ID to the existing recovery lifecycle. A local installed-binary
+journey now produces the overview, approval, and Review screenshots from real
+PTY bytes. Real-emulator evidence and final same-candidate platform validation
+still prevent Phase 11 completion.
 
 The user also requested less approval friction on 2026-08-26. The resulting
 green checkpoint is frozen in `docs/design/approval-modes.md`: explicit,

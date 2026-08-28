@@ -22,10 +22,10 @@ fi
 cd "$project_root"
 python3 "$script_dir/render-terminal-snapshot.py" --self-test
 
-DSH_SCREENSHOT_DIR="$capture_root/raw" "$script_dir/accept-phase9.sh"
+DSH_SCREENSHOT_DIR="$capture_root/raw" "$script_dir/accept-phase11.sh"
 
 mkdir -p -- "$capture_root/rendered"
-for name in approval overview; do
+for name in approval overview review; do
   python3 "$script_dir/render-terminal-snapshot.py" \
     --input "$capture_root/raw/$name.ansi" \
     --output "$capture_root/rendered/dsh-$name.png" \
@@ -35,7 +35,7 @@ done
 
 asset_root="$project_root/docs/assets"
 if [[ "$mode" == "--check" ]]; then
-  for name in approval overview; do
+  for name in approval overview review; do
     cmp --silent \
       "$capture_root/rendered/dsh-$name.png" \
       "$asset_root/dsh-$name.png" || {
@@ -46,8 +46,8 @@ if [[ "$mode" == "--check" ]]; then
   printf 'README screenshots match the installed-binary PTY capture.\n'
 else
   mkdir -p -- "$asset_root"
-  for name in approval overview; do
+  for name in approval overview review; do
     cp -- "$capture_root/rendered/dsh-$name.png" "$asset_root/dsh-$name.png"
   done
-  printf 'Wrote docs/assets/dsh-approval.png and docs/assets/dsh-overview.png.\n'
+  printf 'Wrote Phase 11 overview, approval, and review screenshots.\n'
 fi

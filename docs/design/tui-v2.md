@@ -11,8 +11,9 @@ bounded current-turn Inspect and one-summary Review now use the same primary-
 screen ledger. Six closed semantic palettes, bounded source-preserving tables,
 a closed eight-command completion palette, bounded file suggestions, Reduced
 Motion, and a bounded header-only Session picker now use the same transactional
-screen ownership. Installed screenshots and the real-emulator matrix remain
-incomplete.
+screen ownership. The installed-binary overview, approval, and Review captures
+are now generated from real PTY bytes; the real-emulator and same-candidate
+platform matrix remain incomplete.
 Phase 11 therefore stays `in-progress`. It keeps the accepted Agent, Session,
 approval, cancellation, and process semantics and replaces only their
 interactive presentation and input ownership.

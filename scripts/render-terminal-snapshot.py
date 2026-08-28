@@ -58,7 +58,7 @@ BACKGROUND_PALETTE = {
     47: "#c9d1d9",
 }
 
-ALLOWED_SGR = {0, 1, 2, 30, 31, 32, 33, 35, 36, 39, 43, 49}
+ALLOWED_SGR = {0, 1, 2, 7, 30, 31, 32, 33, 35, 36, 39, 43, 49}
 
 
 class SnapshotError(ValueError):
@@ -71,6 +71,7 @@ class Style:
     background: int | None = None
     bold: bool = False
     dim: bool = False
+    reverse: bool = False
 
 
 @dataclasses.dataclass
@@ -134,6 +135,13 @@ class Screen:
         self.lines[self.row] = [Cell() for _ in range(self.columns)]
         self.pending_wrap = False
 
+    def move_cursor(self, row: int, column: int) -> None:
+        if not 0 <= row < self.rows or not 0 <= column < self.columns:
+            raise SnapshotError("cursor position is outside the declared terminal")
+        self.row = row
+        self.column = column
+        self.pending_wrap = False
+
     def set_graphics(self, parameters: list[int]) -> None:
         style = self.style
         for parameter in parameters or [0]:
@@ -145,6 +153,8 @@ class Screen:
                 style = dataclasses.replace(style, bold=True, dim=False)
             elif parameter == 2:
                 style = dataclasses.replace(style, dim=True, bold=False)
+            elif parameter == 7:
+                style = dataclasses.replace(style, reverse=True)
             elif 30 <= parameter <= 37:
                 style = dataclasses.replace(style, foreground=parameter)
             elif parameter == 39:
@@ -186,6 +196,31 @@ def parse_csi(screen: Screen, sequence: bytes) -> None:
         raise SnapshotError("CSI sequence exceeds the 16-byte limit")
     final = chr(sequence[-1])
     body = sequence[:-1]
+    if (final, body) in {
+        ("h", b"?2004"),
+        ("l", b"?2004"),
+        ("h", b"?25"),
+        ("l", b"?25"),
+        ("l", b"?6"),
+    }:
+        # Bracketed-paste and cursor/origin modes affect terminal input or the
+        # cursor itself, not the captured screen cells.
+        return
+    if final == "r" and body == b"":
+        # dsh resets the scrolling region before it starts owning the Dock.
+        # The renderer already models the complete screen as that region.
+        return
+    if final == "H":
+        try:
+            row_text, column_text = body.decode("ascii").split(";")
+            row = int(row_text)
+            column = int(column_text)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise SnapshotError("invalid absolute cursor position") from error
+        if row == 0 or column == 0:
+            raise SnapshotError("absolute cursor positions are one-based")
+        screen.move_cursor(row - 1, column - 1)
+        return
     if final == "A" and body == b"5":
         screen.cursor_up(5)
         return
@@ -343,7 +378,10 @@ def render_svg(screen: Screen, font_directory: Path) -> str:
                 continue
             text_value = "".join(run_text)
             run_cells = column - run_start
+            foreground = PALETTE[run_style.foreground]
             background = BACKGROUND_PALETTE[run_style.background]
+            if run_style.reverse:
+                foreground, background = background or "#0b0f14", foreground
             x = pad_x + run_start * cell_width
             if background is not None:
                 output.append(
@@ -351,7 +389,6 @@ def render_svg(screen: Screen, font_directory: Path) -> str:
                     f'height="{cell_height}" fill="{background}"/>'
                 )
             if text_value.strip(" "):
-                foreground = PALETTE[run_style.foreground]
                 weight = "700" if run_style.bold else "400"
                 opacity = "0.62" if run_style.dim else "1"
                 output.append(
@@ -419,6 +456,16 @@ def self_test() -> None:
     redraw = parse_transcript(b"one\r\ntwo\r\nthree\x1b[5A\r\x1b[2Ktop", 8, 6)
     assert "top" == "".join(cell.text for cell in redraw.lines[0][:3])
 
+    dock = parse_transcript(
+        b"history\x1b[r\x1b[?6l\x1b[?25l\x1b[?2004h"
+        b"\x1b[3;2H\x1b[2K\x1b[7m> pick\x1b[0m",
+        12,
+        4,
+    )
+    assert "history" == "".join(cell.text for cell in dock.lines[0][:7])
+    assert "> pick" == "".join(cell.text for cell in dock.lines[2][1:7])
+    assert dock.lines[2][1].style.reverse
+
     wrapped = parse_transcript(b"123456789", 4, 2)
     assert "5678" == "".join(cell.text for cell in wrapped.lines[0])
     assert wrapped.lines[1][0].text == "9"
@@ -428,6 +475,10 @@ def self_test() -> None:
         b"\x1bPpayload\x1b\\",
         b"\x1b[?1049h",
         b"\x1b[1H",
+        b"\x1b[5;1H",
+        b"\x1b[1;13H",
+        b"\x1b[1;2r",
+        b"\x1b[?1049l",
         b"\xff",
     ]
     for case in rejected:

@@ -1298,9 +1298,9 @@ zero-ESC numbered presentations are Rust-owned because the fixed upstream has
 no built-in human TUI. The command palette, table subset, and six
 closed semantic themes are Rust terminal-only presentation choices: they change
 no Session or upstream Agent fact, accept no user-defined escape strings, and
-themes reset to Adaptive in a new process. Installed Phase 11 evidence,
-screenshots, and the real-emulator/platform matrix must exist before any broader
-`intentional-difference` completion claim.
+themes reset to Adaptive in a new process. The local installed Phase 11 journey
+and screenshots now exist; the real-emulator/platform matrix must still pass
+before any broader `intentional-difference` completion claim.
 
 The file-suggestion design also inspected the fixed upstream browser input
 trigger rather than inferring its behavior from the current terminal product:

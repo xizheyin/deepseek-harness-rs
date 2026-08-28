@@ -13,7 +13,7 @@ use std::{
 };
 
 use support::{
-    fake_deepseek::{CancelThenSseServer, SequenceSseServer},
+    fake_deepseek::{CancelThenSseServer, GatedFirstSseServer, SequenceSseServer},
     pty::{PtyHarness, TestSessionRoot, dsh_binary},
 };
 
@@ -171,7 +171,7 @@ fn capture_snapshot(name: &str, bytes: &[u8]) {
         return;
     };
     assert!(
-        matches!(name, "approval.ansi" | "overview.ansi"),
+        matches!(name, "approval.ansi" | "overview.ansi" | "review.ansi"),
         "snapshot name must be a fixed test asset"
     );
     let directory = PathBuf::from(directory);
@@ -224,6 +224,19 @@ fn installed_dsh_renders_the_real_readme_scene() {
     dsh.expect(b"Turn complete");
     dsh.expect_occurrences("❯".as_bytes(), 2);
     capture_snapshot("overview.ansi", &dsh.snapshot());
+    let inspect = dsh.checkpoint();
+    dsh.write(&[0x0f]);
+    dsh.expect_after(inspect, b"INSPECT");
+    dsh.expect_after(inspect, b"COMMITTED FACTS");
+    let review = dsh.checkpoint();
+    dsh.write(b"\t");
+    dsh.expect_after(review, b"REVIEW");
+    dsh.expect_after(review, b"3 steps");
+    dsh.expect_after(review, b"2 tool requests");
+    capture_snapshot("review.ansi", &dsh.snapshot());
+    let focus = dsh.checkpoint();
+    dsh.write(b"\x1b");
+    dsh.expect_after(focus, b"Ready");
     let (status, _) = dsh.exit_cleanly();
     let requests = server.finish();
 
@@ -235,6 +248,63 @@ fn installed_dsh_renders_the_real_readme_scene() {
     assert_eq!(requests.len(), 3);
     assert!(requests[1].contains("release needle: old"));
     assert!(requests[2].contains("release needle: ready"));
+}
+
+#[test]
+fn installed_phase11_queues_a_follow_up_while_local_detail_views_stay_offline() {
+    let partial =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"installed turn is working\"}}]}\n\n"
+            .to_owned();
+    let mut server = GatedFirstSseServer::start(
+        partial,
+        text_sse(" and then settled"),
+        vec![text_sse("installed queued follow-up completed")],
+    );
+    let workspace = ReleaseWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root(
+        &server.base_url,
+        &workspace.0,
+        TestSessionRoot::new(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"start the installed Phase 11 turn\r");
+    dsh.expect(b"installed turn is working");
+    let queued = dsh.checkpoint();
+    dsh.write(b"run the installed queued follow-up\r");
+    dsh.expect_after(queued, b"1 next-turn prompt(s) queued");
+
+    let inspect = dsh.checkpoint();
+    dsh.write(&[0x0f]);
+    dsh.expect_after(inspect, b"INSPECT");
+    dsh.expect_after(inspect, b"COMMITTED FACTS");
+    let review = dsh.checkpoint();
+    dsh.write(b"\t");
+    dsh.expect_after(review, b"REVIEW");
+    dsh.expect_after(review, b"Complete a turn before opening Review");
+    let focus = dsh.checkpoint();
+    dsh.write(b"\x1b");
+    dsh.expect_after(focus, b"Next turn queued");
+
+    server.release();
+    dsh.expect(b"and then settled");
+    dsh.expect(b"installed queued follow-up completed");
+    dsh.expect_occurrences(b"Turn complete", 2);
+    let settled_review = dsh.checkpoint();
+    dsh.write(b"/review\r");
+    dsh.expect_after(settled_review, b"REVIEW");
+    dsh.expect_after(settled_review, b"0 tool requests");
+    let focus = dsh.checkpoint();
+    dsh.write(b"\x1b");
+    dsh.expect_after(focus, b"Ready");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("start the installed Phase 11 turn"));
+    assert!(!requests[0].contains("run the installed queued follow-up"));
+    assert!(requests[1].contains("run the installed queued follow-up"));
 }
 
 #[test]
