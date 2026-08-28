@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–37 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–38 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -45,6 +45,7 @@ for behavior that users can run today.
 | 35 | Bounded project-local Skills catalog and loader | `complete` | [`validation/phase-35.md`](validation/phase-35.md) |
 | 36 | Bounded same-workspace persisted-session search | `complete` | [`validation/phase-36.md`](validation/phase-36.md) |
 | 37 | Configured bounded stdio LSP code navigation | `complete` | [`validation/phase-37.md`](validation/phase-37.md) |
+| 38 | Durable opt-in per-step time context | `complete` | [`validation/phase-38.md`](validation/phase-38.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -742,12 +743,51 @@ the normal local Rust gates. A real third-party language server, public network,
 real DeepSeek request, remote CI and unrelated platform/stress matrix are not
 required.
 
+## Phase 38 durable per-step time context boundary (2026-08-29)
+
+Phase 38 adds the fixed upstream's durable preparation-time clock semantics to
+the terminal product. An explicit `--time-zone <IANA_ZONE>` enables one
+snapshot-form `user/message` after each entered `step/start` and before request
+derivation. The message records turn, step, an ISO-shaped whole-second
+timestamp with numeric offset and canonical IANA zone, and elapsed time from
+the preceding model-visible message or the preceding time-context reading.
+
+The time zone is validated once before Session creation, Provider credentials,
+plugins or network work. Unlike the browser product, this terminal has no
+browser RPC provenance: the explicitly supplied CLI zone is the user-owned
+client zone and the durable message says `Terminal time zone`. No zone is
+guessed from the server process, Session header or workspace. Existing readings
+remain ordinary append-only Session facts and survive resume or compaction;
+new readings resume only when the flag is passed to the new process again.
+
+The Agent samples only after cancellation and pre-step policy permit progress.
+Sampling, formatting or message construction failure closes the turn with one
+stable error before a Provider request. A rejected or cancelled pre-step writes
+no reading. The context owns no tool, approval, filesystem, subprocess or
+network authority and adds no request-header field. At most one reading exists
+per entered step, so the existing 64-step limit also bounds event and token
+growth.
+
+Rust keeps the primary official every-step mode and does not expose the
+optional positive refresh interval, browser mixed-zone policy or ambient
+process-zone fallback in this phase. It uses a pinned IANA/DST-aware Rust time
+library instead of mutating process-global `TZ`. These differences are explicit
+terminal-product choices and keep compatibility status at `partial`.
+
+Acceptance is local-only: fixed-source fixture; exact zone, timestamp,
+duration, source-shape, event-order, request-reconstruction, cancellation,
+failure, compaction and resume tests; one real script CLI request in a fixed
+zone; and the normal local Rust gates. No real DeepSeek request, public-network
+product test, remote CI, browser, Schedule product or extra platform matrix is
+required.
+
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
 - MCP, Hooks, ambient/remote Skills, subagents, and background jobs
 - LSP diagnostics, rename/symbol/call-hierarchy operations, complete session-query/lineage reads, and a persistent derived search index
+- Ambient/browser-derived time zones and configurable time-context refresh intervals
 - Multiple model providers
 - Untested operating systems or sandbox claims
 - Feature-for-feature or visual copying of Claude Code

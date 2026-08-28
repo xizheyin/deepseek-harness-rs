@@ -46,6 +46,7 @@ use crate::{
         TurnEndReason, TurnId,
     },
     skills::{SkillRuntime, SkillRuntimeError},
+    time_context::TimeContextRuntime,
     workspace_instructions::{WorkspaceInstructionError, WorkspaceInstructionRuntime},
 };
 
@@ -801,6 +802,7 @@ pub struct AgentLoop {
     workspace_instructions: Option<WorkspaceInstructionRuntime>,
     pending_skill_context: Option<Message>,
     skills: Option<SkillRuntime>,
+    time_context: Option<TimeContextRuntime>,
     pending_workspace_touches: Vec<String>,
     repeat_tool_reminder: RepeatToolReminder,
     poisoned: bool,
@@ -883,6 +885,7 @@ impl AgentLoop {
             workspace_instructions: None,
             pending_skill_context: None,
             skills: None,
+            time_context: None,
             pending_workspace_touches: Vec::new(),
             repeat_tool_reminder: RepeatToolReminder::default(),
             poisoned: false,
@@ -917,6 +920,11 @@ impl AgentLoop {
     /// context and the registry's model-facing loader.
     pub(crate) fn install_skill_runtime(&mut self, runtime: SkillRuntime) {
         self.skills = Some(runtime);
+    }
+
+    /// Install optional durable per-step clock context for this Agent process.
+    pub(crate) fn install_time_context(&mut self, runtime: TimeContextRuntime) {
+        self.time_context = Some(runtime);
     }
 
     /// Commit a local Goal command through the same durable Session owner.
@@ -1004,6 +1012,7 @@ impl AgentLoop {
                 goal_tool_caller: GoalToolCaller::Untrusted,
                 workspace_instructions: self.workspace_instructions.as_ref(),
                 skills: self.skills.as_ref(),
+                time_context: None,
                 pending_workspace_touches: &mut self.pending_workspace_touches,
                 repeat_tool_reminder: &mut self.repeat_tool_reminder,
                 pending_repeat_contexts: &mut pending_repeat_contexts,
@@ -1175,6 +1184,7 @@ impl AgentLoop {
             &mut self.exact_shell_grants,
             self.workspace_instructions.as_ref(),
             self.skills.as_ref(),
+            self.time_context.as_ref(),
             &mut self.pending_workspace_touches,
             &mut self.repeat_tool_reminder,
             proposal,
@@ -1415,6 +1425,7 @@ struct Driver<'a> {
     goal_tool_caller: GoalToolCaller,
     workspace_instructions: Option<&'a WorkspaceInstructionRuntime>,
     skills: Option<&'a SkillRuntime>,
+    time_context: Option<&'a TimeContextRuntime>,
     pending_workspace_touches: &'a mut Vec<String>,
     repeat_tool_reminder: &'a mut RepeatToolReminder,
     pending_repeat_contexts: &'a mut Vec<Message>,
@@ -1464,6 +1475,7 @@ async fn run_turn_inner(
     exact_shell_grants: &mut approval::ExactShellGrantStore,
     workspace_instructions: Option<&WorkspaceInstructionRuntime>,
     skills: Option<&SkillRuntime>,
+    time_context: Option<&TimeContextRuntime>,
     pending_workspace_touches: &mut Vec<String>,
     repeat_tool_reminder: &mut RepeatToolReminder,
     proposal: TurnProposal,
@@ -1516,6 +1528,7 @@ async fn run_turn_inner(
         goal_tool_caller,
         workspace_instructions,
         skills,
+        time_context,
         pending_workspace_touches,
         repeat_tool_reminder,
         pending_repeat_contexts: &mut pending_repeat_contexts,
@@ -1652,11 +1665,6 @@ async fn run_entered_turn(
     budget_failure: &LlmFailure,
 ) -> Result<TurnEndReason, AgentLoopError> {
     let mut summary_attempted = false;
-    if let Some(reason) =
-        refresh_dynamic_context(reservation.session(), driver, &mut messages, cancellation).await?
-    {
-        return Ok(reason);
-    }
     loop {
         if cancellation.is_cancelled() {
             return Ok(TurnEndReason::Aborted {
@@ -1676,6 +1684,18 @@ async fn run_entered_turn(
 
         let step = StepId::new((driver.counters.steps + 1) as u64)
             .map_err(|_| AgentLoopError::Invariant("step identifier exhausted"))?;
+        if let Some(reason) = refresh_dynamic_context(
+            reservation.session(),
+            driver,
+            &mut messages,
+            cancellation,
+            turn,
+            step,
+        )
+        .await?
+        {
+            return Ok(reason);
+        }
         let mut exact = Vec::with_capacity(messages.len() + 2);
         exact.push(NewEvent::log(EventKind::step_start(turn, step)));
         exact.extend(messages.iter().cloned().map(|message| {
@@ -1864,9 +1884,15 @@ async fn run_entered_turn(
         // release the untouched claims and reserve the same step again with
         // that message included.
         let input_count_before_rearm = messages.len();
-        if let Some(reason) =
-            refresh_dynamic_context(reservation.session(), driver, &mut messages, cancellation)
-                .await?
+        if let Some(reason) = refresh_dynamic_context(
+            reservation.session(),
+            driver,
+            &mut messages,
+            cancellation,
+            turn,
+            step,
+        )
+        .await?
         {
             unstarted.release(reservation)?;
             return Ok(reason);
@@ -1983,16 +2009,6 @@ async fn run_entered_turn(
         match resolution.outcome {
             StepOutcome::Continue => {
                 messages.append(driver.pending_repeat_contexts);
-                if let Some(reason) = refresh_dynamic_context(
-                    reservation.session(),
-                    driver,
-                    &mut messages,
-                    cancellation,
-                )
-                .await?
-                {
-                    return Ok(reason);
-                }
             }
             StepOutcome::Completed => return Ok(TurnEndReason::Completed),
             StepOutcome::MaxTokens => return Ok(TurnEndReason::MaxTokens),
@@ -2011,12 +2027,59 @@ async fn refresh_dynamic_context(
     driver: &mut Driver<'_>,
     messages: &mut Vec<Message>,
     cancellation: &CancellationToken,
+    turn: TurnId,
+    step: StepId,
 ) -> Result<Option<TurnEndReason>, AgentLoopError> {
     if let Some(reason) = refresh_workspace_context(session, driver, messages, cancellation).await?
     {
         return Ok(Some(reason));
     }
-    refresh_skill_context(session, driver, messages, cancellation).await
+    if let Some(reason) = refresh_skill_context(session, driver, messages, cancellation).await? {
+        return Ok(Some(reason));
+    }
+    refresh_time_context(session, driver, messages, cancellation, turn, step)
+}
+
+fn refresh_time_context(
+    session: &Session,
+    driver: &Driver<'_>,
+    messages: &mut Vec<Message>,
+    cancellation: &CancellationToken,
+    turn: TurnId,
+    step: StepId,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if messages.iter().any(is_time_context_message) {
+        return Ok(None);
+    }
+    let Some(runtime) = driver.time_context else {
+        return Ok(None);
+    };
+    if cancellation.is_cancelled() {
+        return Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        }));
+    }
+    let context = match runtime.prepare(session, turn, step, driver.runtime) {
+        Ok(context) => context,
+        Err(_) => {
+            return Ok(Some(TurnEndReason::Error {
+                error: failure_reason(
+                    "AGENT_TIME_CONTEXT",
+                    "time context could not be prepared safely",
+                )?,
+            }));
+        }
+    };
+    messages.push(context);
+    Ok(None)
+}
+
+fn is_time_context_message(message: &Message) -> bool {
+    matches!(
+        message.source().kind(),
+        MessageSourceKind::Plugin { plugin, .. }
+            if plugin == crate::time_context::TIME_CONTEXT_SOURCE
+    )
 }
 
 async fn refresh_workspace_context(

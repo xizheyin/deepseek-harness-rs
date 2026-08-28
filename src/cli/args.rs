@@ -2,9 +2,9 @@ use std::ffi::OsString;
 
 use thiserror::Error;
 
-use crate::session::SessionId;
+use crate::{session::SessionId, time_context::MAX_TIME_ZONE_BYTES};
 
-pub(super) const MAX_ARGV_ENTRIES: usize = 16;
+pub(super) const MAX_ARGV_ENTRIES: usize = 18;
 pub(super) const MAX_ARGV_AGGREGATE_BYTES: usize = 1024 * 1024 + 8 * 1024;
 pub(super) const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_WORKSPACE_BYTES: usize = 4_096;
@@ -57,6 +57,7 @@ pub(super) struct CliOptions {
     pub(super) workspace: Option<String>,
     pub(super) plugin_config: Option<String>,
     pub(super) lsp_config: Option<String>,
+    pub(super) time_zone: Option<String>,
     pub(super) resume: Option<ResumeTarget>,
     pub(super) no_color: bool,
     pub(super) reduced_motion: bool,
@@ -129,6 +130,7 @@ pub(super) fn parse_args_os(
     let mut workspace_seen = false;
     let mut plugin_config_seen = false;
     let mut lsp_config_seen = false;
+    let mut time_zone_seen = false;
     let mut resume_seen = false;
     let mut tui_seen = false;
     let mut approval_mode_seen = false;
@@ -186,6 +188,7 @@ pub(super) fn parse_args_os(
             ("--workspace", "--workspace"),
             ("--plugin-config", "--plugin-config"),
             ("--lsp-config", "--lsp-config"),
+            ("--time-zone", "--time-zone"),
             ("--resume", "--resume"),
             ("--tui", "--tui"),
             ("--approval-mode", "--approval-mode"),
@@ -207,6 +210,7 @@ pub(super) fn parse_args_os(
                 &mut workspace_seen,
                 &mut plugin_config_seen,
                 &mut lsp_config_seen,
+                &mut time_zone_seen,
                 &mut resume_seen,
                 &mut tui_seen,
                 &mut approval_mode_seen,
@@ -221,6 +225,7 @@ pub(super) fn parse_args_os(
             "--workspace" | "-w" => Some("--workspace"),
             "--plugin-config" => Some("--plugin-config"),
             "--lsp-config" => Some("--lsp-config"),
+            "--time-zone" => Some("--time-zone"),
             "--tui" => Some("--tui"),
             "--approval-mode" => Some("--approval-mode"),
             _ => None,
@@ -238,6 +243,7 @@ pub(super) fn parse_args_os(
                 &mut workspace_seen,
                 &mut plugin_config_seen,
                 &mut lsp_config_seen,
+                &mut time_zone_seen,
                 &mut resume_seen,
                 &mut tui_seen,
                 &mut approval_mode_seen,
@@ -259,6 +265,7 @@ pub(super) fn parse_args_os(
             || model_seen
             || plugin_config_seen
             || lsp_config_seen
+            || time_zone_seen
             || resume_seen
             || tui_seen
             || approval_mode_seen
@@ -313,6 +320,7 @@ fn set_value(
     workspace_seen: &mut bool,
     plugin_config_seen: &mut bool,
     lsp_config_seen: &mut bool,
+    time_zone_seen: &mut bool,
     resume_seen: &mut bool,
     tui_seen: &mut bool,
     approval_mode_seen: &mut bool,
@@ -323,6 +331,7 @@ fn set_value(
         "--workspace" => (&mut *workspace_seen, MAX_WORKSPACE_BYTES),
         "--plugin-config" => (&mut *plugin_config_seen, MAX_PLUGIN_CONFIG_BYTES),
         "--lsp-config" => (&mut *lsp_config_seen, MAX_LSP_CONFIG_BYTES),
+        "--time-zone" => (&mut *time_zone_seen, MAX_TIME_ZONE_BYTES),
         "--resume" => (&mut *resume_seen, MAX_SESSION_ID_BYTES),
         "--tui" => (&mut *tui_seen, 8),
         "--approval-mode" => (&mut *approval_mode_seen, MAX_APPROVAL_MODE_BYTES),
@@ -341,6 +350,7 @@ fn set_value(
         "--workspace" => options.workspace = Some(value.to_owned()),
         "--plugin-config" => options.plugin_config = Some(value.to_owned()),
         "--lsp-config" => options.lsp_config = Some(value.to_owned()),
+        "--time-zone" => options.time_zone = Some(value.to_owned()),
         "--resume" => options.resume = Some(ResumeTarget::Exact(parse_session_id(value)?)),
         "--tui" => {
             options.tui = match value {
@@ -387,8 +397,8 @@ mod tests {
     use super::{
         ApprovalMode, MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_LSP_CONFIG_BYTES,
         MAX_MODEL_BYTES, MAX_PLUGIN_CONFIG_BYTES, MAX_PROMPT_BYTES, MAX_SESSION_ID_BYTES,
-        MAX_WORKSPACE_BYTES, ParseAction, ParseError, ResumeTarget, TuiMode, admit_args_os,
-        parse_args_os,
+        MAX_TIME_ZONE_BYTES, MAX_WORKSPACE_BYTES, ParseAction, ParseError, ResumeTarget, TuiMode,
+        admit_args_os, parse_args_os,
     };
 
     fn os(values: &[&str]) -> Vec<OsString> {
@@ -431,6 +441,8 @@ mod tests {
             "/tmp/plugins.json",
             "--lsp-config",
             "/tmp/lsp.json",
+            "--time-zone",
+            "Asia/Shanghai",
             "--tui",
             "enhanced",
             "--approval-mode",
@@ -445,6 +457,7 @@ mod tests {
             "--workspace=/tmp/work",
             "--plugin-config=/tmp/plugins.json",
             "--lsp-config=/tmp/lsp.json",
+            "--time-zone=Asia/Shanghai",
             "--tui=enhanced",
             "--approval-mode=auto-edit",
             "--reduced-motion",
@@ -460,6 +473,7 @@ mod tests {
         assert_eq!(options.workspace.as_deref(), Some("/tmp/work"));
         assert_eq!(options.plugin_config.as_deref(), Some("/tmp/plugins.json"));
         assert_eq!(options.lsp_config.as_deref(), Some("/tmp/lsp.json"));
+        assert_eq!(options.time_zone.as_deref(), Some("Asia/Shanghai"));
         assert_eq!(options.tui, TuiMode::Enhanced);
         assert_eq!(options.approval_mode, ApprovalMode::AutoEdit);
         assert!(options.approval_mode_explicit);
@@ -493,6 +507,7 @@ mod tests {
             &["-w", "/one", "--workspace=/two"][..],
             &["--plugin-config", "/one", "--plugin-config=/two"][..],
             &["--lsp-config", "/one", "--lsp-config=/two"][..],
+            &["--time-zone", "UTC", "--time-zone=Asia/Shanghai"][..],
             &[
                 "--resume",
                 "session-550e8400-e29b-41d4-a716-446655440000",
@@ -518,6 +533,7 @@ mod tests {
             "--workspace",
             "--plugin-config",
             "--lsp-config",
+            "--time-zone",
             "--tui",
             "--approval-mode",
             "-p",
@@ -564,6 +580,7 @@ mod tests {
             &["--workspace="][..],
             &["--plugin-config="][..],
             &["--lsp-config="][..],
+            &["--time-zone="][..],
             &["--resume="][..],
             &["--tui="][..],
             &["--approval-mode="][..],
@@ -583,6 +600,7 @@ mod tests {
             ("--workspace", MAX_WORKSPACE_BYTES),
             ("--plugin-config", MAX_PLUGIN_CONFIG_BYTES),
             ("--lsp-config", MAX_LSP_CONFIG_BYTES),
+            ("--time-zone", MAX_TIME_ZONE_BYTES),
         ] {
             assert!(parse_args_os(os(&[option, &"x".repeat(maximum)])).is_ok());
             assert!(matches!(

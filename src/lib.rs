@@ -8,6 +8,7 @@ mod json_value;
 mod plan_mode;
 mod resident_credit;
 mod skills;
+mod time_context;
 mod tui;
 mod user_question;
 mod workspace_authority;

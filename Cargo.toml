@@ -25,6 +25,7 @@ futures-util = "0.3"
 getrandom = "=0.4.3"
 globset = "=0.4.18"
 httpdate = "1.0"
+jiff = { version = "=0.2.35", default-features = false, features = ["std", "tzdb-zoneinfo"] }
 libc = "=0.2.189"
 regex = "=1.12.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }

@@ -69,6 +69,15 @@ dsh --workspace . --lsp-config /absolute/path/to/lsp.json
 
 配置示例和 `rust-analyzer` 路径说明见[配置文档](docs/configuration.md#local-stdio-language-servers)。
 
+如果任务依赖“今天”“明天”或经过了多久，可显式给每个模型步骤附上当前时区的
+可恢复时间快照：
+
+```console
+dsh --workspace . --time-zone Asia/Shanghai
+```
+
+时区必须是规范 IANA 名称；该功能不猜测系统时区，也不会增加审批。
+
 API Key 只从进程环境按请求读取。不要把真实密钥写入提示词、工具参数或 Shell
 命令，因为这些内容本来就是模型和会话可见的。
 
@@ -82,6 +91,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 代码理解 | 工作区内的 `list`、`glob`、`grep` 和 `read`，输出和扫描范围均有上限 |
 | 联网工具（实验性） | `web_search` 并发执行 1–4 个 DeepSeek 原生查询并公平合并最多 8 个来源；`web_fetch` 匿名读取一个经过公网地址校验的 HTTP(S) 页面；两者均无需额外审批 |
 | 项目指令（实验性） | 有界加载用户级、根目录及已触达嵌套目录的 `AGENTS.md` / `CLAUDE.md`，写入会话并在恢复或文件工具成功后检查变化 |
+| 时间上下文（实验性） | 显式 `--time-zone` 后，每个模型步骤追加时间、时区和经过时长快照；会话恢复和上下文压缩后仍可回放，无需审批 |
 | 项目 Skills（实验性） | 有界发现工作区 `.dsh/skills` 和 `.agents/skills` 中的 Markdown Skill；模型先看到名称/描述目录，再用只读 `skill` 工具按需加载当前正文，无需审批 |
 | 历史会话搜索（实验性） | 模型可用只读 `session_search` 搜索同一工作区中已经正常关闭的本地会话；字面短语忽略大小写并允许空白差异，最多返回 20 条带有界摘要的非可信历史线索，无需审批 |
 | LSP 代码导航（实验性） | 显式 `--lsp-config` 后，模型可用只读 `lsp` 精确查询定义、引用、实现和 hover；源码、协议、输出、超时、取消和进程组清理均有上限，无需逐次审批 |
@@ -185,6 +195,13 @@ Plan Mode 并让你先发消息。也可以在空闲时用 `/plan off` 手动退
 上限 60 秒；Ctrl+C 或超时会发送协议取消，若服务器不收敛则回收整个进程组。服务器不能
 借协议要求 `dsh` 修改文件或运行命令。配置本身是对该本机可执行程序的信任，不是沙箱；
 恢复会话时需要再次传入。
+
+显式传入 `--time-zone Asia/Shanghai` 后，`dsh` 会在每个真正进入的模型步骤前读取一次
+本机时间，并把带数值偏移和 IANA 时区的整秒时间、以及距上一条相关消息经过的时间写入
+Session。它是模型可见的普通历史事实，因此恢复或压缩后不会凭空改变；恢复的新进程若还
+需要新读数，必须再次传入该参数。时区必须使用规范写法，例如 `UTC`、`Asia/Shanghai`
+或 `America/New_York`，别名和大小写错误会在创建会话或连接网络前失败。该能力不会启动
+后台任务、调用工具或扩大文件/Shell 权限，但每一步会增加少量上下文。
 
 如果模型在同一个步骤里发出多个互不依赖的 `read`、`skill`、`web_search`、`web_fetch` 或 `lsp`，`dsh`
 会在最多 10 个在途调用的上限内重叠等待，以减少文件或网络往返时间。调用意图仍先写入
@@ -414,6 +431,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | Phase 35 | 已完成：工作区项目 Skills 的有界目录、按需正文加载、变更刷新和恢复对账；只读且无需审批，仅做本机必要验证 |
 | Phase 36 | 已完成：同工作区已关闭会话的有界 `session_search`、严格日志复用、占用/当前会话排除与非可信历史提示；只读且无需审批，仅做本机必要验证 |
 | Phase 37 | 已完成：显式配置的 stdio LSP、四种精确代码导航、协议上限、取消和进程组清理已通过本机必要验收 |
+| Phase 38 | 已完成：显式时区的逐步骤持久时间上下文、经过时长、恢复/压缩回放与失败前置检查已通过本机必要验收 |
 
 Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHub-hosted
 `macos-14` arm64 和 `ubuntu-24.04` x86_64 的完整仓库检查、v0.1 安装版旅程与插件
@@ -498,6 +516,8 @@ DeepSeek。三条命令也会在发布 CI 中运行。贡献前请阅读
 - [Phase 36 本机验收记录](docs/validation/phase-36.md)
 - [Phase 37 LSP 导航设计](docs/design/lsp-navigation.md)
 - [Phase 37 本机验收记录](docs/validation/phase-37.md)
+- [Phase 38 时间上下文设计](docs/design/time-context.md)
+- [Phase 38 本机验收记录](docs/validation/phase-38.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
 

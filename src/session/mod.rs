@@ -2024,6 +2024,7 @@ impl Session {
             );
         };
         event.set_time_for_commit(time);
+        prepared_projection.set_committed_event_time(&event);
         let row_template = commit
             .encoded_row
             .take()
@@ -3002,7 +3003,7 @@ impl Session {
             .kind()
             .live_event_type()
             .ok_or(EventValidationError::UnknownLiveEvent)?;
-        let next_projection = match admission {
+        let mut next_projection = match admission {
             MemoryProjectionAdmission::Ordinary => Ok::<_, EventValidationError>(
                 EitherProjection::Ordinary(self.projection.with_event(&candidate)?),
             ),
@@ -3038,6 +3039,14 @@ impl Session {
             return Err(ClockError::new("live event clock returned a negative timestamp").into());
         }
         candidate.set_time_for_commit(time);
+        match &mut next_projection {
+            EitherProjection::Ordinary(projection) => {
+                projection.set_committed_event_time(&candidate);
+            }
+            EitherProjection::Attempt(prepared) => {
+                prepared.set_committed_event_time(&candidate);
+            }
+        }
         match &mut self.mode {
             SessionMode::Memory {
                 events,
@@ -3205,6 +3214,11 @@ impl Session {
     /// Shallow handles for the messages on the current model-visible surface.
     pub(crate) fn visible_messages(&self) -> Vec<Message> {
         self.projection.messages()
+    }
+
+    /// Durable clock baseline for a proposed time-context reading.
+    pub(crate) fn time_context_baseline(&self, step: StepId) -> Option<UnixMillis> {
+        self.projection.time_context_baseline(step)
     }
 
     /// The next globally continuous durable sequence number.

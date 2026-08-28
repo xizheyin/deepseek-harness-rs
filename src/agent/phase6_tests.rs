@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     AgentIdKind, AgentLimits, AgentLoop, AgentLoopConfig, AgentLoopError, AgentRuntime,
     ApprovalFuture, ApprovalPrompt, ApprovalProvider, ApprovalRequest, ExactShellGrantIdentity,
-    FileChangePolicy, ManualCompactionOutcome, MutationDeclineReason, NoApprovalProvider,
+    FileChangePolicy, ManualCompactionOutcome, MutationDeclineReason, NoApprovalProvider, NoTools,
     PluginPolicy, PreparedToolMutation, ShellPolicy, ToolCommitOutcome, ToolExecutionFuture,
     ToolExecutionRequest, ToolExecutionResult, ToolExecutor, ToolExecutorError, ToolPreparation,
     ToolPreparationFuture, TurnProposal, action_policy,
@@ -45,10 +45,35 @@ use crate::{
         TurnEndReason, TurnId, UnixMillis,
     },
     skills::SkillRuntime,
+    time_context::{TimeContextClock, TimeContextError, TimeContextRuntime},
     tools::WorkspaceToolRegistry,
     workspace_authority::WorkspaceAuthority,
     workspace_instructions::WorkspaceInstructionRuntime,
 };
+
+#[derive(Debug)]
+struct TimeSequenceClock(Mutex<VecDeque<i64>>);
+
+impl TimeContextClock for TimeSequenceClock {
+    fn now(&self) -> Result<UnixMillis, TimeContextError> {
+        let value = self
+            .0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or(TimeContextError::Clock)?;
+        UnixMillis::new(value).map_err(|_| TimeContextError::Clock)
+    }
+}
+
+#[derive(Debug)]
+struct FailingTimeClock;
+
+impl TimeContextClock for FailingTimeClock {
+    fn now(&self) -> Result<UnixMillis, TimeContextError> {
+        Err(TimeContextError::Clock)
+    }
+}
 
 const NORMAL_RESULT_BOUND: usize = 128 * 1024;
 const DELIBERATELY_FALSE_RESULT_BOUND: usize = 512;
@@ -1653,6 +1678,156 @@ fn tool_response_with_id(call_id: &str) -> Vec<StreamChunk> {
         .unwrap(),
         StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
     ]
+}
+
+#[tokio::test]
+async fn durable_time_context_enters_once_per_step_and_reconstructs_each_request() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response(),
+        text_response(),
+    ]));
+    let (tools, _) = ScriptedActions::one(ActionScript::StartedAndQuiescent);
+    let mut agent = agent("time-context-agent", provider.clone(), tools, None);
+    let context = TimeContextRuntime::with_clock(
+        "Asia/Shanghai",
+        Arc::new(TimeSequenceClock(Mutex::new(VecDeque::from([
+            1_720_646_365_567,
+            1_720_646_426_567,
+        ])))),
+    )
+    .unwrap();
+    agent.install_time_context(context);
+
+    let outcome = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(outcome.steps(), 2);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    fn contexts(messages: &[Message]) -> Vec<&Message> {
+        messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message.source().kind(),
+                    crate::model::MessageSourceKind::Plugin { plugin, .. }
+                        if plugin == "time-context"
+                )
+            })
+            .collect::<Vec<_>>()
+    }
+    assert_eq!(contexts(&requests[0]).len(), 1);
+    assert_eq!(contexts(&requests[1]).len(), 2);
+    let second_text = contexts(&requests[1])[1]
+        .content()
+        .iter()
+        .find_map(|block| match block.kind() {
+            ContentBlockKind::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(second_text.contains("turn 1, step 2"));
+    assert!(second_text.contains("Elapsed since the preceding step context:"));
+
+    let events = agent.session().events();
+    let starts = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(event.kind(), EventKind::StepStart { .. }).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let readings = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event.kind() {
+            EventKind::UserMessage { message }
+                if matches!(
+                    message.source().kind(),
+                    crate::model::MessageSourceKind::Plugin { plugin, .. }
+                        if plugin == "time-context"
+                ) =>
+            {
+                Some(index)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(readings.len(), 2);
+    assert!(
+        starts
+            .iter()
+            .zip(&readings)
+            .all(|(start, reading)| start < reading)
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind(), EventKind::RequestHeader { .. }))
+            .all(|event| !event.data().as_value().to_string().contains("Time sampled"))
+    );
+}
+
+#[tokio::test]
+async fn time_context_failure_or_pre_cancel_closes_without_a_step_or_provider_request() {
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response()]));
+    let mut failed = agent(
+        "time-context-failure",
+        provider.clone(),
+        Arc::new(NoTools),
+        None,
+    );
+    failed.install_time_context(
+        TimeContextRuntime::with_clock("UTC", Arc::new(FailingTimeClock)).unwrap(),
+    );
+    let outcome = failed
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    let TurnEndReason::Error { error } = outcome.reason() else {
+        panic!("clock failure must close as a turn error")
+    };
+    assert_eq!(error.code(), "AGENT_TIME_CONTEXT");
+    assert_eq!(outcome.steps(), 0);
+    assert!(provider.requests().is_empty());
+
+    let provider = Arc::new(ScriptedProvider::new(vec![text_response()]));
+    let mut cancelled = agent(
+        "time-context-pre-cancel",
+        provider.clone(),
+        Arc::new(NoTools),
+        None,
+    );
+    cancelled.install_time_context(
+        TimeContextRuntime::with_clock(
+            "UTC",
+            Arc::new(TimeSequenceClock(Mutex::new(VecDeque::from([1_000])))),
+        )
+        .unwrap(),
+    );
+    let token = CancellationToken::new();
+    token.cancel();
+    let outcome = cancelled
+        .run_turn(TurnProposal::Enter(vec![user()]), token)
+        .await
+        .unwrap();
+    assert!(matches!(outcome.reason(), TurnEndReason::Aborted { .. }));
+    assert_eq!(outcome.steps(), 0);
+    assert!(provider.requests().is_empty());
+    assert!(cancelled.session().events().iter().all(|event| {
+        !matches!(
+            event.kind(),
+            EventKind::UserMessage { message }
+                if matches!(
+                    message.source().kind(),
+                    crate::model::MessageSourceKind::Plugin { plugin, .. }
+                        if plugin == "time-context"
+                )
+        )
+    }));
 }
 
 fn two_tool_response() -> Vec<StreamChunk> {
@@ -5099,6 +5274,7 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         goal_tool_caller: super::GoalToolCaller::Untrusted,
         workspace_instructions: None,
         skills: None,
+        time_context: None,
         pending_workspace_touches: &mut pending_workspace_touches,
         repeat_tool_reminder: &mut repeat_tool_reminder,
         pending_repeat_contexts: &mut pending_repeat_contexts,

@@ -27,6 +27,7 @@ events are model-visible. Do not put unrelated secrets in those values.
 | `--resume <SESSION_ID>` | new Session | Continue one validated stored Session |
 | `--plugin-config <PATH>` | no plugins | Start the explicitly configured local tool plugins for this process |
 | `--lsp-config <PATH>` | no language server | Enable explicitly configured local stdio language servers for this process |
+| `--time-zone <IANA_ZONE>` | no time context | Add one durable time reading before each entered model step |
 | `--tui <MODE>` | `auto` | Choose `auto`, `enhanced`, or strict zero-ESC `linear` terminal presentation |
 | `--no-color` | color when supported | Disable ANSI and force the linear terminal presentation |
 
@@ -56,6 +57,32 @@ resize rescue; below that it restores the terminal and fails closed.
 The HTTP client does not follow redirects and ignores system proxy settings.
 Choosing a custom HTTPS endpoint still grants that endpoint the API key and
 model-visible request content.
+
+## Per-step time context
+
+Use a canonical IANA time-zone name when the model needs reliable local dates
+or elapsed time:
+
+```console
+dsh --workspace . --time-zone Asia/Shanghai
+```
+
+The value is capped at 64 UTF-8 bytes and validated before Session creation,
+credential access, local plugin/LSP startup, or network connection. Names are
+case-sensitive and aliases are rejected with their canonical replacement; for
+example, use `America/New_York`, not `america/NEW_YORK`.
+
+Each entered model step gets one append-only snapshot containing the sampled
+whole-second timestamp, numeric UTC offset, canonical zone, and elapsed time
+since the preceding model-visible message or step reading. It is ordinary
+model-visible Session history, so cold recovery and compaction retain old
+readings. Pass `--time-zone` again with `--resume` to add fresh readings in the
+new process; omitting it leaves history intact and disables new samples.
+
+This setting neither asks for approval nor grants tool, file, Shell, process,
+or network authority. It reads no browser zone, does not guess the host zone,
+and starts no timer or background task. Its main cost is a small extra message
+in every model step.
 
 `web_search` uses the same `DEEPSEEK_API_KEY`, but it deliberately does not use
 `DEEPSEEK_BASE_URL`: DeepSeek native search is a separate Anthropic-compatible

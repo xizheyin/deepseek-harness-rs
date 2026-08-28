@@ -1,0 +1,41 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "paths": [
+      "packages/context/time-context/src/index.ts",
+      "packages/context/time-context/src/invariant.ts",
+      "packages/context/time-context/src/request-zone.ts",
+      "packages/context/time-context/src/timestamp.ts",
+      "packages/context/time-context/tests/time-context.spec.ts",
+      "packages/context/time-context/tests/time-context.e2e.ts",
+      ".agents/notes/implemented/feature/2026-07-16-durable-per-step-time-context.md"
+    ]
+  },
+  "source": {
+    "kind": "plugin",
+    "plugin": "time-context",
+    "form": "snapshot",
+    "section": "time-context"
+  },
+  "firstStep": {
+    "prefix": "Time sampled while preparing turn 1, step 1: ",
+    "elapsed": "Elapsed since the preceding model-visible message: unavailable."
+  },
+  "laterStep": {
+    "prefix": "Time sampled while preparing turn 1, step 2: ",
+    "elapsed": "Elapsed since the preceding step context: 1m 1s."
+  },
+  "eventOrder": [
+    "turn/start",
+    "step/start",
+    "user/message:proposal",
+    "user/message:time-context",
+    "request/header-or-context",
+    "provider"
+  ],
+  "rustIntentionalDifference": {
+    "zoneLine": "Terminal time zone for this request: Asia/Shanghai. Interpret otherwise-unqualified dates and times in this zone.",
+    "configuration": "explicit --time-zone; no browser mixed/missing provenance or refresh interval"
+  }
+}

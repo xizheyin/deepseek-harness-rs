@@ -743,6 +743,7 @@ fn help_describes_only_available_options() {
         assert!(help.contains("--model"));
         assert!(help.contains("--workspace"));
         assert!(help.contains("--approval-mode <MODE>"));
+        assert!(help.contains("--time-zone <IANA_ZONE>"));
         assert!(help.contains("ask (default) or auto-edit"));
         assert!(help.contains("--resume [SESSION_ID]"));
         assert!(help.contains("resume: stored model"));
@@ -1623,6 +1624,157 @@ fn real_script_entry_reaches_the_agent_and_loopback_provider() {
             .contains("authorization: bearer test-key-for-loopback-only\r\n")
     );
     std::fs::remove_dir_all(&workspace).expect("test workspace should be removed");
+}
+
+#[test]
+fn real_script_records_configured_time_context_before_the_model_request() {
+    let (base_url, server) = spawn_response_server(vec![text_sse("time context reached dsh")]);
+    let workspace = script_workspace(&format!("time-context-{}", uuid::Uuid::new_v4()));
+    let mut command =
+        prompt_script_command(&base_url, &workspace, "what time context do you have?");
+    command
+        .args(["--time-zone", "Asia/Shanghai"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output =
+        OwnedScriptChild::new(command.spawn().unwrap()).wait_with_output(Duration::from_secs(10));
+    let requests = server.join().unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "time context reached dsh\n");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(requests.len(), 1);
+    let request = request_json(&requests[0]);
+    let request_text = request.to_string();
+    assert!(request_text.contains("Time sampled while preparing turn 1, step 1:"));
+    assert!(request_text.contains("+08:00[Asia/Shanghai]"));
+    assert!(request_text.contains("Terminal time zone for this request: Asia/Shanghai."));
+    assert!(
+        request_text.contains("Elapsed since the preceding model-visible message: unavailable.")
+    );
+    assert!(
+        !request["messages"][0]
+            .to_string()
+            .contains("Time sampled while preparing")
+    );
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let rows = std::fs::read_to_string(only_journal_path(&root))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let step = rows
+        .iter()
+        .position(|row| row["type"] == "step/start")
+        .unwrap();
+    let reading = rows
+        .iter()
+        .position(|row| {
+            row["type"] == "user/message" && row["data"]["source"]["plugin"] == "time-context"
+        })
+        .unwrap();
+    assert!(step < reading);
+    assert_eq!(rows[reading]["data"]["source"]["form"], "snapshot");
+    assert_eq!(
+        rows[reading]["data"]["source"]["sections"][0]["text"],
+        rows[reading]["data"]["content"][0]["text"]
+    );
+    assert!(!rows.iter().any(|row| row["type"] == "approval/asked"));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn resumed_script_replays_old_time_context_and_appends_a_fresh_reading() {
+    let (base_url, server) = spawn_response_server(vec![
+        text_sse("first time-aware answer"),
+        text_sse("second time-aware answer"),
+    ]);
+    let workspace = script_workspace(&format!("time-context-resume-{}", uuid::Uuid::new_v4()));
+    let mut first = prompt_script_command(&base_url, &workspace, "remember this time context");
+    first
+        .args(["--time-zone", "Asia/Shanghai"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let first =
+        OwnedScriptChild::new(first.spawn().unwrap()).wait_with_output(Duration::from_secs(10));
+    assert!(first.status.success(), "{}", stderr(&first));
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let session_id = listed_session_id(&root);
+    let mut second = resume_script_command(
+        &base_url,
+        &root,
+        &session_id,
+        "continue with a fresh time reading",
+    );
+    second
+        .args(["--time-zone", "Asia/Shanghai"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let second =
+        OwnedScriptChild::new(second.spawn().unwrap()).wait_with_output(Duration::from_secs(10));
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert_eq!(stdout(&second), "second time-aware answer\n");
+    assert_eq!(stderr(&second), "");
+
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    let first_request = request_json(&requests[0]).to_string();
+    let resumed_request = request_json(&requests[1]).to_string();
+    assert_eq!(
+        first_request
+            .matches("Time sampled while preparing turn")
+            .count(),
+        1
+    );
+    assert_eq!(
+        resumed_request
+            .matches("Time sampled while preparing turn")
+            .count(),
+        2
+    );
+    assert!(resumed_request.contains("Time sampled while preparing turn 1, step 1:"));
+    assert!(resumed_request.contains("Time sampled while preparing turn 2, step 1:"));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn invalid_time_zone_fails_before_session_credentials_or_network() {
+    let workspace = script_workspace(&format!("time-zone-invalid-{}", uuid::Uuid::new_v4()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let session_root = workspace.join("sessions-must-not-exist");
+    let output = Command::new(env!("CARGO_BIN_EXE_dsh"))
+        .args(["--prompt", "must not run", "--workspace"])
+        .arg(&workspace)
+        .args(["--time-zone", "america/NEW_YORK", "--no-color"])
+        .env_clear()
+        .env("DEEPSEEK_BASE_URL", &base_url)
+        .env("DEEPSEEK_API_KEY", "time-zone-sentinel-secret")
+        .env("DSH_SESSION_ROOT", &session_root)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    let error = stderr(&output);
+    assert!(error.contains("CLI_TIME_ZONE_INVALID"));
+    assert!(error.contains("use America/New_York"));
+    assert!(!error.contains("time-zone-sentinel-secret"));
+    assert!(!session_root.exists());
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    std::fs::remove_dir_all(workspace).unwrap();
 }
 
 #[test]

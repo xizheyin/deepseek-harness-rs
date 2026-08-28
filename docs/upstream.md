@@ -2097,3 +2097,51 @@ git -C ../deepseek-harness-upstream checkout --detach 47f943859bef60e41604923467
 ```
 
 The upstream clone is research input and must not be committed here.
+
+## Phase 38 durable per-step time context — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The following fixed-commit sources
+and tests were inspected before design or implementation:
+
+- `packages/context/time-context/src/index.ts` for listener order, interval
+  scheduling, elapsed baselines, durable message construction and cancellation;
+- `packages/context/time-context/src/invariant.ts` for exact snapshot ownership,
+  step/request boundary checks and replay validation;
+- `packages/context/time-context/src/request-zone.ts` for unique, mixed and
+  missing request-zone provenance and its model wording;
+- `packages/context/time-context/src/timestamp.ts` for whole-second ISO-shaped
+  timestamp, numeric offset and IANA-zone rendering;
+- `packages/context/time-context/tests/{time-context,request-zone,invariant}.spec.ts`
+  and `time-context.e2e.ts` for exact first/later-step text, backward time,
+  cancellation, request history, compaction/resume scheduling and Loader smoke;
+- `.agents/notes/implemented/feature/2026-07-16-durable-per-step-time-context.md`
+  and the package README for the durable-context decision and documented
+  alternatives.
+
+The fixed behavior is opt-in. A due reading is appended to the final entering
+pre-step message batch, so AgentLoop records `step/start` before the
+snapshot-form `user/message` and derives the Provider request afterward.
+Rejected, failed or already-aborted preparation records no reading. Step one
+measures from the latest preceding durable user, assistant or tool-result
+message; later steps measure from the preceding time-context event in the open
+turn. Backward time clamps elapsed duration to zero. Readings are ordinary
+surface messages, remain reconstructable after resume, and are not copied into
+`request/header`.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. In this subsystem, latest master
+preserves all model-visible semantics and changes the listener return from a
+new `{ kind: 'enter', messages }` object to `{ ...decision, messages }`, so
+additional downstream decision fields survive. Test fixtures moved into the
+package and the tool-call identifier type was renamed; neither changes the
+time reading contract.
+
+Rust Phase 38 retains the append-only per-step fact and exact elapsed
+baselines but adapt provenance to a standalone terminal. `--time-zone` is
+explicit user configuration, is validated before external startup work and is
+rendered as `Terminal time zone`; Rust does not claim a browser or Schedule
+boundary. Every enabled step gets a fresh reading, so the optional upstream
+positive interval is deferred. The implementation uses an exact pinned
+IANA/DST-aware dependency rather than changing global `TZ`; dependency purpose,
+features and MSRV are recorded in the design and validation evidence.

@@ -19,6 +19,7 @@ use crate::{
     session::{
         CommittedUiReceiver, Session, SessionSearchRuntime, SessionStore, StoreError, SystemClock,
     },
+    time_context::TimeContextRuntime,
     tools::{
         LSP_PROMPT_TEXT, LocalToolRegistry, LspConfig, PluginConfig, PluginLaunch,
         ToolAssemblyOptions, WebToolProviders, WorkspaceFileCatalogue,
@@ -61,6 +62,26 @@ pub(super) struct AssemblySession {
     session: Session,
     authority: WorkspaceAuthority,
     resumed: bool,
+}
+
+pub(super) struct AssemblyExtensions {
+    plugin_config: Option<PluginConfig>,
+    lsp_config: Option<LspConfig>,
+    time_context: Option<TimeContextRuntime>,
+}
+
+impl AssemblyExtensions {
+    pub(super) fn new(
+        plugin_config: Option<PluginConfig>,
+        lsp_config: Option<LspConfig>,
+        time_context: Option<TimeContextRuntime>,
+    ) -> Self {
+        Self {
+            plugin_config,
+            lsp_config,
+            time_context,
+        }
+    }
 }
 
 impl AssemblySession {
@@ -128,10 +149,14 @@ pub(super) async fn assemble_session(
     requested_model: Option<String>,
     interactive: bool,
     approval_mode: ApprovalMode,
-    plugin_config: Option<PluginConfig>,
-    lsp_config: Option<LspConfig>,
+    extensions: AssemblyExtensions,
     cancellation: CancellationToken,
 ) -> Result<AgentAssembly, AssemblyFailure> {
+    let AssemblyExtensions {
+        plugin_config,
+        lsp_config,
+        time_context,
+    } = extensions;
     let AssemblySession {
         mut session,
         authority,
@@ -307,6 +332,9 @@ pub(super) async fn assemble_session(
         agent.install_workspace_context(workspace_context);
         agent.install_workspace_instruction_runtime(workspace_instruction_runtime);
         agent.install_skill_runtime(skill_runtime);
+        if let Some(time_context) = time_context {
+            agent.install_time_context(time_context);
+        }
         Ok(AgentAssembly::Interactive(InteractiveAssembly {
             agent,
             events,
@@ -330,6 +358,9 @@ pub(super) async fn assemble_session(
                 agent.install_workspace_context(workspace_context);
                 agent.install_workspace_instruction_runtime(workspace_instruction_runtime);
                 agent.install_skill_runtime(skill_runtime);
+                if let Some(time_context) = time_context {
+                    agent.install_time_context(time_context);
+                }
                 Ok(AgentAssembly::Script(agent))
             }
             Err((_error, session)) => {

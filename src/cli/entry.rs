@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     session::SessionStore,
+    time_context::TimeContextRuntime,
     tools::{LspConfig, PluginConfig},
     workspace_authority::WorkspaceAuthority,
 };
@@ -19,7 +20,9 @@ use super::{
         CliOptions, ListSessionsOptions, ParseAction, ParseError, ResumeTarget, TuiMode,
         parse_args_os,
     },
-    assembly::{AgentAssembly, AssemblyError, assemble_session, prepare_new_session},
+    assembly::{
+        AgentAssembly, AssemblyError, AssemblyExtensions, assemble_session, prepare_new_session,
+    },
     interactive::{self, InteractiveError},
     render::VisibleRenderer,
     script_driver::{self, ScriptDriverError},
@@ -46,6 +49,7 @@ const HELP: &str = concat!(
     "  -w, --workspace <PATH>       Workspace (new: current; resume: optional identity check)\n",
     "      --plugin-config <PATH>   Enable explicitly configured local tool plugins\n",
     "      --lsp-config <PATH>      Enable explicitly configured local language servers\n",
+    "      --time-zone <IANA_ZONE>  Add durable per-step time context in this zone\n",
     "      --tui <MODE>             Terminal UI: auto (default), enhanced, or linear\n",
     "      --approval-mode <MODE>   Interactive edits: ask (default) or auto-edit\n",
     "      --reduced-motion         Disable periodic enhanced-UI animation\n",
@@ -112,6 +116,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         workspace,
         plugin_config,
         lsp_config,
+        time_zone,
         resume,
         no_color,
         reduced_motion,
@@ -140,6 +145,9 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             ParseError::ApprovalModeRequiresInteractive,
         ));
     }
+    let time_context = time_zone
+        .map(|zone| TimeContextRuntime::new(&zone).map_err(EntryError::time_context))
+        .transpose()?;
     let plugin_config = plugin_config
         .map(|path| {
             let startup_directory = std::env::current_dir().map_err(|_| EntryError::workspace())?;
@@ -322,8 +330,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
                 model,
                 interactive,
                 approval_mode,
-                plugin_config,
-                lsp_config,
+                AssemblyExtensions::new(plugin_config, lsp_config, time_context),
                 startup_cancellation.clone(),
             ),
             &startup_cancellation,
@@ -627,6 +634,15 @@ impl EntryError {
     fn lsp_config(error: crate::tools::LspConfigError) -> Self {
         Self {
             code: "CLI_LSP_CONFIG_INVALID",
+            exit: 1,
+            detail: Some(error.to_string()),
+            emit_diagnostic: true,
+        }
+    }
+
+    fn time_context(error: crate::time_context::TimeContextError) -> Self {
+        Self {
+            code: "CLI_TIME_ZONE_INVALID",
             exit: 1,
             detail: Some(error.to_string()),
             emit_diagnostic: true,

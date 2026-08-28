@@ -273,6 +273,8 @@ pub enum SurfaceError {
     PruneReplacementWithoutMarker,
     #[error("tool/result replacement does not match the adjacent compaction/prune marker")]
     PruneReplacementMismatch,
+    #[error("time-context user/message has an invalid position or snapshot shape")]
+    InvalidTimeContext,
 }
 
 /// Semantic validation shared by live append and replay.

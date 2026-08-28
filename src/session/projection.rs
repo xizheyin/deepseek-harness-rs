@@ -8,7 +8,10 @@ use std::{
 
 use crate::{
     goal::GoalReplayState,
-    model::{CallId, Message, MessageSourceKind, NonNegativeSafeInteger, TokenUsage},
+    model::{
+        CallId, ContentBlockKind, ContextForm, Message, MessageSourceKind, NonNegativeSafeInteger,
+        TokenUsage,
+    },
     resident_credit::{ResidentCreditLease, arc_inner_charge},
 };
 
@@ -389,6 +392,13 @@ pub(crate) struct Projection {
     retry_schedules: Arc<BTreeMap<(super::RetryId, super::RetryNumber), RetryScheduleState>>,
     attempt: Arc<AttemptProjection>,
     token_anchor: Option<TokenMeasurementAnchor>,
+    time_context: TimeContextProjection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TimeContextProjection {
+    preceding_message: Option<super::UnixMillis>,
+    open_turn_reading: Option<super::UnixMillis>,
 }
 
 /// One current model-visible node.
@@ -472,6 +482,12 @@ impl PreparedLiveProjectionAttempt {
 }
 
 impl PreparedDurableProjection {
+    pub(super) fn set_committed_event_time(&mut self, event: &SessionEvent) {
+        if let Self::Replace { projection, .. } = self {
+            projection.set_committed_event_time(event);
+        }
+    }
+
     pub(super) fn attempt_bookkeeping_resident_bytes(&self) -> usize {
         match self {
             Self::AttemptChunk { prepared, .. } => prepared.resident_bookkeeping_bytes(),
@@ -633,6 +649,7 @@ impl Projection {
             retry_schedules: Arc::new(BTreeMap::new()),
             attempt: Arc::new(AttemptProjection::default()),
             token_anchor: None,
+            time_context: TimeContextProjection::default(),
         }
     }
 
@@ -684,6 +701,14 @@ impl Projection {
             expected: Arc::clone(&self.attempt),
             prepared,
         })
+    }
+
+    pub(crate) fn time_context_baseline(&self, step: StepId) -> Option<super::UnixMillis> {
+        if step == StepId::first() {
+            self.time_context.preceding_message
+        } else {
+            self.time_context.open_turn_reading
+        }
     }
 
     pub(super) fn seal_live_attempt(&mut self) -> Result<PreparedAttempt, AttemptError> {
@@ -1987,6 +2012,7 @@ impl Projection {
                     turn: *turn,
                     next_step: StepId::first(),
                 };
+                self.time_context.open_turn_reading = None;
                 self.standing_todos = None;
             }
             EventKind::TurnEnd { turn, .. } => {
@@ -2010,6 +2036,7 @@ impl Projection {
                     .successor()
                     .ok_or(TransitionError::IdentifierExhausted)?;
                 self.boundary = Boundary::Idle;
+                self.time_context.open_turn_reading = None;
             }
             EventKind::StepStart { turn, step } => match self.boundary.clone() {
                 Boundary::Idle => {
@@ -2548,6 +2575,7 @@ impl Projection {
             }
             return Ok(());
         }
+        let time_context_reading = self.validate_time_context_surface(event)?;
         let operation =
             event
                 .surface_op
@@ -2639,7 +2667,92 @@ impl Projection {
                 self.surface_resident_bytes = surface_resident_bytes;
             }
         }
+        self.observe_message_time(event, time_context_reading);
         Ok(())
+    }
+
+    fn validate_time_context_surface(&self, event: &SessionEvent) -> Result<bool, SurfaceError> {
+        let EventKind::UserMessage { message } = event.kind() else {
+            return Ok(false);
+        };
+        let MessageSourceKind::Plugin {
+            plugin,
+            form,
+            sections,
+            ..
+        } = message.source().kind()
+        else {
+            return Ok(false);
+        };
+        if plugin != crate::time_context::TIME_CONTEXT_SOURCE {
+            return Ok(false);
+        }
+        let (Some(turn), Some(step)) = (self.open_turn(), self.open_step()) else {
+            return Err(SurfaceError::InvalidTimeContext);
+        };
+        if *form != Some(ContextForm::Snapshot)
+            || sections
+                .as_deref()
+                .is_none_or(|sections| sections.len() != 1)
+            || message.content().len() != 1
+        {
+            return Err(SurfaceError::InvalidTimeContext);
+        }
+        let Some(section) = sections.as_deref().and_then(|sections| sections.first()) else {
+            return Err(SurfaceError::InvalidTimeContext);
+        };
+        let ContentBlockKind::Text { text } = message.content()[0].kind() else {
+            return Err(SurfaceError::InvalidTimeContext);
+        };
+        let lines = text.split('\n').collect::<Vec<_>>();
+        let expected_prefix = format!("Time sampled while preparing turn {turn}, step {step}: ");
+        let expected_elapsed = if step == StepId::first() {
+            "Elapsed since the preceding model-visible message: "
+        } else {
+            "Elapsed since the preceding step context: "
+        };
+        let source_fields = message.source().raw().as_value().as_object();
+        if source_fields.is_none_or(|fields| fields.len() != 4)
+            || section.name != crate::time_context::TIME_CONTEXT_SOURCE
+            || section.text != *text
+            || lines.len() != 3
+            || !lines[0].starts_with(&expected_prefix)
+            || lines[0].len() == expected_prefix.len()
+            || !(lines[1].starts_with("Browser time zone for this request: ")
+                || lines[1].starts_with("Terminal time zone for this request: "))
+            || !lines[2].starts_with(expected_elapsed)
+            || !lines[2].ends_with('.')
+        {
+            return Err(SurfaceError::InvalidTimeContext);
+        }
+        Ok(true)
+    }
+
+    fn observe_message_time(&mut self, event: &SessionEvent, time_context_reading: bool) {
+        if matches!(
+            event.kind(),
+            EventKind::UserMessage { .. }
+                | EventKind::AssistantMessage { .. }
+                | EventKind::ToolResult { .. }
+        ) {
+            self.time_context.preceding_message = Some(event.time());
+        }
+        if time_context_reading {
+            self.time_context.open_turn_reading = Some(event.time());
+        }
+    }
+
+    pub(super) fn set_committed_event_time(&mut self, event: &SessionEvent) {
+        let reading = matches!(
+            event.kind(),
+            EventKind::UserMessage { message }
+                if matches!(
+                    message.source().kind(),
+                    MessageSourceKind::Plugin { plugin, .. }
+                        if plugin == crate::time_context::TIME_CONTEXT_SOURCE
+                )
+        );
+        self.observe_message_time(event, reading);
     }
 
     fn surface_node(
