@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–44 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–45 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -52,8 +52,24 @@ for behavior that users can run today.
 | 42 | Bounded process-local background Shell jobs | `complete` | [`validation/phase-42.md`](validation/phase-42.md) |
 | 43 | Background-job completion notices and bounded idle wakeups | `complete` | [`validation/phase-43.md`](validation/phase-43.md) |
 | 44 | Consuming incremental output for background Shell jobs | `complete` | [`validation/phase-44.md`](validation/phase-44.md) |
+| 45 | Durable first-prompt Session titles | `complete` | [`validation/phase-45.md`](validation/phase-45.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
+
+## Phase 45 boundary (2026-08-29)
+
+Phase 45 adds a readable title to each Session without delaying or endangering
+the main conversation. The first direct human prompt immediately produces a
+bounded, control-cleaned fallback title. After the main request route has been
+recorded, one bounded DeepSeek request may replace it with a natural-language
+title. Title failure, timeout, cancellation, malformed output or shutdown keeps
+the fallback and never changes the turn result.
+
+Both the title request and accepted title are append-only log facts and remain
+outside the model-visible conversation. Normally closed local journals expose
+their latest title in `--list-sessions` and the interactive resume picker.
+Phase 45 does not add manual rename, title refresh, fork inheritance, a title
+index/database or background work that survives process shutdown.
 
 ## Phase 8 revised boundary (2026-08-18)
 

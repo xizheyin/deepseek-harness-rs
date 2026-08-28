@@ -54,7 +54,7 @@ const HELP: &str = concat!(
     "      --approval-mode <MODE>   Interactive edits: ask (default) or auto-edit\n",
     "      --reduced-motion         Disable periodic enhanced-UI animation\n",
     "      --no-color               Disable color and force the linear terminal UI\n",
-    "      --list-sessions          List persisted session headers\n",
+    "      --list-sessions          List persisted sessions and titles\n",
     "      --resume [SESSION_ID]    Pick or resume one persisted session\n",
     "  -h, --help                   Print help\n",
     "  -V, --version                Print version\n",

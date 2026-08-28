@@ -1111,6 +1111,12 @@ impl CommittedUiEvent {
                 target: prune.shadowed_range().start(),
                 shadowed_tokens: prune.shadowed_token_count().get(),
             },
+            EventKind::SessionTitle { .. } => CommittedUiKind::TypeOnly {
+                event_type: "session/title",
+            },
+            EventKind::SessionTitleLlmRequest { .. } => CommittedUiKind::TypeOnly {
+                event_type: "session/title-llm-request",
+            },
             EventKind::EndSeed => CommittedUiKind::TypeOnly {
                 event_type: "session/end-seed",
             },

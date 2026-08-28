@@ -20,7 +20,7 @@ use crate::{
         ReasoningEffortId, StreamChunk, StreamChunkKind, ToolSchema,
     },
     provider::{
-        MAX_PROVIDER_REQUEST_BYTES, PreparedProviderCall, ProviderPreflightError,
+        MAX_PROVIDER_REQUEST_BYTES, ModelProvider, PreparedProviderCall, ProviderPreflightError,
         ProviderPrepareError, ProviderRequest, ProviderRequestDraft, RequestPurpose,
     },
 };
@@ -196,6 +196,23 @@ fn preflight_counts_the_exact_wire_without_credentials_or_transport() {
     assert_eq!(request.preflight_encoded_bytes(), Some(encoded_bytes));
     assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
     assert_eq!(transport.request_count(), 0);
+}
+
+#[test]
+fn auxiliary_titles_are_enabled_for_remote_https_and_disabled_for_loopback() {
+    let remote = provider_with(
+        DeepSeekConfig::default(),
+        static_credentials(),
+        Arc::new(ScriptedTransport::new([])),
+    );
+    assert!(remote.supports_session_titles());
+
+    let loopback = provider_with(
+        DeepSeekConfig::new("http://127.0.0.1:40123", CredentialRef::default_deepseek()).unwrap(),
+        static_credentials(),
+        Arc::new(ScriptedTransport::new([])),
+    );
+    assert!(!loopback.supports_session_titles());
 }
 
 #[test]

@@ -622,6 +622,13 @@ pub type ProviderStream =
 /// The built-in DeepSeek provider enforces this; custom providers are
 /// responsible for the same contract.
 pub trait ModelProvider: Send + Sync {
+    /// Whether this provider endpoint permits the optional background Session
+    /// title request. Test doubles and loopback endpoints default to disabled
+    /// so one conversational response cannot be consumed by an auxiliary call.
+    fn supports_session_titles(&self) -> bool {
+        false
+    }
+
     /// Resolve model capabilities and materialize defaults before session
     /// logging. This synchronous method must return promptly; remote discovery
     /// belongs in the lazy stream or a future async preparation API.

@@ -5412,6 +5412,7 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         repeat_tool_reminder: &mut repeat_tool_reminder,
         pending_repeat_contexts: &mut pending_repeat_contexts,
         job_notices: &super::JobNoticeInbox::new(),
+        session_titles: None,
     };
     let budget_failure = super::failure_reason(
         "AGENT_EVENT_BUDGET",

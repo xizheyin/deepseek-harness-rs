@@ -900,7 +900,7 @@ fn listing_prints_sorted_header_facts_and_filters_by_workspace_identity() {
     assert_eq!(
         stdout(&all),
         format!(
-            "{id_b}\t30\t{}\n{id_a}\t20\t{}\n",
+            "{id_b}\t30\t{}\t\n{id_a}\t20\t{}\t\n",
             canonical_b.to_str().unwrap(),
             canonical_a.to_str().unwrap()
         )
@@ -912,7 +912,7 @@ fn listing_prints_sorted_header_facts_and_filters_by_workspace_identity() {
     assert!(filtered.status.success(), "{}", stderr(&filtered));
     assert_eq!(
         stdout(&filtered),
-        format!("{id_a}\t20\t{}\n", canonical_a.to_str().unwrap())
+        format!("{id_a}\t20\t{}\t\n", canonical_a.to_str().unwrap())
     );
     assert_eq!(stderr(&filtered), "");
 
@@ -940,7 +940,7 @@ fn a_real_script_session_is_immediately_keyless_listable() {
         .trim_end_matches('\n')
         .split('\t')
         .collect::<Vec<_>>();
-    assert_eq!(fields.len(), 3);
+    assert_eq!(fields.len(), 4);
     let id = fields[0]
         .strip_prefix("session-")
         .expect("listed id should have the product prefix");
@@ -948,6 +948,7 @@ fn a_real_script_session_is_immediately_keyless_listable() {
     assert_eq!(parsed.get_version(), Some(uuid::Version::Random));
     assert!(fields[1].parse::<i64>().is_ok());
     assert_eq!(fields[2], canonical_workspace.to_str().unwrap());
+    assert_eq!(fields[3], "create a durable session");
 
     std::fs::remove_dir_all(workspace).unwrap();
 }

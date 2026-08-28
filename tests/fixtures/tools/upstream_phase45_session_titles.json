@@ -1,0 +1,31 @@
+{
+  "upstreamCommit": "47f943859bef60e4160492346772ded9b24f765a",
+  "sources": [
+    "packages/session/session-title/src/index.ts",
+    "packages/session/session-title/src/normalize.ts",
+    "packages/session/session-title-llm/src/index.ts",
+    "packages/session/session-title-first-prompt-llm/src/index.ts",
+    "packages/bundle/base/cordis.patch.yml"
+  ],
+  "firstPrompt": {
+    "fallbackMaxWords": 5,
+    "fallbackMaxBytes": 40,
+    "providerInputMaxBytes": 4096,
+    "providerOutputMaxBytes": 80,
+    "maxOutputTokens": 64,
+    "timeoutMs": 60000,
+    "eventOrder": [
+      "user/message",
+      "session/title",
+      "request/header",
+      "session/title-llm-request",
+      "session/title"
+    ]
+  },
+  "failure": {
+    "keepsFallback": true,
+    "changesMainTurn": false,
+    "automaticRetryAfterResume": false
+  },
+  "projection": "latest-title-wins"
+}

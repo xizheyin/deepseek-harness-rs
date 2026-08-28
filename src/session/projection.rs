@@ -303,6 +303,8 @@ pub struct SessionState {
     goal: GoalReplayState,
     plan_mode_active: bool,
     standing_todos: Option<Arc<Vec<TodoItem>>>,
+    session_title: Option<super::SessionTitleEvent>,
+    session_title_llm_requested: bool,
 }
 
 impl SessionState {
@@ -367,6 +369,16 @@ impl SessionState {
     pub fn standing_todos(&self) -> Option<&[TodoItem]> {
         self.standing_todos.as_deref().map(Vec::as_slice)
     }
+
+    #[must_use]
+    pub fn session_title(&self) -> Option<&super::SessionTitleEvent> {
+        self.session_title.as_ref()
+    }
+
+    #[must_use]
+    pub const fn session_title_llm_requested(&self) -> bool {
+        self.session_title_llm_requested
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,6 +397,8 @@ pub(crate) struct Projection {
     goal: GoalReplayState,
     plan_mode_active: bool,
     standing_todos: Option<Arc<Vec<TodoItem>>>,
+    session_title: Option<super::SessionTitleEvent>,
+    session_title_llm_requested: bool,
     compaction: CompactionState,
     pending_approvals: Vec<ApprovalRequestId>,
     owned_approval_ids: Arc<BTreeSet<ApprovalRequestId>>,
@@ -642,6 +656,8 @@ impl Projection {
             goal: GoalReplayState::default(),
             plan_mode_active: false,
             standing_todos: None,
+            session_title: None,
+            session_title_llm_requested: false,
             compaction: CompactionState::default(),
             pending_approvals: Vec::new(),
             owned_approval_ids: Arc::new(BTreeSet::new()),
@@ -1099,6 +1115,8 @@ impl Projection {
             goal: self.goal.clone(),
             plan_mode_active: self.plan_mode_active,
             standing_todos: self.standing_todos.clone(),
+            session_title: self.session_title.clone(),
+            session_title_llm_requested: self.session_title_llm_requested,
         }
     }
 
@@ -2196,6 +2214,12 @@ impl Projection {
             }
             EventKind::PlanMode { change } => {
                 self.plan_mode_active = change.active();
+            }
+            EventKind::SessionTitle { title } => {
+                self.session_title = Some(title.clone());
+            }
+            EventKind::SessionTitleLlmRequest { .. } => {
+                self.session_title_llm_requested = true;
             }
             EventKind::RequestContext { context } => {
                 if self.open_turn().is_none() {
@@ -3395,6 +3419,8 @@ impl EventKind {
             Self::TodoWrite { .. } => "todo/write",
             Self::GoalChange { .. } => "goal/change",
             Self::PlanMode { .. } => "plan/mode",
+            Self::SessionTitle { .. } => "session/title",
+            Self::SessionTitleLlmRequest { .. } => "session/title-llm-request",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",

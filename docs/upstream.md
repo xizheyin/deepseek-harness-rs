@@ -2399,3 +2399,38 @@ process runner. It retains one cursor, exact per-stream 64,000-byte tails,
 explicit loss, finalized spill locators and the existing total process/output
 caps. It does not add generic producer registration, live spill locator
 publication, persistence or multi-Agent routing.
+
+## Phase 45 first-prompt Session titles — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. Before design and implementation,
+the following fixed-commit paths were inspected:
+
+- `packages/session/session-title/src/{index,normalize,types}.ts` and its
+  Session, persistence and provider tests for title events, latest-value replay,
+  normalization and the five-word/40-byte fallback;
+- `packages/session/session-title-llm/src/index.ts` and focused tests for the
+  exact pre-dispatch request fact, tool-free auxiliary call, accepted `stop`
+  text and non-fatal failure behavior;
+- `packages/session/session-title-first-prompt-llm/src/index.ts` and tests for
+  first direct-human eligibility, 4096-byte input, 64-token output, 60-second
+  timeout and non-blocking lifecycle;
+- `packages/bundle/base/cordis.patch.yml` for the shipped 80-byte accepted title
+  and first-prompt provider configuration.
+
+The official producer writes a fallback from the first eligible human message,
+then records `session/title-llm-request` before starting one current-route model
+call. Only plain text ending with `stop` may replace the fallback. Errors,
+reasoning/tool output, max-token finish, cancellation and disposal leave the
+main conversation unchanged. Title events are log-only and the last title wins.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Its relevant title changes route
+reads through a projection cache; normalization, request framing, limits and
+first-prompt behavior are unchanged.
+
+Rust Phase 45 keeps one Session writer and collects the asynchronous result at
+the end of a turn, the next turn, or orderly shutdown. Custom loopback endpoints
+retain the immediate fallback but skip the extra provider call. Local listing
+scans only closed, shared-locked, current-format journals up to 16 MiB and omits
+unavailable title metadata without weakening resume validation.

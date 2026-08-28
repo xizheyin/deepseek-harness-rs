@@ -11,6 +11,7 @@ mod phase6_tests;
 mod phase7_tests;
 mod repeat_tool_reminder;
 mod retry;
+mod session_title;
 mod tool;
 
 use std::{
@@ -85,6 +86,7 @@ use compaction::{
 use job_notice::{PendingJobNotice, messages_for_notices};
 use repeat_tool_reminder::RepeatToolReminder;
 use retry::{RetryDecision, decide, policy_key};
+use session_title::SessionTitleRuntime;
 
 pub const MAX_AGENT_STEPS_PER_TURN: usize = 64;
 pub const MAX_AGENT_ATTEMPTS_PER_TURN: usize = 64;
@@ -809,6 +811,7 @@ pub struct AgentLoop {
     pending_workspace_touches: Vec<String>,
     repeat_tool_reminder: RepeatToolReminder,
     job_notices: JobNoticeInbox,
+    session_titles: SessionTitleRuntime,
     prepared_job_wake: Option<Vec<PendingJobNotice>>,
     poisoned: bool,
 }
@@ -878,6 +881,14 @@ impl AgentLoop {
         if let Err(error) = config.validate_fixed_request_size() {
             return Err((error, session));
         }
+        let refinement_enabled = provider.supports_session_titles();
+        let session_titles = SessionTitleRuntime::new(
+            &session,
+            provider.clone(),
+            config.call.provider() == crate::provider::deepseek::DEEPSEEK_PROVIDER
+                || refinement_enabled,
+            refinement_enabled,
+        );
         Ok(Self {
             session,
             provider,
@@ -894,6 +905,7 @@ impl AgentLoop {
             pending_workspace_touches: Vec::new(),
             repeat_tool_reminder: RepeatToolReminder::default(),
             job_notices: JobNoticeInbox::new(),
+            session_titles,
             prepared_job_wake: None,
             poisoned: false,
         })
@@ -1061,6 +1073,7 @@ impl AgentLoop {
                 repeat_tool_reminder: &mut self.repeat_tool_reminder,
                 pending_repeat_contexts: &mut pending_repeat_contexts,
                 job_notices: &self.job_notices,
+                session_titles: None,
             };
             compact_once(
                 &mut reservation,
@@ -1120,7 +1133,8 @@ impl AgentLoop {
     ///
     /// This replaces the old synchronous extraction seam, which could drop a
     /// persistent plugin process without waiting for its process group.
-    pub async fn shutdown_into_session(self) -> Result<Session, AgentReleaseError> {
+    pub async fn shutdown_into_session(mut self) -> Result<Session, AgentReleaseError> {
+        self.session_titles.shutdown(&mut self.session).await;
         let Self { session, tools, .. } = self;
         match shutdown_tool_executor(tools.as_ref()).await {
             Ok(()) => Ok(session),
@@ -1130,6 +1144,7 @@ impl AgentLoop {
 
     /// Stop and join tools before flushing and joining the Session writer.
     pub async fn shutdown(&mut self) -> Result<(), AgentShutdownError> {
+        self.session_titles.shutdown(&mut self.session).await;
         let tools = shutdown_tool_executor(self.tools.as_ref()).await;
         let session = self.session.shutdown().await;
         match (tools, session) {
@@ -1231,6 +1246,7 @@ impl AgentLoop {
             }
             return Err(error.into());
         }
+        self.session_titles.collect_ready(&mut self.session).await;
         let provider = self.provider.clone();
         let tools = self.tools.clone();
         let runtime = self.runtime.clone();
@@ -1249,10 +1265,12 @@ impl AgentLoop {
             &mut self.pending_workspace_touches,
             &mut self.repeat_tool_reminder,
             &self.job_notices,
+            &mut self.session_titles,
             proposal,
             cancellation,
         )
         .await;
+        self.session_titles.collect_ready(&mut self.session).await;
         if inserted_workspace_context.as_deref().is_some_and(|id| {
             self.session
                 .visible_messages()
@@ -1367,12 +1385,16 @@ impl UnstartedStepClaims {
     async fn enter(
         mut self,
         reservation: &mut SessionReservation<'_>,
-    ) -> Result<EventClaim, AgentLoopError> {
+    ) -> Result<(EventClaim, Vec<AppendReceipt>), AgentLoopError> {
         reservation.settle_exact_settled(&mut self.start).await?;
+        let mut receipts = Vec::new();
+        receipts
+            .try_reserve_exact(self.inputs.len())
+            .map_err(|_| AgentLoopError::Invariant("step input receipts could not be reserved"))?;
         for input in &mut self.inputs {
-            reservation.settle_exact_settled(input).await?;
+            receipts.push(reservation.settle_exact_settled(input).await?);
         }
-        Ok(self.end)
+        Ok((self.end, receipts))
     }
 
     fn release(mut self, reservation: &mut SessionReservation<'_>) -> Result<(), AgentLoopError> {
@@ -1526,6 +1548,7 @@ struct Driver<'a> {
     repeat_tool_reminder: &'a mut RepeatToolReminder,
     pending_repeat_contexts: &'a mut Vec<Message>,
     job_notices: &'a JobNoticeInbox,
+    session_titles: Option<&'a mut SessionTitleRuntime>,
 }
 
 impl Driver<'_> {
@@ -1576,6 +1599,7 @@ async fn run_turn_inner(
     pending_workspace_touches: &mut Vec<String>,
     repeat_tool_reminder: &mut RepeatToolReminder,
     job_notices: &JobNoticeInbox,
+    session_titles: &mut SessionTitleRuntime,
     proposal: TurnProposal,
     cancellation: CancellationToken,
 ) -> Result<TurnOutcome, AgentLoopError> {
@@ -1631,6 +1655,7 @@ async fn run_turn_inner(
         repeat_tool_reminder,
         pending_repeat_contexts: &mut pending_repeat_contexts,
         job_notices,
+        session_titles: Some(session_titles),
     };
 
     let mut reason = if cancellation.is_cancelled() {
@@ -2001,7 +2026,12 @@ async fn run_entered_turn(
             unstarted.release(reservation)?;
             continue;
         }
-        let mut step_end = unstarted.enter(reservation).await?;
+        let (mut step_end, input_receipts) = unstarted.enter(reservation).await?;
+        if let Some(session_titles) = driver.session_titles.as_deref_mut() {
+            session_titles
+                .record_fallback(reservation, &messages, &input_receipts)
+                .await;
+        }
         messages.clear();
         driver.counters.steps += 1;
 
@@ -2710,6 +2740,12 @@ async fn run_step(
                 }
                 Err(error) => return Err(error.into()),
             }
+        }
+
+        if let Some(session_titles) = driver.session_titles.as_deref_mut() {
+            session_titles
+                .start_refinement(reservation, &effective_config)
+                .await;
         }
 
         if let Some(failure) = prepared_failure {

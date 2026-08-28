@@ -19,6 +19,11 @@ pub(super) fn write_session_list(
         visible.render_single_line_fragment(session.workspace(), |chunk| {
             output.write_all(chunk.as_bytes())
         })?;
+        output.write_all(b"\t")?;
+        if let Some(title) = session.title() {
+            visible
+                .render_single_line_fragment(title, |chunk| output.write_all(chunk.as_bytes()))?;
+        }
         visible.render_trusted("\n", |chunk| output.write_all(chunk.as_bytes()))?;
     }
     Ok(())
@@ -41,7 +46,7 @@ mod tests {
         write_session_list(&mut output, &sessions).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "session-550e8400-e29b-41d4-a716-446655440000\t7\t/work\\nforged\\tcolumn\\u{1b}[31m\n"
+            "session-550e8400-e29b-41d4-a716-446655440000\t7\t/work\\nforged\\tcolumn\\u{1b}[31m\t\n"
         );
     }
 }

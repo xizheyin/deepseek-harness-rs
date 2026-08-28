@@ -21,6 +21,7 @@ mod recovery;
 mod resume;
 mod search;
 mod store;
+mod title;
 mod tool_result_pruner;
 
 use std::{
@@ -60,6 +61,11 @@ pub(crate) use projection::CompactionCandidate;
 pub use projection::SessionState;
 pub(crate) use store::SessionMetadata;
 pub use store::{SessionStore, StoreError};
+pub(crate) use title::{PROVIDER_TITLE_MAX_BYTES, TITLE_INPUT_MAX_BYTES, TITLE_OUTPUT_MAX_TOKENS};
+pub use title::{
+    SessionTitleEvent, SessionTitleLlmRequestEvent, SessionTitleRoute, SessionTitleSource,
+    fallback_title, normalize_title,
+};
 
 pub(crate) use observer::{
     CommittedUiEvent, CommittedUiKind, CommittedUiReceiver, SourceSeqBitmap, UiAssistantBlockKind,

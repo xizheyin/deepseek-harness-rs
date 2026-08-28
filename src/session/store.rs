@@ -2,8 +2,9 @@
 
 use std::{
     fs::File,
-    io::{Read as _, Write as _},
+    io::{Read as _, Seek as _, Write as _},
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
     time::{Duration, Instant},
 };
 
@@ -85,7 +86,7 @@ pub struct SessionStore {
     root: RootPlan,
 }
 
-/// Safe header-only facts shown by `--list-sessions`.
+/// Safe header facts plus an optional title from a bounded closed-journal scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionMetadata {
     id: SessionId,
@@ -93,6 +94,7 @@ pub(crate) struct SessionMetadata {
     workspace: String,
     workspace_device: u64,
     workspace_inode: u64,
+    title: Option<String>,
 }
 
 /// One workspace-authorized, shared-locked journal opened for a bounded
@@ -126,6 +128,7 @@ impl SessionMetadata {
         workspace: String,
         workspace_device: u64,
         workspace_inode: u64,
+        title: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -133,6 +136,7 @@ impl SessionMetadata {
             workspace,
             workspace_device,
             workspace_inode,
+            title,
         }
     }
 
@@ -142,7 +146,7 @@ impl SessionMetadata {
         created_at: UnixMillis,
         workspace: impl Into<String>,
     ) -> Self {
-        Self::new(id.into(), created_at, workspace.into(), 0, 0)
+        Self::new(id.into(), created_at, workspace.into(), 0, 0, None)
     }
 
     pub(crate) fn id(&self) -> &SessionId {
@@ -155,6 +159,16 @@ impl SessionMetadata {
 
     pub(crate) fn workspace(&self) -> &str {
         &self.workspace
+    }
+
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_title_for_test(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
     }
 }
 
@@ -583,7 +597,52 @@ fn read_session_metadata(
     if !named_journal_still_matches(root, name, &file)? {
         return Ok(None);
     }
-    Ok(parse_session_metadata(&line, &expected_id))
+    let Some(mut metadata) = parse_session_metadata(&line, &expected_id) else {
+        return Ok(None);
+    };
+    metadata.title = read_latest_session_title(&mut file, &expected_id);
+    if !named_journal_still_matches(root, name, &file)? {
+        return Ok(None);
+    }
+    Ok(Some(metadata))
+}
+
+fn read_latest_session_title(file: &mut File, expected_id: &SessionId) -> Option<String> {
+    const MAX_TITLE_SCAN_BYTES: u64 = 16 * 1_024 * 1_024;
+    let length = file.metadata().ok()?.len();
+    if length > MAX_TITLE_SCAN_BYTES {
+        return None;
+    }
+    match rustix::fs::flock(&*file, rustix::fs::FlockOperation::NonBlockingLockShared) {
+        Ok(()) => {}
+        Err(error)
+            if error == rustix::io::Errno::WOULDBLOCK || error == rustix::io::Errno::AGAIN =>
+        {
+            return None;
+        }
+        Err(_) => return None,
+    }
+    file.seek(std::io::SeekFrom::Start(0)).ok()?;
+    let cancelled = AtomicBool::new(false);
+    let mut latest = None;
+    let scan = super::recovery::scan_jsonl_observing(
+        &mut *file,
+        expected_id,
+        &cancelled,
+        |_, _| Ok(()),
+        |event| {
+            if let super::EventKind::SessionTitle { title } = event.kind() {
+                latest = Some(title.title().to_owned());
+            }
+            Ok(())
+        },
+    )
+    .ok()?;
+    (scan.physical_bytes() == length
+        && scan.valid_bytes() == length
+        && scan.is_quiescent_for_search())
+    .then_some(latest)
+    .flatten()
 }
 
 fn read_complete_header_line(file: &mut File) -> Result<Option<Vec<u8>>, StoreError> {
@@ -655,6 +714,7 @@ fn parse_session_metadata(line: &[u8], expected_id: &SessionId) -> Option<Sessio
         workspace,
         workspace_device,
         workspace_inode,
+        None,
     ))
 }
 
@@ -857,8 +917,8 @@ mod tests {
 
     use crate::{
         session::{
-            EventKind, EventSeq, NewEvent, SessionHeader, SessionId, SystemClock, TurnEndReason,
-            TurnId, UnixMillis,
+            EventKind, EventSeq, NewEvent, SessionHeader, SessionId, SessionTitleEvent,
+            SessionTitleSource, SystemClock, TurnEndReason, TurnId, UnixMillis,
         },
         workspace_authority::WorkspaceAuthority,
     };
@@ -890,6 +950,40 @@ mod tests {
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(root).unwrap();
+        fs::remove_dir(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn listing_reads_the_latest_title_from_a_closed_valid_journal() {
+        let root = private_dir("store-title-root");
+        let workspace = private_dir("store-title-workspace");
+        let store = SessionStore::open_existing(&root).unwrap();
+        let authority = WorkspaceAuthority::open(&workspace).unwrap();
+        let mut session = store
+            .prepare_new(
+                SessionId::new("session-450e8400-e29b-41d4-a716-446655440000"),
+                &authority,
+                SystemClock,
+            )
+            .unwrap();
+        session.materialize_if_needed().await.unwrap();
+        let title = SessionTitleEvent::new(
+            "Readable Session title",
+            vec![EventSeq::new(0).unwrap()],
+            SessionTitleSource::Fallback,
+        )
+        .unwrap();
+        session
+            .append_settled(NewEvent::log(EventKind::session_title(title)))
+            .await
+            .unwrap();
+        session.shutdown().await.unwrap();
+
+        let listed = store.list(Some(authority.identity())).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title(), Some("Readable Session title"));
+
+        fs::remove_dir_all(root).unwrap();
         fs::remove_dir(workspace).unwrap();
     }
 

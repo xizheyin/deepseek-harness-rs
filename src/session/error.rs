@@ -311,6 +311,8 @@ pub enum EventValidationError {
     InvalidCompactionEvent(&'static str),
     #[error("invalid Goal event: {0}")]
     InvalidGoalEvent(String),
+    #[error("invalid Session title event: {0}")]
+    InvalidTitleEvent(&'static str),
     #[error("session contains {actual} events; maximum is {maximum}")]
     TooManyEvents { maximum: usize, actual: usize },
 }

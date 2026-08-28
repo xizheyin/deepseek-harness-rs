@@ -111,6 +111,20 @@ impl DeepSeekProvider {
 }
 
 impl ModelProvider for DeepSeekProvider {
+    fn supports_session_titles(&self) -> bool {
+        let Ok(endpoint) = reqwest::Url::parse(self.inner.config.endpoint()) else {
+            return false;
+        };
+        let Some(host) = endpoint.host_str() else {
+            return false;
+        };
+        if host.eq_ignore_ascii_case("localhost") {
+            return false;
+        }
+        host.parse::<std::net::IpAddr>()
+            .map_or(true, |address| !address.is_loopback())
+    }
+
     fn prepare_call(
         &self,
         config: LlmCallConfig,

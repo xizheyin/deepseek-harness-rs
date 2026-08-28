@@ -1331,6 +1331,12 @@ pub enum EventKind {
     PlanMode {
         change: crate::plan_mode::PlanModeChange,
     },
+    SessionTitle {
+        title: super::SessionTitleEvent,
+    },
+    SessionTitleLlmRequest {
+        request: super::SessionTitleLlmRequestEvent,
+    },
     RequestHeader {
         header: EpochHeader,
         reason: RequestHeaderReason,
@@ -1461,6 +1467,16 @@ impl EventKind {
     }
 
     #[must_use]
+    pub fn session_title(title: super::SessionTitleEvent) -> Self {
+        Self::SessionTitle { title }
+    }
+
+    #[must_use]
+    pub fn session_title_llm_request(request: super::SessionTitleLlmRequestEvent) -> Self {
+        Self::SessionTitleLlmRequest { request }
+    }
+
+    #[must_use]
     pub fn llm_retry(retry: LlmRetryEvent) -> Self {
         Self::LlmRetry { retry }
     }
@@ -1516,6 +1532,8 @@ impl EventKind {
             Self::TodoWrite { .. } => "todo/write",
             Self::GoalChange { .. } => "goal/change",
             Self::PlanMode { .. } => "plan/mode",
+            Self::SessionTitle { .. } => "session/title",
+            Self::SessionTitleLlmRequest { .. } => "session/title-llm-request",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",
@@ -1545,6 +1563,8 @@ impl EventKind {
             Self::TodoWrite { .. } => "todo/write",
             Self::GoalChange { .. } => "goal/change",
             Self::PlanMode { .. } => "plan/mode",
+            Self::SessionTitle { .. } => "session/title",
+            Self::SessionTitleLlmRequest { .. } => "session/title-llm-request",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",
@@ -1604,6 +1624,8 @@ impl EventKind {
             Self::GoalChange { change } => change
                 .validate()
                 .map_err(|error| EventValidationError::InvalidGoalEvent(error.to_string()))?,
+            Self::SessionTitle { title } => title.validate()?,
+            Self::SessionTitleLlmRequest { request } => request.validate()?,
             Self::CompactionStart { start } => start.validate()?,
             Self::CompactionSummary { summary } => summary.validate()?,
             Self::CompactionEnd { end } => end.validate()?,

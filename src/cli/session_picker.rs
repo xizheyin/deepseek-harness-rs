@@ -547,7 +547,11 @@ fn format_session_row(
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or(session.workspace());
-    let visible = render_visible_owned_bounded(basename, false, MAX_SAFE_WORKSPACE_LABEL_BYTES)
+    let label = session
+        .title()
+        .map(|title| format!("{title} · {basename}"))
+        .unwrap_or_else(|| basename.to_owned());
+    let visible = render_visible_owned_bounded(&label, false, MAX_SAFE_WORKSPACE_LABEL_BYTES)
         .map_err(|_| PickerError::Output)?
         .unwrap_or_else(|| "[workspace]".to_owned());
     let id = session
@@ -716,6 +720,19 @@ mod tests {
 
         assert_eq!(clip_cells("中文abc", 4), "中文");
         assert_eq!(clip_cells("👨‍👩‍👧‍👦x", 2), "👨‍👩‍👧‍👦");
+    }
+
+    #[test]
+    fn row_prefers_the_title_but_keeps_workspace_context() {
+        let session = metadata(
+            "session-12345678-e29b-41d4-a716-446655440000",
+            7,
+            "/work/project",
+        )
+        .with_title_for_test("Fix parser cancellation");
+        let row = super::format_session_row(&session, 112).unwrap();
+        assert!(row.contains("Fix parser cancellation · project"));
+        assert!(row.contains("12345678"));
     }
 
     #[test]

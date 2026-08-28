@@ -1668,6 +1668,8 @@ fn extract_event_text(event: &SessionEvent) -> String {
         | EventKind::AssistantChunk { .. }
         | EventKind::GoalChange { .. }
         | EventKind::PlanMode { .. }
+        | EventKind::SessionTitle { .. }
+        | EventKind::SessionTitleLlmRequest { .. }
         | EventKind::RequestHeader { .. }
         | EventKind::RequestContext { .. }
         | EventKind::LlmRetry { .. }
