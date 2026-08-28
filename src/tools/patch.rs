@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, path::Path};
 
-use diffy::{Line, Patch};
+use diffy::{Line, Patch, create_patch};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -16,8 +16,10 @@ use crate::{
 
 use super::{
     MAX_DIRECTORY_DEPTH,
-    error::ToolCallError,
-    workspace::{Workspace, WorkspaceCommitStatus, WorkspaceMutationOperation},
+    error::{ToolCallError, ToolCallResult},
+    workspace::{
+        PreparedWorkspaceMutation, Workspace, WorkspaceCommitStatus, WorkspaceMutationOperation,
+    },
 };
 
 pub(crate) const MAX_PATCH_BYTES: usize = 256 * 1024;
@@ -85,8 +87,186 @@ pub(crate) async fn prepare(
     if let Err(error) = validate_file_text(&candidate) {
         return error.into_execution_result().map(ToolPreparation::Complete);
     }
+    let canonical = match canonical_diff(
+        &parsed.path,
+        parsed.operation,
+        &before.normalized,
+        &parsed.patch,
+        cancellation,
+    ) {
+        Ok(diff) => diff,
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    let prompt = match canonical_prompt(&parsed.path, parsed.operation, canonical) {
+        Ok(prompt) => prompt,
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    finish_prepared_mutation(
+        target,
+        before,
+        candidate,
+        parsed.path,
+        parsed.operation,
+        prompt,
+        None,
+    )
+}
+
+pub(crate) struct GeneratedTextMutation {
+    pub(crate) candidate: String,
+    pub(crate) success_message: String,
+}
+
+/// Prepare an editor-derived candidate through the same retained-capability,
+/// approval, conflict, and publication path as `apply_patch`.
+pub(crate) async fn prepare_text_mutation<F>(
+    workspace: &Workspace,
+    path: &str,
+    operation: WorkspaceMutationOperation,
+    cancellation: &CancellationToken,
+    transform: F,
+) -> Result<ToolPreparation, ToolExecutorError>
+where
+    F: FnOnce(&str) -> ToolCallResult<GeneratedTextMutation>,
+{
+    if cancellation.is_cancelled() {
+        return ToolCallError::aborted()
+            .into_execution_result()
+            .map(ToolPreparation::Complete);
+    }
+    let resolved = match workspace.resolve(path) {
+        Ok(path) => path,
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    let display_path = resolved.display.clone();
+    let target = match workspace
+        .prepare_mutation(resolved, operation, MAX_MUTATION_FILE_BYTES, cancellation)
+        .await
+    {
+        Ok(target) => target,
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    let before = match normalize_existing_text(target.baseline().unwrap_or_default()) {
+        Ok(value) => value,
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    let generated = match transform(&before.normalized) {
+        Ok(generated) => generated,
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    if let Err(error) = validate_file_text(&generated.candidate) {
+        return error.into_execution_result().map(ToolPreparation::Complete);
+    }
+    let prompt = match generated_prompt(
+        &display_path,
+        operation,
+        &before.normalized,
+        &generated.candidate,
+        cancellation,
+    ) {
+        Ok(prompt) => prompt,
+        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
+    };
+    finish_prepared_mutation(
+        target,
+        before,
+        generated.candidate,
+        display_path,
+        operation,
+        prompt,
+        Some(generated.success_message),
+    )
+}
+
+fn generated_prompt(
+    path: &str,
+    operation: WorkspaceMutationOperation,
+    before: &str,
+    candidate: &str,
+    cancellation: &CancellationToken,
+) -> ToolCallResult<ApprovalPrompt> {
+    if before == candidate {
+        let preview = match operation {
+            WorkspaceMutationOperation::Create => {
+                format!("Create empty workspace file `{path}`.\n")
+            }
+            WorkspaceMutationOperation::Update => {
+                format!("Republish unchanged workspace file `{path}`.\n")
+            }
+        };
+        return ApprovalPrompt::new(approval_reason(operation, path), preview)
+            .map_err(|_| ToolCallError::Infrastructure);
+    }
+    let generated = create_patch(before, candidate).to_string();
+    let body = generated.find("@@ ").ok_or_else(|| {
+        ToolCallError::model(
+            "PatchError",
+            "INVALID_PATCH",
+            "could not derive a bounded editor preview",
+        )
+    })?;
+    let input = format!(
+        "{}+++ b/{path}\n{}",
+        match operation {
+            WorkspaceMutationOperation::Create => "--- /dev/null\n".to_owned(),
+            WorkspaceMutationOperation::Update => format!("--- a/{path}\n"),
+        },
+        &generated[body..]
+    );
+    if input.len() > MAX_PATCH_BYTES {
+        return Err(ToolCallError::model(
+            "PatchError",
+            "PATCH_TOO_LARGE",
+            "the generated editor preview exceeds the patch limit",
+        ));
+    }
+    let parsed = parse_patch(&input)?;
+    let canonical = canonical_diff(path, operation, before, &parsed.patch, cancellation)?;
+    canonical_prompt(path, operation, canonical)
+}
+
+fn canonical_prompt(
+    path: &str,
+    operation: WorkspaceMutationOperation,
+    canonical: CanonicalDiff,
+) -> ToolCallResult<ApprovalPrompt> {
+    let meta_probe = mutation_meta(path, operation, &canonical.text, false, true)
+        .map_err(|_| ToolCallError::Infrastructure)?;
+    if canonical.text.is_empty() || meta_probe.encoded_len() > MAX_CANONICAL_DIFF_JSON_BYTES {
+        return Err(ToolCallError::model(
+            "PatchError",
+            "DIFF_TOO_LARGE",
+            "the complete canonical approval diff exceeds the configured limit",
+        ));
+    }
+    ApprovalPrompt::canonical_patch(
+        approval_reason(operation, path),
+        canonical.text,
+        match operation {
+            WorkspaceMutationOperation::Create => ApprovalPatchOperation::Create,
+            WorkspaceMutationOperation::Update => ApprovalPatchOperation::Update,
+        },
+        path.to_owned(),
+        canonical.rows,
+        canonical.additions,
+        canonical.removals,
+        canonical.hunks,
+    )
+    .map_err(|_| ToolCallError::Infrastructure)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_prepared_mutation(
+    target: PreparedWorkspaceMutation,
+    before: NormalizedText,
+    candidate: String,
+    path: String,
+    operation: WorkspaceMutationOperation,
+    prompt: ApprovalPrompt,
+    success_message: Option<String>,
+) -> Result<ToolPreparation, ToolExecutorError> {
     let candidate_raw = match before.line_endings {
-        LineEndings::Lf => candidate.as_bytes().to_vec(),
+        LineEndings::Lf => candidate.into_bytes(),
         LineEndings::CrLf => candidate.replace('\n', "\r\n").into_bytes(),
     };
     if candidate_raw.len() > MAX_MUTATION_FILE_BYTES {
@@ -98,58 +278,24 @@ pub(crate) async fn prepare(
         .into_execution_result()
         .map(ToolPreparation::Complete);
     }
-    let canonical = match canonical_diff(
-        &parsed.path,
-        parsed.operation,
-        &before.normalized,
-        &parsed.patch,
-        cancellation,
-    ) {
-        Ok(diff) => diff,
-        Err(error) => return error.into_execution_result().map(ToolPreparation::Complete),
-    };
-    let meta_probe =
-        match mutation_meta(&parsed.path, parsed.operation, &canonical.text, false, true) {
-            Ok(meta) => meta,
-            Err(error) => return Err(error),
-        };
-    if canonical.text.is_empty() || meta_probe.encoded_len() > MAX_CANONICAL_DIFF_JSON_BYTES {
-        return ToolCallError::model(
-            "PatchError",
-            "DIFF_TOO_LARGE",
-            "the complete canonical approval diff exceeds the configured limit",
-        )
-        .into_execution_result()
-        .map(ToolPreparation::Complete);
-    }
-    let prompt = ApprovalPrompt::canonical_patch(
-        approval_reason(parsed.operation, &parsed.path),
-        canonical.text,
-        match parsed.operation {
-            WorkspaceMutationOperation::Create => ApprovalPatchOperation::Create,
-            WorkspaceMutationOperation::Update => ApprovalPatchOperation::Update,
-        },
-        parsed.path.clone(),
-        canonical.rows,
-        canonical.additions,
-        canonical.removals,
-        canonical.hunks,
-    )
-    .map_err(|_| ToolExecutorError::new("approval prompt normalization failed"))?;
     let canonical_diff = prompt.preview_arc();
-
-    let decline_path = parsed.path.clone();
+    let decline_path = path.clone();
     let decline_diff = canonical_diff.clone();
-    let decline_operation = parsed.operation;
-    let commit_path = parsed.path;
+    let decline_operation = operation;
+    let commit_path = path;
     let commit_diff = canonical_diff;
-    let commit_operation = parsed.operation;
+    let commit_operation = operation;
     // Every post-publication result is fully built before the commit
     // capability exists. After link/rename succeeds, no fallible JSON/model
     // construction remains that could erase the truthful committed fact.
     let committed_success = ToolCommitOutcome::committed(
-        success_result(&commit_path, commit_operation, &commit_diff)?
-            .with_workspace_touch(commit_path.clone()),
+        success_result(
+            &commit_path,
+            commit_operation,
+            &commit_diff,
+            success_message,
+        )?
+        .with_workspace_touch(commit_path.clone()),
     )?;
     let committed_durability = ToolCommitOutcome::committed(
         failure_result(
@@ -1015,17 +1161,21 @@ fn success_result(
     path: &str,
     operation: WorkspaceMutationOperation,
     diff: &str,
+    message: Option<String>,
 ) -> Result<ToolExecutionResult, ToolExecutorError> {
+    let message = message.unwrap_or_else(|| {
+        format!(
+            "{} workspace file `{path}`.",
+            match operation {
+                WorkspaceMutationOperation::Create => "Created",
+                WorkspaceMutationOperation::Update => "Updated",
+            }
+        )
+    });
     ToolExecutionResult::new(
         vec![
-            ContentBlock::text(format!(
-                "{} workspace file `{path}`.",
-                match operation {
-                    WorkspaceMutationOperation::Create => "Created",
-                    WorkspaceMutationOperation::Update => "Updated",
-                }
-            ))
-            .map_err(|_| ToolExecutorError::new("file mutation result normalization failed"))?,
+            ContentBlock::text(message)
+                .map_err(|_| ToolExecutorError::new("file mutation result normalization failed"))?,
         ],
         false,
         None,

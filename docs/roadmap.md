@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–31 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–32 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -39,6 +39,7 @@ for behavior that users can run today.
 | 29 | Current-master multi-query search and public `web_fetch` | `complete` | [`validation/phase-29.md`](validation/phase-29.md) |
 | 30 | Bounded parallel-safe tool scheduling | `complete` | [`validation/phase-30.md`](validation/phase-30.md) |
 | 31 | Advisory repeated-tool-call reminder | `complete` | [`validation/phase-31.md`](validation/phase-31.md) |
+| 32 | Fixed-upstream `str_replace_editor` file editing | `complete` | [`validation/phase-32.md`](validation/phase-32.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -537,6 +538,31 @@ replay, resume freshness, and parallel result ordering. One real script CLI
 journey must loop three times and prove the notice reaches the fourth request
 without changing tool results or requiring approval. No public network, real
 API, remote CI, or unrelated exhaustive check is required.
+
+## Phase 32 `str_replace_editor` boundary (2026-08-29)
+
+Phase 32 closes a remaining fixed-upstream default-tool gap. The model receives
+one `str_replace_editor` schema with `view`, `create`, `str_replace`, and
+`insert`. Paths must be absolute and remain confined to the retained workspace.
+Views use one-based line numbers; directory views are deterministic, omit the
+official hidden/dependency/cache names, descend at most two levels, and clip at
+the fixed 16,000-character presentation budget. Literal replacement requires
+exactly one non-empty match and insertion uses the official zero-based boundary
+without silently adding a trailing newline.
+
+Every mutation reuses the existing two-stage file path: strict argument and
+UTF-8 validation, retained capability, complete preview, `FileChangePolicy`,
+intent-before-side-effect Session order, late conflict checks, atomic publish,
+truthful committed outcome, cancellation, and workspace-instruction touch.
+Default interactive mode therefore still asks; the already explicit
+`--approval-mode auto-edit` also covers these prepared built-in file edits.
+Shell and plugin approval behavior is unchanged. The older `apply_patch` tool
+remains available for multi-line unified diffs.
+
+Acceptance is local-only: a source-attributed fixed fixture, focused unit and
+Agent approval tests, one real CLI loopback journey, and the normal local Rust
+gates. No public network, real model call, remote CI, additional platform
+matrix, or unrelated exhaustive stress run is required.
 
 ## Still deferred
 

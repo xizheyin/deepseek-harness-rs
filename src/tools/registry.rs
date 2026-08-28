@@ -42,6 +42,8 @@ use super::plugin::{PluginConfig, PluginHost, approval_required_result, prepare_
 use super::process::ProcessRunner;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::shell::{self, ShellEnvironment};
+#[cfg(unix)]
+use super::str_replace_editor;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::agent::ToolClaimProfile;
 #[cfg(unix)]
@@ -436,6 +438,17 @@ impl ToolExecutor for LocalToolRegistry {
                 .into_execution_result()
             });
         }
+        if request.name() == str_replace_editor::TOOL_NAME {
+            let workspace = Arc::clone(&self.workspace);
+            return Box::pin(async move {
+                str_replace_editor::execute(
+                    workspace.as_ref(),
+                    request.arguments().as_value(),
+                    &cancellation,
+                )
+                .await
+            });
+        }
         let workspace = Arc::clone(&self.workspace);
         Box::pin(async move {
             let outcome = dispatch(
@@ -490,6 +503,14 @@ impl ToolExecutor for LocalToolRegistry {
             }
             if request.name() == "apply_patch" {
                 return patch::prepare(
+                    workspace.as_ref(),
+                    request.arguments().as_value(),
+                    &cancellation,
+                )
+                .await;
+            }
+            if request.name() == str_replace_editor::TOOL_NAME {
+                return str_replace_editor::prepare(
                     workspace.as_ref(),
                     request.arguments().as_value(),
                     &cancellation,
@@ -598,6 +619,17 @@ impl ToolExecutor for WorkspaceToolRegistry {
                 .into_execution_result()
             });
         }
+        if request.name() == str_replace_editor::TOOL_NAME {
+            let workspace = self.workspace.clone();
+            return Box::pin(async move {
+                str_replace_editor::execute(
+                    &workspace,
+                    request.arguments().as_value(),
+                    &cancellation,
+                )
+                .await
+            });
+        }
         let workspace = self.workspace.clone();
         Box::pin(async move {
             let outcome = dispatch(
@@ -624,6 +656,14 @@ impl ToolExecutor for WorkspaceToolRegistry {
             if request.name() == "apply_patch" {
                 return patch::prepare(&workspace, request.arguments().as_value(), &cancellation)
                     .await;
+            }
+            if request.name() == str_replace_editor::TOOL_NAME {
+                return str_replace_editor::prepare(
+                    &workspace,
+                    request.arguments().as_value(),
+                    &cancellation,
+                )
+                .await;
             }
             let outcome = dispatch(
                 &workspace,
@@ -1615,6 +1655,53 @@ fn build_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> {
 #[cfg(unix)]
 fn build_workspace_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> {
     let mut schemas = build_schemas()?;
+    schemas.push(schema(
+        "str_replace_editor",
+        "View, create, or edit one UTF-8 workspace file using an exact literal replacement or line insertion.",
+        json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["view", "create", "str_replace", "insert"],
+                    "description": "The command to run."
+                },
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "Absolute path to one file or directory inside the opened workspace."
+                },
+                "file_text": {
+                    "type": "string",
+                    "description": "Required content for create."
+                },
+                "insert_line": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "For insert, place new_str after this zero-based line boundary."
+                },
+                "new_str": {
+                    "type": "string",
+                    "description": "Replacement text, or required inserted text. Omit during str_replace to delete old_str."
+                },
+                "old_str": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "For str_replace, one non-empty literal that must occur exactly once."
+                },
+                "view_range": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": { "type": "integer" },
+                    "description": "Optional one-based inclusive [start, end] file range; end -1 means EOF."
+                }
+            },
+            "required": ["command", "path"],
+            "additionalProperties": false
+        }),
+    )?);
     schemas.push(schema(
         "apply_patch",
         "Prepare one bounded single-file unified diff for approval and atomic publication.",

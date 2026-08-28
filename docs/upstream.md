@@ -1851,6 +1851,30 @@ algorithm. Rust Phase 31 therefore follows the fixed default behavior while
 recording its smaller non-configurable, Agent-owned seam in
 `docs/design/repeated-tool-reminder.md`.
 
+## Phase 32 `str_replace_editor` inspection — 2026-08-29
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/fs/tool-str-replace-editor/src/index.ts`, README, invariant, and
+  `tests/tools.spec.ts` for the closed four-command schema, absolute paths,
+  one-based file views, `[start, -1]` ranges, two-level filtered directory
+  views, 16,000-character clipping, empty creation, literal unique replacement,
+  zero-based insertion boundaries, exact success/failure vocabulary, and
+  mutation policy delegation;
+- `packages/bundle/base/cordis.patch.yml` and
+  `apps/cli/config/agent-presets/minimal/agent.cordis.yml` for default
+  registration and the fixed output cap;
+- `packages/fs/{fs,fs-local,fs-observation-policy}` sources reached by the tool
+  for versioned write intent, absence observation, sandbox enforcement, and
+  stale-write behavior.
+
+Latest inspected master `cd5ef8148158c3a752a658978873241fdf8e2bbc`
+retains the same model-facing commands. Its later persistent-Bash composition
+changes which preset pairs the editor with which Shell surface, not the editor
+contract implemented here. Phase 32 maps mutations onto Rust's already stronger
+capability-confined, approval-gated atomic file path and records the differences
+in `docs/design/str-replace-editor.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

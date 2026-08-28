@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "sources": [
+      "packages/fs/tool-str-replace-editor/src/index.ts",
+      "packages/fs/tool-str-replace-editor/tests/tools.spec.ts",
+      "packages/fs/tool-str-replace-editor/README.md",
+      "packages/bundle/base/cordis.patch.yml"
+    ]
+  },
+  "schema": {
+    "name": "str_replace_editor",
+    "commands": ["view", "create", "str_replace", "insert"],
+    "required": ["command", "path"],
+    "absolutePath": true,
+    "maxOutputChars": 16000,
+    "replaceAllPresent": false
+  },
+  "canonical": {
+    "created": "New file created successfully at: {absolute}/sample.txt",
+    "view": "Here's the content of {absolute}/sample.txt with line numbers (which has a total of 4 lines) with view_range=[2, -1]:\n     2  two\n     3  three\n     4  \n",
+    "edited": "The file {absolute}/sample.txt has been edited successfully.",
+    "after": "one\nbetween\n\nthree\n"
+  },
+  "rules": {
+    "replacement": "one unique non-empty literal match",
+    "insertBoundary": "zero-based value in [0, split-newline line count]",
+    "directoryDepth": 2,
+    "directoryExcludes": ["dot-prefixed names", "node_modules", "__pycache__"]
+  }
+}

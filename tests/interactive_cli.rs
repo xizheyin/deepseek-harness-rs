@@ -2179,6 +2179,95 @@ fn auto_edit_commits_a_workspace_patch_without_opening_the_approval_selector() {
 }
 
 #[test]
+fn auto_edit_commits_a_literal_editor_change_without_opening_approval() {
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-auto-editor",
+            "str_replace_editor",
+            serde_json::json!({
+                "command": "str_replace",
+                "path": target.to_str().unwrap(),
+                "old_str": "old",
+                "new_str": "new"
+            }),
+        ),
+        text_sse("literal editor finished"),
+    ]);
+    let mut dsh =
+        PtyHarness::spawn_color_with_approval_mode(&server.base_url, &workspace.0, "auto-edit");
+
+    dsh.expect("❯".as_bytes());
+    let turn = dsh.checkpoint();
+    dsh.write(b"replace the exact text automatically\r");
+    dsh.expect_after(turn, b"Updated  note.txt");
+    dsh.expect_after(turn, b"literal editor finished");
+    dsh.expect_after(turn, b"Turn complete");
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert!(
+        !transcript
+            .windows(b"> Reject".len())
+            .any(|row| row == b"> Reject")
+    );
+    assert_eq!(requests.len(), 2);
+    let first = request_json(&requests[0]);
+    let editor = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "str_replace_editor")
+        .unwrap();
+    assert_eq!(
+        editor["function"]["parameters"]["properties"]["command"]["enum"],
+        serde_json::json!(["view", "create", "str_replace", "insert"])
+    );
+}
+
+#[test]
+fn literal_editor_uses_the_normal_semantic_diff_approval_when_ask_is_active() {
+    let workspace = TestWorkspace::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").expect("test file should be created");
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-ask-editor",
+            "str_replace_editor",
+            serde_json::json!({
+                "command": "str_replace",
+                "path": target.to_str().unwrap(),
+                "old_str": "old",
+                "new_str": "new"
+            }),
+        ),
+        text_sse("approved literal editor finished"),
+    ]);
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"show and approve the exact edit\r");
+    dsh.approval_ready();
+    dsh.expect(b"Proposed update");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    dsh.write(b"\x1b[A");
+    dsh.expect(b"> Allow once");
+    dsh.write(b"\r");
+    dsh.expect(b"Updated  note.txt");
+    dsh.expect(b"approved literal editor finished");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
 fn user_question_selection_returns_the_displayed_label_and_continues_the_turn() {
     let server = SequenceSseServer::start(vec![
         tool_sse(

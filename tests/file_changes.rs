@@ -100,10 +100,24 @@ impl ScriptedProvider {
     }
 
     fn with_response(call_id: &str, patch: &str, final_text: &str) -> Self {
+        Self::with_tool_response(
+            call_id,
+            "apply_patch",
+            json!({ "patch": patch }),
+            final_text,
+        )
+    }
+
+    fn with_tool_response(
+        call_id: &str,
+        tool_name: &str,
+        arguments: Value,
+        final_text: &str,
+    ) -> Self {
         Self {
             attempts: Mutex::new(
                 vec![
-                    tool_response_with_id(call_id, patch),
+                    named_tool_response(call_id, tool_name, arguments),
                     text_response_with(final_text),
                 ]
                 .into_iter()
@@ -253,17 +267,12 @@ impl ApprovalProvider for FixedApproval {
     }
 }
 
-fn tool_response_with_id(call_id: &str, patch: &str) -> Vec<StreamChunk> {
+fn named_tool_response(call_id: &str, name: &str, arguments: Value) -> Vec<StreamChunk> {
     vec![
         StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
         StreamChunk::block_end(
             0,
-            ContentBlock::tool_call(
-                call_id,
-                "apply_patch",
-                json!({ "patch": patch }).to_string(),
-            )
-            .unwrap(),
+            ContentBlock::tool_call(call_id, name, arguments.to_string()).unwrap(),
         )
         .unwrap(),
         StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
@@ -325,6 +334,22 @@ async fn run_patch_with_provider(
         .await
         .unwrap();
     agent.shutdown_into_session().await.unwrap()
+}
+
+async fn run_editor(
+    workspace: &Path,
+    call_id: &str,
+    arguments: Value,
+    policy: FileChangePolicy,
+    approval: Arc<dyn ApprovalProvider>,
+) -> Session {
+    let provider = Arc::new(ScriptedProvider::with_tool_response(
+        call_id,
+        "str_replace_editor",
+        arguments,
+        "editor step finished",
+    ));
+    run_patch_with_provider(workspace, policy, approval, provider).await
 }
 
 fn patch_agent(
@@ -474,7 +499,7 @@ fn rust_first_mutation_step_types(session: &Session) -> Vec<String> {
 }
 
 #[test]
-fn workspace_registry_keeps_the_closed_apply_patch_schema_before_todo_write() {
+fn workspace_registry_keeps_the_fixed_editor_and_patch_schemas_before_todo_write() {
     let workspace = TempWorkspace::new("schema");
     let registry = WorkspaceToolRegistry::open(workspace.path()).unwrap();
     assert_eq!(
@@ -483,9 +508,24 @@ fn workspace_registry_keeps_the_closed_apply_patch_schema_before_todo_write() {
             .iter()
             .map(|schema| schema.name())
             .collect::<Vec<_>>(),
-        ["list", "glob", "grep", "read", "apply_patch", "todo_write"]
+        [
+            "list",
+            "glob",
+            "grep",
+            "read",
+            "str_replace_editor",
+            "apply_patch",
+            "todo_write"
+        ]
     );
-    let parameters = registry.schemas()[4].parameters().as_value();
+    let editor = registry.schemas()[4].parameters().as_value();
+    assert_eq!(
+        editor["properties"]["command"]["enum"],
+        json!(["view", "create", "str_replace", "insert"])
+    );
+    assert_eq!(editor["required"], json!(["command", "path"]));
+    assert_eq!(editor["additionalProperties"], false);
+    let parameters = registry.schemas()[5].parameters().as_value();
     assert_eq!(parameters["required"], json!(["patch"]));
     assert_eq!(parameters["additionalProperties"], false);
     assert_eq!(
@@ -496,6 +536,251 @@ fn workspace_registry_keeps_the_closed_apply_patch_schema_before_todo_write() {
             .collect::<Vec<_>>(),
         ["patch"]
     );
+}
+
+#[tokio::test]
+async fn fixed_editor_fixture_runs_all_four_commands_through_the_real_agent_pipeline() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/tools/upstream_phase32_str_replace_editor.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture["schemaVersion"], 1);
+    assert_eq!(
+        fixture["upstream"]["commit"],
+        "47f943859bef60e4160492346772ded9b24f765a"
+    );
+
+    let workspace = TempWorkspace::new("editor-canonical");
+    let absolute = workspace.path().join("sample.txt");
+    let absolute_text = absolute.to_str().unwrap();
+    let unavailable = || {
+        Arc::new(FixedApproval {
+            outcome: ApprovalOutcome::Unavailable,
+            mutate_before_answer: None,
+        }) as Arc<dyn ApprovalProvider>
+    };
+
+    let create = run_editor(
+        workspace.path(),
+        "editor-create",
+        json!({
+            "command": "create",
+            "path": absolute_text,
+            "file_text": "one\ntwo\nthree\n"
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    let expected_create = fixture["canonical"]["created"]
+        .as_str()
+        .unwrap()
+        .replace("{absolute}", workspace.path().to_str().unwrap());
+    assert_eq!(result_facts(&create).2, expected_create);
+    assert_eq!(
+        rust_first_mutation_step_types(&create),
+        ["assistant/message", "tool/call", "tool/result", "step/end"]
+    );
+    assert_eq!(
+        result_facts(&create).1.unwrap().as_value()["committed"],
+        true
+    );
+
+    let view = run_editor(
+        workspace.path(),
+        "editor-view",
+        json!({
+            "command": "view",
+            "path": absolute_text,
+            "view_range": [2, -1]
+        }),
+        FileChangePolicy::Ask,
+        unavailable(),
+    )
+    .await;
+    let expected_view = fixture["canonical"]["view"]
+        .as_str()
+        .unwrap()
+        .replace("{absolute}", workspace.path().to_str().unwrap());
+    assert_eq!(result_facts(&view).2, expected_view);
+
+    let replace = run_editor(
+        workspace.path(),
+        "editor-replace",
+        json!({
+            "command": "str_replace",
+            "path": absolute_text,
+            "old_str": "two",
+            "new_str": "TWO"
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    let expected_edit = fixture["canonical"]["edited"]
+        .as_str()
+        .unwrap()
+        .replace("{absolute}", workspace.path().to_str().unwrap());
+    assert_eq!(result_facts(&replace).2, expected_edit);
+
+    let delete = run_editor(
+        workspace.path(),
+        "editor-delete",
+        json!({
+            "command": "str_replace",
+            "path": absolute_text,
+            "old_str": "TWO"
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_facts(&delete).2, expected_edit);
+
+    let insert = run_editor(
+        workspace.path(),
+        "editor-insert",
+        json!({
+            "command": "insert",
+            "path": absolute_text,
+            "insert_line": 1,
+            "new_str": "between"
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert_eq!(result_facts(&insert).2, expected_edit);
+    assert_eq!(
+        fs::read_to_string(&absolute).unwrap(),
+        fixture["canonical"]["after"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn editor_rejects_ambiguous_relative_denied_and_stale_mutations_without_overwrite() {
+    let workspace = TempWorkspace::new("editor-failures");
+    workspace.write("ambiguous.txt", "same\nother\nsame");
+    let absolute = workspace.path().join("ambiguous.txt");
+    let absolute_text = absolute.to_str().unwrap();
+    let unavailable = Arc::new(FixedApproval {
+        outcome: ApprovalOutcome::Unavailable,
+        mutate_before_answer: None,
+    });
+
+    let ambiguous = run_editor(
+        workspace.path(),
+        "editor-ambiguous",
+        json!({
+            "command": "str_replace",
+            "path": absolute_text,
+            "old_str": "same",
+            "new_str": "changed"
+        }),
+        FileChangePolicy::Allow,
+        unavailable.clone(),
+    )
+    .await;
+    assert_eq!(result_code(&ambiguous), Some("FS_AMBIGUOUS_EDIT"));
+    assert!(result_facts(&ambiguous).2.contains("lines [1, 3]"));
+
+    let relative = run_editor(
+        workspace.path(),
+        "editor-relative",
+        json!({ "command": "view", "path": "ambiguous.txt" }),
+        FileChangePolicy::Allow,
+        unavailable.clone(),
+    )
+    .await;
+    assert_eq!(result_code(&relative), Some("INVALID_ARGS"));
+
+    let denied_path = workspace.path().join("denied.txt");
+    let denied = run_editor(
+        workspace.path(),
+        "editor-denied",
+        json!({
+            "command": "create",
+            "path": denied_path.to_str().unwrap(),
+            "file_text": "blocked"
+        }),
+        FileChangePolicy::Deny,
+        unavailable,
+    )
+    .await;
+    assert_eq!(result_code(&denied), Some("POLICY_DENIED"));
+    assert!(!denied_path.exists());
+
+    let stale = run_editor(
+        workspace.path(),
+        "editor-stale",
+        json!({
+            "command": "str_replace",
+            "path": absolute_text,
+            "old_str": "other",
+            "new_str": "changed"
+        }),
+        FileChangePolicy::Ask,
+        Arc::new(FixedApproval {
+            outcome: ApprovalOutcome::AllowedOnce,
+            mutate_before_answer: Some((absolute.clone(), "external".to_owned())),
+        }),
+    )
+    .await;
+    assert_eq!(result_code(&stale), Some("FILE_CONFLICT"));
+    assert_eq!(fs::read_to_string(absolute).unwrap(), "external");
+}
+
+#[tokio::test]
+async fn editor_creates_empty_files_and_lists_only_the_bounded_visible_tree() {
+    let workspace = TempWorkspace::new("editor-view-tree");
+    let empty = workspace.path().join("empty.txt");
+    let unavailable = || {
+        Arc::new(FixedApproval {
+            outcome: ApprovalOutcome::Unavailable,
+            mutate_before_answer: None,
+        }) as Arc<dyn ApprovalProvider>
+    };
+    let created = run_editor(
+        workspace.path(),
+        "editor-empty",
+        json!({
+            "command": "create",
+            "path": empty.to_str().unwrap(),
+            "file_text": ""
+        }),
+        FileChangePolicy::Allow,
+        unavailable(),
+    )
+    .await;
+    assert!(result_code(&created).is_none());
+    assert_eq!(fs::read(&empty).unwrap(), b"");
+
+    let directory = workspace.path().join("dir");
+    fs::create_dir_all(directory.join("nested/third")).unwrap();
+    fs::create_dir_all(directory.join("node_modules/pkg")).unwrap();
+    fs::create_dir_all(directory.join("__pycache__")).unwrap();
+    fs::write(directory.join("visible.txt"), "ok").unwrap();
+    fs::write(directory.join(".hidden"), "hidden").unwrap();
+    fs::write(directory.join("nested/child.txt"), "child").unwrap();
+    fs::write(directory.join("nested/third/too-deep.txt"), "deep").unwrap();
+    fs::write(directory.join("node_modules/pkg/index.js"), "dependency").unwrap();
+    fs::write(directory.join("__pycache__/module.pyc"), "cache").unwrap();
+
+    let viewed = run_editor(
+        workspace.path(),
+        "editor-directory",
+        json!({ "command": "view", "path": directory.to_str().unwrap() }),
+        FileChangePolicy::Ask,
+        unavailable(),
+    )
+    .await;
+    let text = result_facts(&viewed).2;
+    assert!(text.contains("visible.txt"));
+    assert!(text.contains("nested/child.txt"));
+    assert!(!text.contains("too-deep.txt"));
+    assert!(!text.contains(".hidden"));
+    assert!(!text.contains("index.js"));
+    assert!(!text.contains("module.pyc"));
 }
 
 #[tokio::test]

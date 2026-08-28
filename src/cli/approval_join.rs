@@ -312,7 +312,10 @@ impl ApprovalJoin {
             || (matches!(
                 envelope.request.preview_kind(),
                 ApprovalPreviewKind::CanonicalPatch(_)
-            ) && asked.tool_name != "apply_patch")
+            ) && !matches!(
+                asked.tool_name.as_str(),
+                "apply_patch" | "str_replace_editor"
+            ))
         {
             drop(envelope);
             return Err(ApprovalJoinError);

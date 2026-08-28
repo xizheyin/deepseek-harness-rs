@@ -15,6 +15,8 @@ mod read;
 mod registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod shell;
+#[cfg(unix)]
+mod str_replace_editor;
 mod web_fetch;
 mod web_search;
 mod workspace;
