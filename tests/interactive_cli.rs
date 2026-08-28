@@ -14,8 +14,9 @@ use rustix::process::Signal;
 
 use support::{
     fake_deepseek::{
-        BacklogThenStalledSseServer, CancelThenSseServer, GatedFirstSseServer,
-        GatedThenStalledSseServer, SequenceSseServer, SplitSseServer, StalledSseServer,
+        BacklogThenStalledSseServer, CancelThenSseServer, DynamicGoalSseServer,
+        GatedFirstSseServer, GatedThenStalledSseServer, SequenceSseServer, SplitSseServer,
+        StalledSseServer,
     },
     process_state,
     pty::{AutoTuiProfile, DisabledTerminalMode, JobControlHarness, PtyHarness, TestSessionRoot},
@@ -1783,18 +1784,10 @@ fn input_typed_during_a_turn_is_queued_and_admitted_only_after_settlement() {
 
 #[test]
 fn goal_command_runs_sequential_rounds_until_the_model_completes_it() {
-    let server = SequenceSseServer::start(vec![
-        text_sse("goal round one finished"),
-        tool_sse(
-            "call-goal-complete",
-            "update_goal",
-            serde_json::json!({
-                "expected_revision": 1,
-                "operation": "complete"
-            }),
-        ),
+    let server = DynamicGoalSseServer::start(
+        vec![text_sse("goal round one finished")],
         text_sse("goal is complete"),
-    ]);
+    );
     let workspace = TestWorkspace::new();
     let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
 
@@ -1885,17 +1878,7 @@ fn resumed_goal_is_restored_disarmed_and_requires_explicit_resume() {
     let filename = entries[0].file_name().into_string().unwrap();
     let session_id = filename.strip_suffix(".jsonl").unwrap().to_owned();
 
-    let resumed_server = SequenceSseServer::start(vec![
-        tool_sse(
-            "call-resumed-goal-complete",
-            "update_goal",
-            serde_json::json!({
-                "expected_revision": 3,
-                "operation": "complete"
-            }),
-        ),
-        text_sse("resumed goal complete"),
-    ]);
+    let resumed_server = DynamicGoalSseServer::start(Vec::new(), text_sse("resumed goal complete"));
     let caller_workspace = TestWorkspace::new();
     let mut resumed = PtyHarness::spawn_resume_color_cargo(
         &resumed_server.base_url,

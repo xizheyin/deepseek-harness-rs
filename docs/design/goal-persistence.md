@@ -111,8 +111,8 @@ arms work from an uncommitted state.
 
 ## Intentional differences
 
-Rust keeps the established 32-round cap rather than upstream's default 256 and
-does not expose per-Goal cap editing yet. Image attachments remain unsupported.
+Rust keeps 32 rather than upstream's 256 as the default and bounds configurable
+per-Goal caps to positive `u32` values. Image attachments remain unsupported.
 The event vocabulary and disarmed restart semantics otherwise target the fixed
 upstream behavior. Compatibility remains `partial` after the local event and
 resume evidence because caller-sensitive tool authority, configurable caps,

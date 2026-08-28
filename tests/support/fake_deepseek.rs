@@ -32,6 +32,12 @@ pub struct SequenceSseServer {
     _terminal_permit: TerminalTestPermit,
 }
 
+pub struct DynamicGoalSseServer {
+    pub base_url: String,
+    worker: Option<thread::JoinHandle<Vec<String>>>,
+    _terminal_permit: TerminalTestPermit,
+}
+
 pub struct CancelThenSseServer {
     pub base_url: String,
     worker: Option<thread::JoinHandle<(Vec<String>, bool)>>,
@@ -230,6 +236,147 @@ impl SequenceSseServer {
             .join()
             .expect("server worker should join")
     }
+}
+
+impl DynamicGoalSseServer {
+    pub fn start(before_goal_update: Vec<String>, final_body: String) -> Self {
+        let terminal_permit = acquire_terminal_test_permit();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("loopback listener should become nonblocking");
+        let base_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("loopback listener should have an address")
+        );
+        let worker = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (index, body) in before_goal_update.into_iter().enumerate() {
+                let timeout = if index == 0 {
+                    INITIAL_ACCEPT_TIMEOUT
+                } else {
+                    FOLLOWUP_ACCEPT_TIMEOUT
+                };
+                let (mut stream, _) = accept_with_deadline(&listener, timeout)
+                    .expect("dsh should make the pre-update request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("request read should be bounded");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .expect("response write should be bounded");
+                requests.push(
+                    String::from_utf8(read_http_request(&mut stream))
+                        .expect("request should be UTF-8"),
+                );
+                write_sse_response(&mut stream, &body);
+            }
+
+            let timeout = if requests.is_empty() {
+                INITIAL_ACCEPT_TIMEOUT
+            } else {
+                FOLLOWUP_ACCEPT_TIMEOUT
+            };
+            let (mut update_stream, _) = accept_with_deadline(&listener, timeout)
+                .expect("dsh should request the Goal update");
+            update_stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("request read should be bounded");
+            update_stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("response write should be bounded");
+            let update_request = String::from_utf8(read_http_request(&mut update_stream))
+                .expect("request should be UTF-8");
+            let (goal_id, revision) = goal_ref_from_request(&update_request);
+            let update_body = goal_complete_sse(&goal_id, revision);
+            requests.push(update_request);
+            write_sse_response(&mut update_stream, &update_body);
+
+            let (mut final_stream, _) = accept_with_deadline(&listener, FOLLOWUP_ACCEPT_TIMEOUT)
+                .expect("dsh should make the post-update request");
+            final_stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("request read should be bounded");
+            final_stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .expect("response write should be bounded");
+            requests.push(
+                String::from_utf8(read_http_request(&mut final_stream))
+                    .expect("request should be UTF-8"),
+            );
+            write_sse_response(&mut final_stream, &final_body);
+            requests
+        });
+        Self {
+            base_url,
+            worker: Some(worker),
+            _terminal_permit: terminal_permit,
+        }
+    }
+
+    pub fn finish(mut self) -> Vec<String> {
+        self.worker
+            .take()
+            .expect("server worker should exist")
+            .join()
+            .expect("server worker should join")
+    }
+}
+
+fn goal_ref_from_request(request: &str) -> (String, u64) {
+    let (_, body) = request
+        .split_once("\r\n\r\n")
+        .expect("HTTP request should contain a body");
+    let request: serde_json::Value =
+        serde_json::from_str(body).expect("provider request body should be JSON");
+    let prompt = request["messages"]
+        .as_array()
+        .expect("messages should be an array")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_str())
+        .expect("Goal request should retain its generated prompt");
+    let (_, tail) = prompt
+        .split_once("goal_id ")
+        .expect("Goal prompt should name goal_id");
+    let (id_json, tail) = tail
+        .split_once(", revision ")
+        .expect("Goal prompt should name revision");
+    let goal_id = serde_json::from_str(id_json).expect("goal_id should be JSON quoted");
+    let revision = tail
+        .split_once(',')
+        .map_or(tail, |(value, _)| value)
+        .trim()
+        .parse()
+        .expect("revision should be an integer");
+    (goal_id, revision)
+}
+
+fn goal_complete_sse(goal_id: &str, revision: u64) -> String {
+    let arguments = serde_json::json!({
+        "goal_id": goal_id,
+        "revision": revision,
+        "action": "complete",
+    });
+    let arguments = serde_json::to_string(&arguments).expect("tool arguments should encode");
+    let delta = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call-dynamic-goal-complete",
+                    "type": "function",
+                    "function": { "name": "update_goal", "arguments": arguments }
+                }]
+            }
+        }]
+    });
+    format!(
+        "data: {delta}\n\ndata: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"tool_calls\"}}]}}\n\ndata: [DONE]\n\n"
+    )
 }
 
 impl CancelThenSseServer {

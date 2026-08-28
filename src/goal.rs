@@ -55,6 +55,17 @@ impl GoalBlockReason {
         }
     }
 
+    pub(crate) fn model_reported(message: &str) -> Result<Self, GoalError> {
+        let message = message.trim_matches(char::is_whitespace);
+        if message.is_empty() || message.len() > 4 * 1024 {
+            return Err(GoalError::InvalidBlockReason);
+        }
+        Ok(Self {
+            code: "model-reported".to_owned(),
+            message: message.to_owned(),
+        })
+    }
+
     fn validate(&self) -> Result<(), GoalError> {
         let valid_code = !self.code.is_empty()
             && self.code.len() <= 128
@@ -318,7 +329,6 @@ impl GoalReplayState {
             || next.goal.revision != current.goal.revision.saturating_add(1)
             || (next.goal.objective != current.goal.objective
                 && change.operation != GoalOperation::Edit)
-            || next.goal.max_goal_rounds != current.goal.max_goal_rounds
             || next.rounds_started != current.rounds_started
             || next.created_at != current.created_at
             || next.updated_at < current.updated_at
@@ -334,6 +344,7 @@ impl GoalReplayState {
                 current.goal.phase == GoalPhase::Active
                     && next.goal.phase == GoalPhase::Paused
                     && next.goal.blocked_reason.is_none()
+                    && same_goal_definition(&current.goal, &next.goal)
             }
             GoalOperation::Resume => {
                 matches!(
@@ -342,16 +353,19 @@ impl GoalReplayState {
                 ) && next.goal.phase == GoalPhase::Active
                     && next.goal.blocked_reason.is_none()
                     && next.rounds_started < next.goal.max_goal_rounds
+                    && same_goal_definition(&current.goal, &next.goal)
             }
             GoalOperation::Complete => {
                 current.goal.phase != GoalPhase::Complete
                     && next.goal.phase == GoalPhase::Complete
                     && next.goal.blocked_reason.is_none()
+                    && same_goal_definition(&current.goal, &next.goal)
             }
             GoalOperation::Block => {
                 current.goal.phase == GoalPhase::Active
                     && next.goal.phase == GoalPhase::Blocked
                     && next.goal.blocked_reason.is_some()
+                    && same_goal_definition(&current.goal, &next.goal)
             }
             GoalOperation::Create | GoalOperation::Clear => false,
         };
@@ -386,6 +400,10 @@ impl GoalReplayState {
     }
 }
 
+fn same_goal_definition(current: &GoalDurableSnapshot, next: &GoalDurableSnapshot) -> bool {
+    current.objective == next.objective && current.max_goal_rounds == next.max_goal_rounds
+}
+
 fn durable_state(change: &GoalChange) -> Result<DurableGoalState, GoalError> {
     Ok(DurableGoalState {
         goal: change.goal.clone().ok_or(GoalError::InvalidEvent)?,
@@ -418,6 +436,24 @@ impl GoalSnapshot {
         value
     }
 
+    pub(crate) fn tool_value(&self) -> Value {
+        let mut goal = json!({
+            "id": self.durable.goal.id,
+            "revision": self.durable.goal.revision,
+            "objective": self.durable.goal.objective,
+            "phase": self.durable.goal.phase.as_str(),
+            "roundsStarted": self.durable.rounds_started,
+            "maxGoalRounds": self.durable.goal.max_goal_rounds,
+        });
+        if let Some(reason) = &self.durable.goal.blocked_reason {
+            goal["blockedReason"] = serde_json::to_value(reason).unwrap_or(Value::Null);
+        }
+        json!({
+            "goal": goal,
+            "activation": if self.armed { "armed" } else { "disarmed" },
+        })
+    }
+
     fn notice(&self) -> String {
         format!(
             "Goal · {} · {} · round {}/{} · revision {} · {}",
@@ -432,6 +468,11 @@ impl GoalSnapshot {
 
     pub(crate) fn revision(&self) -> u64 {
         self.durable.goal.revision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> &str {
+        &self.durable.goal.id
     }
 
     pub(crate) fn rounds_started(&self) -> u32 {
@@ -536,6 +577,12 @@ pub(crate) enum GoalError {
     EmptyObjective,
     #[error("the Goal objective exceeds {MAX_GOAL_OBJECTIVE_BYTES} UTF-8 bytes")]
     ObjectiveTooLarge,
+    #[error("max_goal_rounds must be a positive 32-bit integer")]
+    InvalidMaxRounds,
+    #[error("Goal edit requires objective and/or max_goal_rounds")]
+    InvalidEdit,
+    #[error("blocked_reason must contain non-whitespace text")]
+    InvalidBlockReason,
     #[error("the Goal changed since this request; call get_goal and retry with its revision")]
     StaleRevision,
     #[error("this Goal transition is not valid from the current phase")]
@@ -654,10 +701,12 @@ impl GoalRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn create(&self, objective: String) -> Result<GoalSnapshot, GoalError> {
         self.prepare_create(objective)?.commit_snapshot()
     }
 
+    #[cfg(test)]
     pub(crate) fn update(
         &self,
         expected_revision: u64,
@@ -672,7 +721,16 @@ impl GoalRuntime {
         &self,
         objective: String,
     ) -> Result<PreparedGoalMutation, GoalError> {
+        self.prepare_create_with_max(objective, None)
+    }
+
+    pub(crate) fn prepare_create_with_max(
+        &self,
+        objective: String,
+        max_goal_rounds: Option<u32>,
+    ) -> Result<PreparedGoalMutation, GoalError> {
         let objective = validate_objective(&objective)?;
+        let max_goal_rounds = validate_max_goal_rounds(max_goal_rounds.unwrap_or(MAX_GOAL_ROUNDS))?;
         let mut state = self.state.lock().map_err(|_| GoalError::Unavailable)?;
         ensure_not_pending(&state)?;
         if state
@@ -699,7 +757,7 @@ impl GoalRuntime {
                 objective,
                 phase: GoalPhase::Active,
                 blocked_reason: None,
-                max_goal_rounds: MAX_GOAL_ROUNDS,
+                max_goal_rounds,
             },
             rounds_started: 0,
             created_at: now,
@@ -721,23 +779,55 @@ impl GoalRuntime {
         operation: GoalUpdate,
         objective: Option<String>,
     ) -> Result<PreparedGoalMutation, GoalError> {
-        let objective = match operation {
-            GoalUpdate::Edit => Some(validate_objective(
-                objective.as_deref().ok_or(GoalError::EmptyObjective)?,
-            )?),
-            _ if objective.is_some() => return Err(GoalError::InvalidTransition),
-            _ => None,
-        };
+        self.prepare_update_exact(None, expected_revision, operation, objective, None, None)
+    }
+
+    pub(crate) fn prepare_update_exact(
+        &self,
+        expected_goal_id: Option<&str>,
+        expected_revision: u64,
+        operation: GoalUpdate,
+        objective: Option<String>,
+        max_goal_rounds: Option<u32>,
+        blocked_reason: Option<GoalBlockReason>,
+    ) -> Result<PreparedGoalMutation, GoalError> {
+        let objective = objective.as_deref().map(validate_objective).transpose()?;
+        let max_goal_rounds = max_goal_rounds.map(validate_max_goal_rounds).transpose()?;
+        match operation {
+            GoalUpdate::Edit if objective.is_none() && max_goal_rounds.is_none() => {
+                return Err(GoalError::InvalidEdit);
+            }
+            GoalUpdate::Edit if blocked_reason.is_some() => {
+                return Err(GoalError::InvalidTransition);
+            }
+            GoalUpdate::Edit => {}
+            GoalUpdate::Blocked if objective.is_some() || max_goal_rounds.is_some() => {
+                return Err(GoalError::InvalidTransition);
+            }
+            GoalUpdate::Blocked => {}
+            _ if objective.is_some() || max_goal_rounds.is_some() || blocked_reason.is_some() => {
+                return Err(GoalError::InvalidTransition);
+            }
+            _ => {}
+        }
         let mut state = self.state.lock().map_err(|_| GoalError::Unavailable)?;
         ensure_not_pending(&state)?;
         let current = state.current.clone().ok_or(GoalError::Missing)?;
         if current.goal.revision != expected_revision {
             return Err(GoalError::StaleRevision);
         }
+        if expected_goal_id.is_some_and(|id| id != current.goal.id) {
+            return Err(GoalError::StaleRevision);
+        }
         let mut next = current.clone();
         let (goal_operation, armed) = match operation {
-            GoalUpdate::Edit if current.goal.phase != GoalPhase::Complete => {
-                next.goal.objective = objective.ok_or(GoalError::EmptyObjective)?;
+            GoalUpdate::Edit => {
+                if let Some(objective) = objective {
+                    next.goal.objective = objective;
+                }
+                if let Some(max_goal_rounds) = max_goal_rounds {
+                    next.goal.max_goal_rounds = max_goal_rounds;
+                }
                 (GoalOperation::Edit, state.armed)
             }
             GoalUpdate::Pause if current.goal.phase == GoalPhase::Active => {
@@ -762,7 +852,8 @@ impl GoalRuntime {
             }
             GoalUpdate::Blocked if current.goal.phase == GoalPhase::Active => {
                 next.goal.phase = GoalPhase::Blocked;
-                next.goal.blocked_reason = Some(GoalBlockReason::repeated());
+                next.goal.blocked_reason =
+                    Some(blocked_reason.unwrap_or_else(GoalBlockReason::repeated));
                 (GoalOperation::Block, false)
             }
             _ => return Err(GoalError::InvalidTransition),
@@ -826,8 +917,9 @@ impl GoalRuntime {
         let max_rounds = goal.goal.max_goal_rounds;
         let objective =
             serde_json::to_string(&goal.goal.objective).map_err(|_| GoalError::Unavailable)?;
+        let goal_id_json = serde_json::to_string(&goal_id).map_err(|_| GoalError::Unavailable)?;
         let prompt = format!(
-            "<goal_round>\nObjective: {objective}\nRound: {number}/{max_rounds}\nContinue making concrete progress toward this objective. Verify the work that matters. Use get_goal for current state. Call update_goal with expected_revision {revision} and operation complete only when the objective is actually achieved. If the same external blocker prevents progress for three consecutive rounds, call update_goal with operation blocked. Leave the Goal active when useful work remains.\n</goal_round>"
+            "<goal_round>\nObjective: {objective}\nRound: {number}/{max_rounds}\nContinue making concrete progress toward this objective. Verify the work that matters. Use get_goal for current state. Call update_goal with goal_id {goal_id_json}, revision {revision}, and action complete only when the objective is actually achieved. If the same external blocker prevents progress for three consecutive rounds, call update_goal with action blocked and a concrete blocked_reason. Leave the Goal active when useful work remains.\n</goal_round>"
         );
         Ok(Some(GoalRound {
             prompt,
@@ -887,12 +979,16 @@ impl PreparedGoalMutation {
     }
 
     pub(crate) fn result_value(&self) -> Value {
-        json!({
-            "goal": self.next.as_ref().map(|durable| GoalSnapshot {
-                durable: durable.clone(),
-                armed: self.armed,
-            }.to_value()),
-        })
+        self.next.as_ref().map_or_else(
+            || json!({ "goal": null }),
+            |durable| {
+                GoalSnapshot {
+                    durable: durable.clone(),
+                    armed: self.armed,
+                }
+                .tool_value()
+            },
+        )
     }
 
     pub(crate) fn commit(mut self) -> Result<String, GoalError> {
@@ -910,7 +1006,7 @@ impl PreparedGoalMutation {
         Ok(notice)
     }
 
-    fn commit_snapshot(mut self) -> Result<GoalSnapshot, GoalError> {
+    pub(crate) fn commit_snapshot(mut self) -> Result<GoalSnapshot, GoalError> {
         let snapshot = GoalSnapshot {
             durable: self.next.clone().ok_or(GoalError::Unavailable)?,
             armed: self.armed,
@@ -1001,6 +1097,14 @@ fn validate_objective(objective: &str) -> Result<String, GoalError> {
         return Err(GoalError::ObjectiveTooLarge);
     }
     Ok(objective.to_owned())
+}
+
+fn validate_max_goal_rounds(value: u32) -> Result<u32, GoalError> {
+    if value == 0 {
+        Err(GoalError::InvalidMaxRounds)
+    } else {
+        Ok(value)
+    }
 }
 
 fn validate_goal_id(id: &str) -> Result<(), GoalError> {
@@ -1101,6 +1205,56 @@ mod tests {
             GoalReplayState::default().apply_change(&malformed),
             Err(GoalError::InvalidEvent)
         );
+    }
+
+    #[test]
+    fn cap_only_edit_replays_and_can_rearm_an_exhausted_goal() {
+        let runtime = GoalRuntime::new();
+        let create = runtime
+            .prepare_create_with_max("bounded".to_owned(), Some(1))
+            .unwrap();
+        let mut replay = GoalReplayState::default();
+        replay.apply_change(create.change()).unwrap();
+        create.commit().unwrap();
+        let goal_id = runtime.snapshot().unwrap().unwrap().id().to_owned();
+
+        let round = runtime.next_round().unwrap().unwrap();
+        let source = MessageSource::from_value(serde_json::json!({
+            "kind": "goal",
+            "goalId": round.goal_id,
+            "revision": round.revision,
+            "round": round.number,
+        }))
+        .unwrap();
+        let message = Message::user(
+            "goal-round-cap",
+            vec![ContentBlock::text(round.prompt).unwrap()],
+            source,
+        )
+        .unwrap();
+        replay.apply_goal_message(&message).unwrap();
+        assert_eq!(runtime.next_round().unwrap(), None);
+        assert!(matches!(
+            runtime.prepare_update_exact(Some(&goal_id), 1, GoalUpdate::Resume, None, None, None,),
+            Err(GoalError::InvalidTransition)
+        ));
+
+        let edit = runtime
+            .prepare_update_exact(Some(&goal_id), 1, GoalUpdate::Edit, None, Some(2), None)
+            .unwrap();
+        replay.apply_change(edit.change()).unwrap();
+        edit.commit().unwrap();
+        let resumed = runtime
+            .prepare_update_exact(Some(&goal_id), 2, GoalUpdate::Resume, None, None, None)
+            .unwrap();
+        replay.apply_change(resumed.change()).unwrap();
+        resumed.commit().unwrap();
+
+        let restored = GoalRuntime::from_replay(&replay);
+        let value = restored.snapshot().unwrap().unwrap().to_value();
+        assert_eq!(value["maxGoalRounds"], 2);
+        assert_eq!(value["revision"], 3);
+        assert_eq!(value["activation"], "disarmed");
     }
 
     #[test]

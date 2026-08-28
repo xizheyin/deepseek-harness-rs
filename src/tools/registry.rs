@@ -8,7 +8,7 @@ use crate::{
         ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult, ToolExecutor,
         ToolExecutorError, ToolShutdownFuture,
     },
-    goal::{GoalError, GoalRuntime, GoalUpdate, MAX_GOAL_OBJECTIVE_BYTES},
+    goal::{GoalBlockReason, GoalError, GoalRuntime, GoalUpdate, MAX_GOAL_OBJECTIVE_BYTES},
     model::{ContentBlock, JsonValue, ToolSchema},
     workspace_authority::WorkspaceAuthority,
 };
@@ -488,10 +488,9 @@ fn dispatch_goal(
         "get_goal" => parse_empty_goal_arguments(request.arguments().as_value())
             .and_then(|()| goal.snapshot().map_err(goal_call_error))
             .and_then(|snapshot| {
-                serde_json::to_string(&json!({
-                    "goal": snapshot.map(|goal| goal.to_value()),
-                }))
-                .map_err(|_| {
+                let value =
+                    snapshot.map_or_else(|| json!({ "goal": null }), |goal| goal.tool_value());
+                serde_json::to_string(&value).map_err(|_| {
                     ToolCallError::model(
                         "GoalError",
                         "GOAL_UNAVAILABLE",
@@ -500,9 +499,13 @@ fn dispatch_goal(
                 })
             }),
         "create_goal" => parse_create_goal_arguments(request.arguments().as_value())
-            .and_then(|objective| goal.create(objective).map_err(goal_call_error))
+            .and_then(|(objective, max_goal_rounds)| {
+                goal.prepare_create_with_max(objective, max_goal_rounds)
+                    .and_then(|mutation| mutation.commit_snapshot())
+                    .map_err(goal_call_error)
+            })
             .and_then(|snapshot| {
-                serde_json::to_string(&json!({ "goal": snapshot.to_value() })).map_err(|_| {
+                serde_json::to_string(&snapshot.tool_value()).map_err(|_| {
                     ToolCallError::model(
                         "GoalError",
                         "GOAL_UNAVAILABLE",
@@ -511,12 +514,20 @@ fn dispatch_goal(
                 })
             }),
         "update_goal" => parse_update_goal_arguments(request.arguments().as_value())
-            .and_then(|(revision, operation, objective)| {
-                goal.update(revision, operation, objective)
-                    .map_err(goal_call_error)
+            .and_then(|arguments| {
+                goal.prepare_update_exact(
+                    Some(&arguments.goal_id),
+                    arguments.revision,
+                    arguments.operation,
+                    arguments.objective,
+                    arguments.max_goal_rounds,
+                    arguments.blocked_reason,
+                )
+                .and_then(|mutation| mutation.commit_snapshot())
+                .map_err(goal_call_error)
             })
             .and_then(|snapshot| {
-                serde_json::to_string(&json!({ "goal": snapshot.to_value() })).map_err(|_| {
+                serde_json::to_string(&snapshot.tool_value()).map_err(|_| {
                     ToolCallError::model(
                         "GoalError",
                         "GOAL_UNAVAILABLE",
@@ -548,17 +559,20 @@ fn prepare_goal(
     let prepared = match request.name() {
         "create_goal" => require_goal_authority(caller, GoalAuthorityNeed::DirectHuman)
             .and_then(|()| parse_create_goal_arguments(request.arguments().as_value()))
-            .and_then(|objective| goal.prepare_create(objective).map_err(goal_call_error)),
-        "update_goal" => parse_update_goal_arguments(request.arguments().as_value()).and_then(
-            |(revision, operation, objective)| {
-                let need = match operation {
+            .and_then(|(objective, max_goal_rounds)| {
+                goal.prepare_create_with_max(objective, max_goal_rounds)
+                    .map_err(goal_call_error)
+            }),
+        "update_goal" => {
+            parse_update_goal_arguments(request.arguments().as_value()).and_then(|arguments| {
+                let need = match arguments.operation {
                     GoalUpdate::Edit | GoalUpdate::Pause | GoalUpdate::Resume => {
                         GoalAuthorityNeed::DirectHuman
                     }
                     GoalUpdate::Complete | GoalUpdate::Blocked => GoalAuthorityNeed::Completion,
                 };
                 require_goal_authority(caller, need)?;
-                if operation == GoalUpdate::Blocked
+                if arguments.operation == GoalUpdate::Blocked
                     && caller == GoalToolCaller::GoalRound
                     && goal
                         .snapshot()
@@ -567,10 +581,17 @@ fn prepare_goal(
                 {
                     return Err(goal_call_error(GoalError::BlockThreshold));
                 }
-                goal.prepare_update(revision, operation, objective)
-                    .map_err(goal_call_error)
-            },
-        ),
+                goal.prepare_update_exact(
+                    Some(&arguments.goal_id),
+                    arguments.revision,
+                    arguments.operation,
+                    arguments.objective,
+                    arguments.max_goal_rounds,
+                    arguments.blocked_reason,
+                )
+                .map_err(goal_call_error)
+            })
+        }
         _ => Err(ToolCallError::unknown_tool()),
     };
     match prepared {
@@ -617,70 +638,164 @@ fn parse_empty_goal_arguments(arguments: &serde_json::Value) -> ToolCallResult<(
     }
 }
 
-fn parse_create_goal_arguments(arguments: &serde_json::Value) -> ToolCallResult<String> {
+fn parse_create_goal_arguments(
+    arguments: &serde_json::Value,
+) -> ToolCallResult<(String, Option<u32>)> {
     let fields = arguments
         .as_object()
         .ok_or_else(|| ToolCallError::invalid_args("create_goal arguments must be an object"))?;
-    if fields.len() != 1 {
+    if fields
+        .keys()
+        .any(|key| !matches!(key.as_str(), "objective" | "max_goal_rounds"))
+    {
         return Err(ToolCallError::invalid_args(
-            "create_goal accepts exactly objective",
+            "create_goal received an unknown argument",
         ));
     }
-    fields
+    let objective = fields
         .get("objective")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| ToolCallError::invalid_args("objective must be a string"))
+        .ok_or_else(|| ToolCallError::invalid_args("objective must be a string"))?;
+    let max_goal_rounds = fields
+        .get("max_goal_rounds")
+        .map(parse_positive_goal_cap)
+        .transpose()?;
+    Ok((objective, max_goal_rounds))
 }
 
-fn parse_update_goal_arguments(
-    arguments: &serde_json::Value,
-) -> ToolCallResult<(u64, GoalUpdate, Option<String>)> {
+struct ParsedGoalUpdate {
+    goal_id: String,
+    revision: u64,
+    operation: GoalUpdate,
+    objective: Option<String>,
+    max_goal_rounds: Option<u32>,
+    blocked_reason: Option<GoalBlockReason>,
+}
+
+fn parse_update_goal_arguments(arguments: &serde_json::Value) -> ToolCallResult<ParsedGoalUpdate> {
     let fields = arguments
         .as_object()
         .ok_or_else(|| ToolCallError::invalid_args("update_goal arguments must be an object"))?;
     if fields.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "expected_revision" | "operation" | "objective"
+            "goal_id" | "revision" | "action" | "objective" | "max_goal_rounds" | "blocked_reason"
         )
     }) {
         return Err(ToolCallError::invalid_args(
             "update_goal received an unknown argument",
         ));
     }
+    let goal_id = fields
+        .get("goal_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 256
+                && *id == id.trim()
+                && !id.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+        .ok_or_else(goal_invalid_update)?;
     let revision = fields
-        .get("expected_revision")
+        .get("revision")
         .and_then(serde_json::Value::as_u64)
-        .filter(|revision| *revision != 0)
-        .ok_or_else(|| {
-            ToolCallError::invalid_args("expected_revision must be a positive integer")
-        })?;
+        .filter(|revision| *revision != 0 && *revision <= crate::session::MAX_SAFE_INTEGER)
+        .ok_or_else(goal_invalid_update)?;
     let operation = fields
-        .get("operation")
+        .get("action")
         .and_then(serde_json::Value::as_str)
         .and_then(GoalUpdate::parse)
-        .ok_or_else(|| ToolCallError::invalid_args("operation is not supported"))?;
-    let objective = match fields.get("objective") {
-        Some(value) => Some(
-            value
-                .as_str()
-                .ok_or_else(|| ToolCallError::invalid_args("objective must be a string"))?
-                .to_owned(),
-        ),
+        .ok_or_else(goal_invalid_update)?;
+    let objective = optional_goal_text(fields.get("objective"), "objective")?;
+    let max_goal_rounds = match fields.get("max_goal_rounds") {
+        Some(value) if value.as_u64() == Some(0) => None,
+        Some(value) => Some(parse_positive_goal_cap(value)?),
         None => None,
     };
-    Ok((revision, operation, objective))
+    let blocked_reason = optional_goal_text(fields.get("blocked_reason"), "blocked_reason")?;
+    let blocked_reason = match operation {
+        GoalUpdate::Edit => {
+            if blocked_reason.is_some() || (objective.is_none() && max_goal_rounds.is_none()) {
+                return Err(goal_invalid_update());
+            }
+            None
+        }
+        GoalUpdate::Pause | GoalUpdate::Resume | GoalUpdate::Complete => {
+            if objective.is_some() || max_goal_rounds.is_some() || blocked_reason.is_some() {
+                return Err(goal_invalid_update());
+            }
+            None
+        }
+        GoalUpdate::Blocked => {
+            if objective.is_some() || max_goal_rounds.is_some() {
+                return Err(goal_invalid_update());
+            }
+            Some(
+                GoalBlockReason::model_reported(
+                    blocked_reason.as_deref().ok_or_else(goal_invalid_update)?,
+                )
+                .map_err(|_| goal_invalid_update())?,
+            )
+        }
+    };
+    Ok(ParsedGoalUpdate {
+        goal_id,
+        revision,
+        operation,
+        objective,
+        max_goal_rounds,
+        blocked_reason,
+    })
+}
+
+fn optional_goal_text(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+) -> ToolCallResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| ToolCallError::invalid_args(format!("{field} must be a string")))?;
+    Ok((!value.is_empty()).then(|| value.to_owned()))
+}
+
+fn parse_positive_goal_cap(value: &serde_json::Value) -> ToolCallResult<u32> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0)
+        .ok_or_else(|| {
+            ToolCallError::model(
+                "GoalError",
+                "GOAL_INVALID_MAX_ROUNDS",
+                "max_goal_rounds must be a positive 32-bit integer",
+            )
+        })
+}
+
+fn goal_invalid_update() -> ToolCallError {
+    ToolCallError::model(
+        "GoalError",
+        "GOAL_TOOL_INVALID_UPDATE",
+        "update_goal arguments are invalid for the selected action",
+    )
 }
 
 fn goal_call_error(error: GoalError) -> ToolCallError {
     let code = match &error {
-        GoalError::Missing => "GOAL_MISSING",
-        GoalError::Unfinished => "GOAL_UNFINISHED",
+        GoalError::Missing => "GOAL_NOT_FOUND",
+        GoalError::Unfinished => "GOAL_ALREADY_EXISTS",
         GoalError::EmptyObjective | GoalError::ObjectiveTooLarge => "GOAL_INVALID_OBJECTIVE",
+        GoalError::InvalidMaxRounds => "GOAL_INVALID_MAX_ROUNDS",
+        GoalError::InvalidEdit => "GOAL_INVALID_EDIT",
+        GoalError::InvalidBlockReason => "GOAL_INVALID_BLOCK_REASON",
         GoalError::StaleRevision => "GOAL_STALE_REVISION",
         GoalError::InvalidTransition => "GOAL_INVALID_TRANSITION",
-        GoalError::BlockThreshold => "GOAL_BLOCK_THRESHOLD",
+        GoalError::BlockThreshold => "GOAL_TOOL_BLOCK_THRESHOLD",
         GoalError::Busy => "GOAL_BUSY",
         GoalError::Unavailable | GoalError::Commit(_) | GoalError::InvalidEvent => {
             "GOAL_UNAVAILABLE"
@@ -824,7 +939,7 @@ fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
     Ok([
         schema(
             "get_goal",
-            "Read the current process-local Goal, including its revision, phase, activation, and round limits.",
+            "Read the current same-session Goal, including its exact id, revision, phase, activation, and round limit.",
             json!({
                 "type": "object",
                 "properties": {},
@@ -833,7 +948,7 @@ fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
         )?,
         schema(
             "create_goal",
-            "Create and arm one process-local Goal when no unfinished Goal exists.",
+            "Create and arm one persisted same-session Goal from a direct human request.",
             json!({
                 "type": "object",
                 "properties": {
@@ -842,6 +957,12 @@ fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
                         "minLength": 1,
                         "maxLength": MAX_GOAL_OBJECTIVE_BYTES,
                         "description": "Concrete nonblank objective for bounded automatic continuation"
+                    },
+                    "max_goal_rounds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 4294967295_u32,
+                        "description": "Optional positive automatic continuation round limit"
                     }
                 },
                 "required": ["objective"],
@@ -850,15 +971,20 @@ fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
         )?,
         schema(
             "update_goal",
-            "Edit, pause, resume, complete, or report a repeated blocker for the current Goal using its exact revision.",
+            "Update the exact current Goal. Edit, pause, and resume require a direct human turn; complete and blocked also allow the current Goal round.",
             json!({
                 "type": "object",
                 "properties": {
-                    "expected_revision": {
+                    "goal_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                    },
+                    "revision": {
                         "type": "integer",
                         "minimum": 1
                     },
-                    "operation": {
+                    "action": {
                         "type": "string",
                         "enum": ["edit", "pause", "resume", "complete", "blocked"]
                     },
@@ -866,10 +992,21 @@ fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": MAX_GOAL_OBJECTIVE_BYTES,
-                        "description": "Required only when operation is edit"
+                        "description": "Replacement objective; valid only with action edit"
+                    },
+                    "max_goal_rounds": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4294967295_u32,
+                        "description": "Replacement round limit; valid only with action edit"
+                    },
+                    "blocked_reason": {
+                        "type": "string",
+                        "maxLength": 4096,
+                        "description": "Concrete blocking condition; required only with action blocked"
                     }
                 },
-                "required": ["expected_revision", "operation"],
+                "required": ["goal_id", "revision", "action"],
                 "additionalProperties": false
             }),
         )?,
@@ -921,6 +1058,13 @@ mod tests {
         )
     }
 
+    fn goal_result_json(result: &crate::agent::ToolExecutionResult) -> serde_json::Value {
+        let ContentBlockKind::Text { text } = result.content()[0].kind() else {
+            panic!("Goal result should contain one text block")
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
     #[test]
     fn normalized_content_budget_accepts_the_exact_json_limit_and_rejects_one_more() {
         let exact = "x".repeat(MAX_TOOL_CONTENT_BYTES - EMPTY_TEXT_BLOCK_JSON_BYTES);
@@ -967,12 +1111,14 @@ mod tests {
             created.content()[0].kind(),
             ContentBlockKind::Text { text } if text.contains("\"revision\":1")
         ));
+        let goal_id = goal.snapshot().unwrap().unwrap().id().to_owned();
 
         let update = goal_request(
             "update_goal",
             serde_json::json!({
-                "expected_revision": 1,
-                "operation": "complete"
+                "goal_id": goal_id,
+                "revision": 1,
+                "action": "complete"
             }),
         );
         let completed = dispatch_goal(Some(goal.clone()), &update).unwrap();
@@ -1025,14 +1171,16 @@ mod tests {
             panic!("a direct human turn may prepare Goal creation")
         };
         created.commit().unwrap();
+        let goal_id = goal.snapshot().unwrap().unwrap().id().to_owned();
 
         let rejected_edit = prepare_goal(
             Some(goal.clone()),
             &goal_request_as(
                 "update_goal",
                 serde_json::json!({
-                    "expected_revision": 1,
-                    "operation": "edit",
+                    "goal_id": goal_id,
+                    "revision": 1,
+                    "action": "edit",
                     "objective": "forged edit"
                 }),
                 GoalToolCaller::GoalRound,
@@ -1052,8 +1200,9 @@ mod tests {
             &goal_request_as(
                 "update_goal",
                 serde_json::json!({
-                    "expected_revision": 1,
-                    "operation": "complete"
+                    "goal_id": goal_id,
+                    "revision": 1,
+                    "action": "complete"
                 }),
                 GoalToolCaller::GoalRound,
             ),
@@ -1066,13 +1215,16 @@ mod tests {
     fn block_threshold_applies_to_goal_rounds_but_not_direct_human_turns() {
         let round_goal = GoalRuntime::new();
         round_goal.create("round blocker".to_owned()).unwrap();
+        let round_goal_id = round_goal.snapshot().unwrap().unwrap().id().to_owned();
         let early = prepare_goal(
             Some(round_goal.clone()),
             &goal_request_as(
                 "update_goal",
                 serde_json::json!({
-                    "expected_revision": 1,
-                    "operation": "blocked"
+                    "goal_id": round_goal_id,
+                    "revision": 1,
+                    "action": "blocked",
+                    "blocked_reason": "credential still unavailable"
                 }),
                 GoalToolCaller::GoalRound,
             ),
@@ -1083,24 +1235,123 @@ mod tests {
         };
         assert_eq!(
             early.error().map(|error| error.code.as_str()),
-            Some("GOAL_BLOCK_THRESHOLD")
+            Some("GOAL_TOOL_BLOCK_THRESHOLD")
         );
         assert_eq!(round_goal.snapshot().unwrap().unwrap().revision(), 1);
 
         let human_goal = GoalRuntime::new();
         human_goal.create("human blocker".to_owned()).unwrap();
+        let human_goal_id = human_goal.snapshot().unwrap().unwrap().id().to_owned();
         let early_human = prepare_goal(
             Some(human_goal),
             &goal_request_as(
                 "update_goal",
                 serde_json::json!({
-                    "expected_revision": 1,
-                    "operation": "blocked"
+                    "goal_id": human_goal_id,
+                    "revision": 1,
+                    "action": "blocked",
+                    "blocked_reason": "user requested a prerequisite pause"
                 }),
                 GoalToolCaller::DirectHuman,
             ),
         )
         .unwrap();
         assert!(matches!(early_human, ToolPreparation::Goal(_)));
+    }
+
+    #[test]
+    fn official_goal_contract_checks_exact_ref_cap_and_blocker_shape() {
+        let schemas = build_goal_schemas().unwrap();
+        assert_eq!(
+            schemas[1].parameters().as_value()["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["max_goal_rounds", "objective"]
+        );
+        assert_eq!(
+            schemas[2].parameters().as_value()["required"],
+            serde_json::json!(["goal_id", "revision", "action"])
+        );
+
+        let goal = GoalRuntime::new();
+        let created = dispatch_goal(
+            Some(goal.clone()),
+            &goal_request(
+                "create_goal",
+                serde_json::json!({
+                    "objective": "bounded contract",
+                    "max_goal_rounds": 5
+                }),
+            ),
+        )
+        .unwrap();
+        let created_json = goal_result_json(&created);
+        let goal_id = created_json["goal"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(created_json["activation"], "armed");
+        assert_eq!(created_json["goal"]["maxGoalRounds"], 5);
+
+        let wrong_id = dispatch_goal(
+            Some(goal.clone()),
+            &goal_request(
+                "update_goal",
+                serde_json::json!({
+                    "goal_id": "goal-wrong",
+                    "revision": 1,
+                    "action": "edit",
+                    "objective": "must not commit"
+                }),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            wrong_id.error().map(|error| error.code.as_str()),
+            Some("GOAL_STALE_REVISION")
+        );
+        assert_eq!(goal.snapshot().unwrap().unwrap().revision(), 1);
+
+        let edited = dispatch_goal(
+            Some(goal.clone()),
+            &goal_request(
+                "update_goal",
+                serde_json::json!({
+                    "goal_id": goal_id,
+                    "revision": 1,
+                    "action": "edit",
+                    "objective": "",
+                    "max_goal_rounds": 2,
+                    "blocked_reason": ""
+                }),
+            ),
+        )
+        .unwrap();
+        let edited_json = goal_result_json(&edited);
+        assert_eq!(edited_json["goal"]["objective"], "bounded contract");
+        assert_eq!(edited_json["goal"]["maxGoalRounds"], 2);
+
+        let blocked = dispatch_goal(
+            Some(goal),
+            &goal_request(
+                "update_goal",
+                serde_json::json!({
+                    "goal_id": goal_id,
+                    "revision": 2,
+                    "action": "blocked",
+                    "blocked_reason": "  credential unavailable  "
+                }),
+            ),
+        )
+        .unwrap();
+        let blocked_json = goal_result_json(&blocked);
+        assert_eq!(blocked_json["goal"]["phase"], "blocked");
+        assert_eq!(
+            blocked_json["goal"]["blockedReason"],
+            serde_json::json!({
+                "code": "model-reported",
+                "message": "credential unavailable"
+            })
+        );
     }
 }

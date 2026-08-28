@@ -1450,6 +1450,24 @@ preparation. Rust has no product subagents, so its single interactive Agent is
 the only possible top-level root. The focused evidence is recorded in
 `docs/design/goal-tool-authority.md` and `docs/validation/phase-14.md`.
 
+## Phase 15 Goal tool-contract inspection — 2026-08-28
+
+The fixed `packages/goal/tool-goal/src/index.ts`,
+`packages/goal/goal/src/{index,fold}.ts`, and contract/state-transition cases in
+`packages/goal/tool-goal/tests/tool-goal.spec.ts` were inspected for the exact
+model-facing shape. Official create accepts `objective` plus optional
+`max_goal_rounds`; update requires `goal_id`, `revision`, and `action`, with
+conditional objective/cap/blocker fields. Results place the snapshot under
+`goal` and activation beside it. Edit alone may replace objective/cap, and
+block persists trimmed text under code `model-reported`.
+
+Rust Phase 15 now exposes that closed shape, including exact ID/revision checks,
+cap-only edits, empty optional fillers, blocker validation, and canonical
+compact results. Rust retains its documented default of 32 rounds and a `u32`
+cap ceiling. Autonomous completion wrap-up context remains the next Goal
+behavior gap. Design and local evidence are in
+`docs/design/goal-tool-contract.md` and `docs/validation/phase-15.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:
