@@ -781,7 +781,7 @@ mod tests {
         ui.cancel();
         assert_eq!(
             answer.await,
-            Err(crate::user_question::UserQuestionError::Cancelled)
+            Err(crate::user_question::UserQuestionError::Dismissed)
         );
     }
 
@@ -833,7 +833,7 @@ mod tests {
         ui.cancel();
         assert_eq!(
             answer.await,
-            Err(crate::user_question::UserQuestionError::Cancelled)
+            Err(crate::user_question::UserQuestionError::Dismissed)
         );
     }
 
@@ -908,7 +908,7 @@ mod tests {
         ui.cancel();
         assert_eq!(
             answer.await,
-            Err(crate::user_question::UserQuestionError::Cancelled)
+            Err(crate::user_question::UserQuestionError::Dismissed)
         );
     }
 

@@ -47,6 +47,30 @@ fn minimal_snapshot(events: Value) -> String {
 }
 
 #[test]
+fn plan_mode_events_round_trip_and_reject_unknown_payload_fields() {
+    let snapshot = minimal_snapshot(json!([
+        { "type": "plan/mode", "seq": 0, "time": 11, "data": { "active": true } },
+        { "type": "plan/mode", "seq": 1, "time": 12, "data": { "active": false } }
+    ]));
+    let session = Session::from_json(&snapshot, IncrementingClock::new(20)).unwrap();
+
+    let encoded: Value = serde_json::from_str(&session.to_json().unwrap()).unwrap();
+    assert_eq!(encoded["events"][0]["type"], "plan/mode");
+    assert_eq!(encoded["events"][0]["data"], json!({ "active": true }));
+    assert_eq!(encoded["events"][1]["data"], json!({ "active": false }));
+
+    let malformed = minimal_snapshot(json!([
+        {
+            "type": "plan/mode",
+            "seq": 0,
+            "time": 11,
+            "data": { "active": true, "unexpected": true }
+        }
+    ]));
+    assert!(Session::from_json(&malformed, IncrementingClock::new(20)).is_err());
+}
+
+#[test]
 fn official_behavior_fixture_replays_to_expected_surface_and_messages() {
     let fixture = fixture();
     assert_eq!(fixture["fixture"]["baselineCommit"], UPSTREAM_COMMIT);

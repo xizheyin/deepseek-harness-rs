@@ -135,6 +135,18 @@ fn tool_message_content(request: &str, call_id: &str) -> String {
         .to_owned()
 }
 
+fn system_message_content(request: &str) -> String {
+    let request = request_json(request);
+    request["messages"]
+        .as_array()
+        .expect("request messages should be an array")
+        .iter()
+        .find(|message| message["role"] == "system")
+        .and_then(|message| message["content"].as_str())
+        .expect("request should contain a system message")
+        .to_owned()
+}
+
 fn repeated_text_sse(delta_count: usize) -> String {
     repeated_text_sse_with_width(delta_count, 1)
 }
@@ -2708,6 +2720,181 @@ fn user_question_pager_retains_drafts_and_returns_to_the_missing_first_question(
             r#"{"id":"targets","selected":["docs"]}]}"#,
         )
     );
+}
+
+#[test]
+fn plan_mode_reviews_the_exact_plan_and_exits_before_the_next_model_step() {
+    let plan = "# Safe change\n\n- Inspect the project\n- Run focused tests";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-exit-plan",
+            "exit_plan_mode",
+            serde_json::json!({ "plan": plan }),
+        ),
+        text_sse("The approved plan is ready to implement."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"/plan inspect the project first\r");
+    dsh.expect(b"Plan Mode on");
+    dsh.expect(b"# Safe change");
+    dsh.expect(b"Run focused tests");
+    dsh.expect(b"Press 1 to approve");
+    dsh.write(b"1");
+    dsh.expect(b"The approved plan is ready to implement.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(last_user_content(&requests[0]), "inspect the project first");
+    assert!(system_message_content(&requests[0]).contains("You are in Plan Mode."));
+    assert!(!system_message_content(&requests[1]).contains("You are in Plan Mode."));
+    assert!(
+        request_json(&requests[0])["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "exit_plan_mode")
+    );
+    assert_eq!(
+        tool_message_content(&requests[1], "call-exit-plan"),
+        "Plan approved — Plan Mode exited; carry out the plan starting with your next step."
+    );
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let journal = std::fs::read_to_string(entry.path()).unwrap();
+    let rows = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    let tool_result = rows
+        .iter()
+        .position(|row| row["type"] == "tool/result")
+        .unwrap();
+    let exit = rows
+        .iter()
+        .position(|row| row["type"] == "plan/mode" && row["data"]["active"] == false)
+        .unwrap();
+    let changed_header = rows
+        .iter()
+        .enumerate()
+        .skip(exit + 1)
+        .find(|(_, row)| row["type"] == "request/header")
+        .map(|(index, _)| index)
+        .unwrap();
+    assert!(tool_result < exit && exit < changed_header);
+}
+
+#[test]
+fn plan_mode_feedback_stays_active_until_manual_off() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-plan-feedback",
+            "exit_plan_mode",
+            serde_json::json!({ "plan": "# First draft\n\nImplement it." }),
+        ),
+        text_sse("I will revise the plan with that feedback."),
+        text_sse("Now I can implement outside Plan Mode."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"/plan draft safely\r");
+    dsh.expect(b"Press 1 to approve");
+    dsh.write(b"3");
+    dsh.expect(b"Enter answer | Ctrl+J newline");
+    dsh.write(b"add resume tests\r");
+    dsh.expect(b"I will revise the plan with that feedback.");
+    dsh.expect(b"Turn complete");
+    dsh.write(b"/plan off\r");
+    dsh.expect(b"Plan Mode off");
+    dsh.write(b"now implement\r");
+    dsh.expect(b"Now I can implement outside Plan Mode.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 3);
+    assert!(system_message_content(&requests[0]).contains("You are in Plan Mode."));
+    assert!(system_message_content(&requests[1]).contains("You are in Plan Mode."));
+    assert!(!system_message_content(&requests[2]).contains("You are in Plan Mode."));
+    assert_eq!(
+        tool_message_content(&requests[1], "call-plan-feedback"),
+        "Error: The user chose to keep planning; their feedback: add resume tests"
+    );
+}
+
+#[test]
+fn dismissing_plan_review_keeps_plan_mode_for_the_model() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-plan-discuss",
+            "exit_plan_mode",
+            serde_json::json!({ "plan": "# Discuss first\n\nWait for the user." }),
+        ),
+        text_sse("I will wait for your message in Plan Mode."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn_color(&server.base_url, &workspace.0);
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"/plan ask before acting\r");
+    dsh.expect(b"Press 1 to approve");
+    dsh.write(&[0x1b]);
+    dsh.expect(b"I will wait for your message in Plan Mode.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(system_message_content(&requests[1]).contains("You are in Plan Mode."));
+    assert_eq!(
+        tool_message_content(&requests[1], "call-plan-discuss"),
+        concat!(
+            "Error: The user dismissed the plan review to speak instead; ",
+            "stay in Plan Mode, stop here, and wait for their message."
+        )
+    );
+}
+
+#[test]
+fn linear_plan_command_enters_sends_and_manually_exits_without_escape_bytes() {
+    let server = SequenceSseServer::start(vec![text_sse("Linear planning response.")]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"/plan inspect in linear mode\r");
+    dsh.expect(b"[Plan Mode on. Use /plan off to leave.]");
+    dsh.expect(b"assistant | Linear planning response.");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    dsh.write(b"/plan off\r");
+    dsh.expect(b"[Plan Mode off.]");
+    dsh.expect_occurrences(b"dsh > ", 4);
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert!(!transcript.contains(&0x1b));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(last_user_content(&requests[0]), "inspect in linear mode");
+    assert!(system_message_content(&requests[0]).contains("You are in Plan Mode."));
 }
 
 #[test]

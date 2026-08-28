@@ -298,6 +298,7 @@ pub struct SessionState {
     request_header: Option<super::EpochHeader>,
     request_context: Option<super::RequestContext>,
     goal: GoalReplayState,
+    plan_mode_active: bool,
 }
 
 impl SessionState {
@@ -352,6 +353,11 @@ impl SessionState {
     pub(crate) fn goal_replay(&self) -> &GoalReplayState {
         &self.goal
     }
+
+    #[must_use]
+    pub(crate) const fn plan_mode_active(&self) -> bool {
+        self.plan_mode_active
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -368,6 +374,7 @@ pub(crate) struct Projection {
     request_context: Option<super::RequestContext>,
     request_context_seq: Option<EventSeq>,
     goal: GoalReplayState,
+    plan_mode_active: bool,
     compaction: CompactionState,
     pending_approvals: Vec<ApprovalRequestId>,
     owned_approval_ids: Arc<BTreeSet<ApprovalRequestId>>,
@@ -610,6 +617,7 @@ impl Projection {
             request_context: None,
             request_context_seq: None,
             goal: GoalReplayState::default(),
+            plan_mode_active: false,
             compaction: CompactionState::default(),
             pending_approvals: Vec::new(),
             owned_approval_ids: Arc::new(BTreeSet::new()),
@@ -1056,6 +1064,7 @@ impl Projection {
             request_header: self.request_header.as_deref().cloned(),
             request_context: self.request_context.clone(),
             goal: self.goal.clone(),
+            plan_mode_active: self.plan_mode_active,
         }
     }
 
@@ -2120,6 +2129,9 @@ impl Projection {
                 }
                 self.request_header = Some(Arc::new(header.canonicalized()));
                 self.request_header_seq = Some(event.seq);
+            }
+            EventKind::PlanMode { change } => {
+                self.plan_mode_active = change.active();
             }
             EventKind::RequestContext { context } => {
                 if self.open_turn().is_none() {
@@ -3217,6 +3229,7 @@ impl EventKind {
             Self::ToolResult { .. } => "tool/result",
             Self::TodoWrite { .. } => "todo/write",
             Self::GoalChange { .. } => "goal/change",
+            Self::PlanMode { .. } => "plan/mode",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",

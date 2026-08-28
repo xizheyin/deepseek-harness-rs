@@ -1068,6 +1068,9 @@ impl CommittedUiEvent {
             EventKind::GoalChange { .. } => CommittedUiKind::TypeOnly {
                 event_type: "goal/change",
             },
+            EventKind::PlanMode { .. } => CommittedUiKind::TypeOnly {
+                event_type: "plan/mode",
+            },
             EventKind::RequestHeader { .. } => CommittedUiKind::TypeOnly {
                 event_type: "request/header",
             },

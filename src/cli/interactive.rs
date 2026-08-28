@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent::AgentLoop,
     goal::{GoalCommand, GoalError, GoalRound, GoalRuntime},
+    plan_mode::{PlanModeCommand, PlanModeError, PlanModeRuntime},
     session::{
         ApprovalOutcome, CommittedUiKind, CommittedUiReceiver, EventSeq, StoreError, TurnEndReason,
         TurnId, UiUserSource,
@@ -298,6 +299,7 @@ async fn run_enhanced(
         resumed,
         file_suggestions,
         goal,
+        plan_mode,
     } = assembly;
     let mut file_suggestions = FileSuggestionController::new(file_suggestions);
     let mut live = LiveRenderer::for_session(resumed);
@@ -574,8 +576,9 @@ async fn run_enhanced(
                                 | EnhancedSubmission::Theme(_)
                                 | EnhancedSubmission::Motion(_)
                                 | EnhancedSubmission::Goal(_)
+                                | EnhancedSubmission::Plan(_)
                         );
-                    let (draft, cursor) = if let Some(round) = &goal_round {
+                    let (mut draft, mut cursor) = if let Some(round) = &goal_round {
                         (round.prompt().to_owned(), 0)
                     } else if local_command {
                         let cursor = input.composer().cursor();
@@ -591,7 +594,7 @@ async fn run_enhanced(
                         let cursor = input.composer().cursor();
                         (input.take_draft_for_turn()?, cursor)
                     };
-                    let submission = if goal_round.is_some() {
+                    let mut submission = if goal_round.is_some() {
                         EnhancedSubmission::Prompt
                     } else if local_command {
                         composer_submission
@@ -600,17 +603,39 @@ async fn run_enhanced(
                     } else {
                         classify_enhanced_submission(&draft)
                     };
+                    let mut handled_plan_command = false;
+                    if let EnhancedSubmission::Plan(command) = submission {
+                        match apply_plan_mode_command(
+                            &mut agent,
+                            &plan_mode,
+                            command,
+                            &mut notice,
+                        )
+                        .await
+                        {
+                            Some(prompt) => {
+                                draft = prompt;
+                                cursor = draft.len();
+                                submission = EnhancedSubmission::Prompt;
+                            }
+                            None => {
+                                handled_plan_command = true;
+                                submission = EnhancedSubmission::Empty;
+                            }
+                        }
+                    }
                     if queued_id.is_none() {
                         let _ = file_suggestions
                             .sync(input.composer(), false, false)
                             .map_err(|_| InteractiveError::Agent)?;
                     }
                     match submission {
+                        EnhancedSubmission::Empty if handled_plan_command => {}
                         EnhancedSubmission::Empty => notice = None,
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/goal [objective|edit|pause|resume|clear] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -662,6 +687,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Goal(command) => {
                             apply_goal_command(&mut agent, &goal, command, &mut notice).await;
                         }
+                        EnhancedSubmission::Plan(_) => return Err(InteractiveError::Agent),
                         EnhancedSubmission::Prompt => {
                             let prompt = copy_enhanced_prompt(&draft)?;
                             presenter.observe_external_line_start();
@@ -1141,6 +1167,7 @@ enum EnhancedSubmission {
     Theme(ThemeCommand),
     Motion(MotionCommand),
     Goal(Result<GoalCommand, GoalError>),
+    Plan(Result<PlanModeCommand, PlanModeError>),
     Prompt,
 }
 
@@ -1152,6 +1179,8 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         EnhancedSubmission::Command(command)
     } else if let Some(goal) = GoalCommand::parse(command) {
         EnhancedSubmission::Goal(goal)
+    } else if let Some(plan) = PlanModeCommand::parse(command) {
+        EnhancedSubmission::Plan(plan)
     } else if let Some(theme) = ThemeCommand::parse(command) {
         EnhancedSubmission::Theme(theme)
     } else if let Some(motion) = MotionCommand::parse(command) {
@@ -1159,6 +1188,52 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
     } else {
         EnhancedSubmission::Prompt
     }
+}
+
+async fn apply_plan_mode_command(
+    agent: &mut AgentLoop,
+    runtime: &PlanModeRuntime,
+    command: Result<PlanModeCommand, PlanModeError>,
+    notice: &mut Option<String>,
+) -> Option<String> {
+    let command = match command {
+        Ok(command) => command,
+        Err(error) => {
+            *notice = Some(format!("Plan Mode error · {error}"));
+            return None;
+        }
+    };
+    let (target, message) = match command {
+        PlanModeCommand::Enter { message } => (true, message),
+        PlanModeCommand::Off => (false, None),
+    };
+    let current = match runtime.active() {
+        Ok(current) => current,
+        Err(error) => {
+            *notice = Some(format!("Plan Mode error · {error}"));
+            return None;
+        }
+    };
+    let mutation = match runtime.prepare_set(target) {
+        Ok(mutation) => mutation,
+        Err(error) => {
+            *notice = Some(format!("Plan Mode error · {error}"));
+            return None;
+        }
+    };
+    if let Some(mutation) = mutation {
+        if agent.commit_plan_mode_mutation(mutation).await.is_err() {
+            *notice = Some("Plan Mode error · the mode change could not be recorded".to_owned());
+            return None;
+        }
+    }
+    *notice = Some(match (target, current) {
+        (true, true) => "Plan Mode is already active. Use /plan off to leave.".to_owned(),
+        (true, false) => "Plan Mode on. Use /plan off to leave.".to_owned(),
+        (false, true) => "Plan Mode off.".to_owned(),
+        (false, false) => "Plan Mode is already inactive.".to_owned(),
+    });
+    message
 }
 
 async fn apply_goal_command(
@@ -1649,7 +1724,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
+                "/goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -2399,6 +2474,7 @@ async fn run_linear(
         resumed,
         file_suggestions: _file_suggestions,
         goal,
+        plan_mode,
     } = assembly;
     let mut live = LiveRenderer::for_session(resumed);
     live.set_context_estimate(session_context_estimate(agent.session(), None, None));
@@ -2415,6 +2491,7 @@ async fn run_linear(
             }
         }
 
+        let mut plan_prompt: Option<String> = None;
         loop {
             if goal.is_armed().map_err(|_| InteractiveError::Agent)? {
                 if let Some(round) = goal.next_round().map_err(|_| InteractiveError::Agent)? {
@@ -2469,23 +2546,30 @@ async fn run_linear(
             }
             terminal.revalidate()?;
 
-            let input = loop {
-                tokio::select! {
-                    biased;
-                    signal = signals.next() => break IdleEvent::Signal(signal),
-                    read = terminal.read_once(&mut scratch) => {
-                        let count = read.map_err(|_| InteractiveError::TerminalUnavailable)?;
-                        if count == 0 {
-                            break IdleEvent::Eof;
-                        }
-                        let mut first = None;
-                        parser.feed(&scratch[..count], count < TERMINAL_READ_BYTES, |event| {
-                            if first.is_none() {
-                                first = Some(event);
+            let input = if let Some(text) = plan_prompt.take() {
+                IdleEvent::Record(InputRecordEvent::Record {
+                    text,
+                    terminated_by_lf: true,
+                })
+            } else {
+                loop {
+                    tokio::select! {
+                        biased;
+                        signal = signals.next() => break IdleEvent::Signal(signal),
+                        read = terminal.read_once(&mut scratch) => {
+                            let count = read.map_err(|_| InteractiveError::TerminalUnavailable)?;
+                            if count == 0 {
+                                break IdleEvent::Eof;
                             }
-                        });
-                        if let Some(event) = first {
-                            break IdleEvent::Record(event);
+                            let mut first = None;
+                            parser.feed(&scratch[..count], count < TERMINAL_READ_BYTES, |event| {
+                                if first.is_none() {
+                                    first = Some(event);
+                                }
+                            });
+                            if let Some(event) = first {
+                                break IdleEvent::Record(event);
+                            }
                         }
                     }
                 }
@@ -2615,6 +2699,26 @@ async fn run_linear(
                         let message = format!(
                             "[{}]\n",
                             notice.as_deref().unwrap_or("Goal state unavailable")
+                        );
+                        if let Some(signal) =
+                            write_dynamic_notice(message, &mut presenter, &terminal, signals)
+                                .await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::Plan(command) => {
+                        let mut notice = None;
+                        plan_prompt =
+                            apply_plan_mode_command(&mut agent, &plan_mode, command, &mut notice)
+                                .await;
+                        let message = format!(
+                            "[{}]\n",
+                            notice.as_deref().unwrap_or("Plan Mode state unavailable")
                         );
                         if let Some(signal) =
                             write_dynamic_notice(message, &mut presenter, &terminal, signals)
@@ -5668,7 +5772,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/goal [objective|edit|pause|resume|clear] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -5714,6 +5818,14 @@ fn handle_active_input(
                 EnhancedSubmission::Goal(command) => {
                     let _ = input.take_draft_for_turn()?;
                     apply_active_goal_command(goal, command, notice);
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::Plan(_) => {
+                    let _ = input.take_draft_for_turn()?;
+                    *notice = Some(
+                        "Plan Mode error · wait for the current turn or press Ctrl+C before changing mode"
+                            .to_owned(),
+                    );
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Empty => {
@@ -5789,7 +5901,7 @@ fn process_event(
         return if matches!(
             &event.kind,
             CommittedUiKind::TypeOnly {
-                event_type: "goal/change"
+                event_type: "goal/change" | "plan/mode"
             }
         ) {
             Ok(())

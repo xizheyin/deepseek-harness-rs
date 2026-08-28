@@ -10,6 +10,7 @@ use crate::{
     entropy::EntropySource,
     goal::GoalRuntime,
     model::LlmCallConfig,
+    plan_mode::PlanModeRuntime,
     provider::{
         ModelProvider,
         deepseek::{DEEPSEEK_PROVIDER, DeepSeekConfig, DeepSeekProvider},
@@ -29,6 +30,7 @@ use super::{
 };
 
 const SYSTEM_PROMPT: &str = "You are dsh, a coding agent working only through the supplied workspace tools. Use tools when they are useful. Never claim a file change or command completed unless its correlated tool result says it completed. When a Goal exists, use get_goal and settle it truthfully with update_goal; leave it active while useful work remains. This session has no sandbox, Skills, Hooks, or background-task feature.";
+const PLAN_MODE_POLICY: &str = "You are in Plan Mode. Explore and inspect the project, then produce a complete implementation plan before making changes. Do not modify files or run commands with side effects while planning. When the plan is ready, call exit_plan_mode with the complete markdown plan beginning with a # heading. Plan Mode is guidance, not a sandbox; all existing approval and safety rules still apply.";
 
 pub(super) enum AgentAssembly {
     Script(AgentLoop),
@@ -45,6 +47,7 @@ pub(super) struct InteractiveAssembly {
     pub(super) resumed: bool,
     pub(super) file_suggestions: WorkspaceFileCatalogue,
     pub(super) goal: GoalRuntime,
+    pub(super) plan_mode: PlanModeRuntime,
 }
 
 pub(super) struct AssemblySession {
@@ -167,6 +170,7 @@ pub(super) async fn assemble_session(
     let file_suggestions =
         interactive.then(|| WorkspaceFileCatalogue::from_authority(authority.clone()));
     let goal = interactive.then(|| GoalRuntime::from_replay(session.state().goal_replay()));
+    let plan_mode = PlanModeRuntime::new(session.state().plan_mode_active());
     let (user_questions, question_receiver) = if interactive {
         let (broker, receiver) = UserQuestionBroker::new();
         (Some(broker), Some(receiver))
@@ -181,6 +185,7 @@ pub(super) async fn assemble_session(
                 plugin_config,
                 cancellation,
                 goal.clone(),
+                Some(plan_mode.clone()),
                 user_questions.clone(),
             )
             .await
@@ -188,6 +193,7 @@ pub(super) async fn assemble_session(
         None => LocalToolRegistry::from_authority_with_interaction(
             authority,
             goal.clone(),
+            Some(plan_mode.clone()),
             user_questions,
         ),
     };
@@ -216,6 +222,7 @@ pub(super) async fn assemble_session(
     let config = match AgentLoopConfig::new(call)
         .with_system(SYSTEM_PROMPT)
         .and_then(|config| config.with_tools(schemas))
+        .and_then(|config| config.with_plan_mode(plan_mode.clone(), PLAN_MODE_POLICY))
     {
         Ok(config) => config,
         Err(_) => {
@@ -263,6 +270,7 @@ pub(super) async fn assemble_session(
             resumed,
             file_suggestions,
             goal,
+            plan_mode,
         }))
     } else {
         let config = config

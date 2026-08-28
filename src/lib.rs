@@ -5,6 +5,7 @@
 mod entropy;
 mod goal;
 mod json_value;
+mod plan_mode;
 mod resident_credit;
 mod tui;
 mod user_question;

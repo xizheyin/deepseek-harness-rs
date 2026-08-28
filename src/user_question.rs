@@ -4,6 +4,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const MAX_QUESTION_ID_BYTES: usize = 64;
 pub(crate) const MAX_QUESTION_HEADER_BYTES: usize = 64;
 pub(crate) const MAX_QUESTION_TEXT_BYTES: usize = 512;
+pub(crate) const MAX_QUESTION_DETAIL_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_QUESTION_OPTION_LABEL_BYTES: usize = 128;
 pub(crate) const MAX_QUESTION_OPTION_DESCRIPTION_BYTES: usize = 256;
 pub(crate) const MAX_CUSTOM_ANSWER_BYTES: usize = 4 * 1024;
@@ -34,12 +35,27 @@ impl UserQuestionOption {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UserQuestionIntent {
+    PlanReview { approve: String },
+}
+
+impl UserQuestionIntent {
+    pub(crate) fn approve(&self) -> &str {
+        match self {
+            Self::PlanReview { approve } => approve,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UserQuestionItem {
     id: String,
     header: Option<String>,
     question: String,
+    detail: Option<String>,
     options: Vec<UserQuestionOption>,
     multi_select: bool,
+    intent: Option<UserQuestionIntent>,
 }
 
 impl UserQuestionItem {
@@ -53,13 +69,25 @@ impl UserQuestionItem {
             id,
             header,
             question,
+            detail: None,
             options,
             multi_select: false,
+            intent: None,
         }
     }
 
     pub(crate) fn with_multi_select(mut self, multi_select: bool) -> Self {
         self.multi_select = multi_select;
+        self
+    }
+
+    pub(crate) fn with_detail(mut self, detail: String) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+
+    pub(crate) fn with_intent(mut self, intent: UserQuestionIntent) -> Self {
+        self.intent = Some(intent);
         self
     }
 
@@ -75,12 +103,20 @@ impl UserQuestionItem {
         &self.question
     }
 
+    pub(crate) fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
     pub(crate) fn options(&self) -> &[UserQuestionOption] {
         &self.options
     }
 
     pub(crate) fn multi_select(&self) -> bool {
         self.multi_select
+    }
+
+    pub(crate) fn intent(&self) -> Option<&UserQuestionIntent> {
+        self.intent.as_ref()
     }
 }
 
@@ -134,6 +170,7 @@ impl UserQuestionAnswer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserQuestionError {
     Cancelled,
+    Dismissed,
     Unavailable,
     InvalidResponse,
 }
@@ -213,6 +250,22 @@ impl UserQuestionBroker {
         if cancellation.is_cancelled() {
             return Err(UserQuestionError::Cancelled);
         }
+        if request.questions.iter().any(|question| {
+            question.detail.as_ref().is_some_and(|detail| {
+                detail.len() > MAX_QUESTION_DETAIL_BYTES
+                    || detail.chars().any(|character| {
+                        character.is_control() && !matches!(character, '\n' | '\t')
+                    })
+            }) || question.intent.as_ref().is_some_and(|intent| {
+                question.detail.is_none()
+                    || !question
+                        .options
+                        .iter()
+                        .any(|option| option.label == intent.approve())
+            })
+        }) {
+            return Err(UserQuestionError::InvalidResponse);
+        }
         let questions = request.questions.clone();
         let (response, receive_response) = oneshot::channel();
         self.sender
@@ -224,7 +277,7 @@ impl UserQuestionBroker {
             response = receive_response => response.map_err(|_| UserQuestionError::Unavailable)?,
         };
         let Some(response_answers) = response.answers else {
-            return Err(UserQuestionError::Cancelled);
+            return Err(UserQuestionError::Dismissed);
         };
         if response_answers.len() != questions.len() {
             return Err(UserQuestionError::InvalidResponse);
@@ -415,7 +468,7 @@ mod tests {
             Err(UserQuestionError::Unavailable)
         );
         receiver.try_recv().unwrap().cancel().unwrap();
-        assert_eq!(first.await, Err(UserQuestionError::Cancelled));
+        assert_eq!(first.await, Err(UserQuestionError::Dismissed));
 
         drop(receiver);
         assert_eq!(

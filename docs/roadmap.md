@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–22 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–23 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -30,6 +30,7 @@ for behavior that users can run today.
 | 20 | Bounded multi-select user questions | `complete` | [`validation/phase-20.md`](validation/phase-20.md) |
 | 21 | Per-question skip in bounded question batches | `complete` | [`validation/phase-21.md`](validation/phase-21.md) |
 | 22 | Draft-preserving user-question pager | `complete` | [`validation/phase-22.md`](validation/phase-22.md) |
+| 23 | Durable terminal Plan Mode and reviewed exit | `complete` | [`validation/phase-23.md`](validation/phase-23.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -320,6 +321,23 @@ ordinary next-turn Composer draft exactly, and Escape/Ctrl+C semantics are
 unchanged. Plan-review presentation, product subagent routing, and the general
 answerer waterfall remain deferred. Design and local evidence live in
 `docs/design/user-question-pager.md` and `docs/validation/phase-22.md`.
+
+## Phase 23 Plan Mode boundary (2026-08-28)
+
+Phase 23 adds the official Plan Mode loop as a real terminal capability:
+durable `plan/mode` state, `/plan` and `/plan off`, a stable
+`exit_plan_mode` schema, plan-only system guidance, and a human review of the
+exact submitted markdown plan. Approval records the exit before the next model
+request; Keep planning and feedback remain failed tool results so the model
+must revise; dismissing the review keeps Plan Mode active and returns control
+to the human.
+
+Plan Mode is guidance, not a sandbox. It does not remove tools or bypass the
+existing file, Shell, plugin, approval, timeout, Session, or cancellation
+pipelines. The Rust terminal does not copy the Web card: it renders the exact
+bounded plan through the existing trusted/untrusted terminal projection and
+uses the existing question answerer. Image attachments and runtime-owned
+subagents remain unavailable. Acceptance is local-only and focused as requested.
 
 ## Still deferred
 

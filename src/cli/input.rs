@@ -1,5 +1,6 @@
 use crate::{
     goal::{GoalCommand, GoalError},
+    plan_mode::{PlanModeCommand, PlanModeError},
     tui::{motion::MotionCommand, theme::ThemeCommand},
 };
 
@@ -99,6 +100,7 @@ pub(super) enum IdleInput {
     Theme(ThemeCommand),
     Motion(MotionCommand),
     Goal(Result<GoalCommand, GoalError>),
+    Plan(Result<PlanModeCommand, PlanModeError>),
     Exit,
     Submit(String),
 }
@@ -113,6 +115,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     }
     if let Some(goal) = GoalCommand::parse(command) {
         return IdleInput::Goal(goal);
+    }
+    if let Some(plan) = PlanModeCommand::parse(command) {
+        return IdleInput::Plan(plan);
     }
     match command {
         "" => IdleInput::Redraw,

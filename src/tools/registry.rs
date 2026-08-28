@@ -10,11 +10,12 @@ use crate::{
     },
     goal::{GoalBlockReason, GoalError, GoalRuntime, GoalUpdate, MAX_GOAL_OBJECTIVE_BYTES},
     model::{ContentBlock, JsonValue, ToolSchema},
+    plan_mode::{MAX_PLAN_BYTES, PlanModeRuntime},
     user_question::{
         MAX_QUESTION_HEADER_BYTES, MAX_QUESTION_ID_BYTES, MAX_QUESTION_OPTION_DESCRIPTION_BYTES,
         MAX_QUESTION_OPTION_LABEL_BYTES, MAX_QUESTION_OPTIONS, MAX_QUESTION_TEXT_BYTES,
         MAX_USER_QUESTIONS, MIN_QUESTION_OPTIONS, UserQuestionBroker, UserQuestionError,
-        UserQuestionItem, UserQuestionOption, UserQuestionRequest,
+        UserQuestionIntent, UserQuestionItem, UserQuestionOption, UserQuestionRequest,
     },
     workspace_authority::WorkspaceAuthority,
 };
@@ -152,6 +153,7 @@ pub struct LocalToolRegistry {
     runner: Arc<ProcessRunner>,
     plugins: Option<Arc<PluginHost>>,
     goal: Option<GoalRuntime>,
+    plan_mode: Option<PlanModeRuntime>,
     user_questions: Option<UserQuestionBroker>,
 }
 
@@ -172,6 +174,7 @@ impl std::fmt::Debug for LocalToolRegistry {
                     .map_or(0, |plugins| plugins.schemas().len()),
             )
             .field("goal_enabled", &self.goal.is_some())
+            .field("plan_mode_enabled", &self.plan_mode.is_some())
             .field("user_questions_enabled", &self.user_questions.is_some())
             .finish()
     }
@@ -200,12 +203,13 @@ impl LocalToolRegistry {
         authority: WorkspaceAuthority,
         goal: Option<GoalRuntime>,
     ) -> Result<Self, ToolRegistryBuildError> {
-        Self::from_authority_with_interaction(authority, goal, None)
+        Self::from_authority_with_interaction(authority, goal, None, None)
     }
 
     pub(crate) fn from_authority_with_interaction(
         authority: WorkspaceAuthority,
         goal: Option<GoalRuntime>,
+        plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
     ) -> Result<Self, ToolRegistryBuildError> {
         let workspace = Arc::new(Workspace::from_authority(authority));
@@ -219,6 +223,9 @@ impl LocalToolRegistry {
         if goal.is_some() {
             schemas.extend(build_goal_schemas()?);
         }
+        if plan_mode.is_some() {
+            schemas.push(build_exit_plan_mode_schema()?);
+        }
         if user_questions.is_some() {
             schemas.push(build_user_question_schema()?);
         }
@@ -229,6 +236,7 @@ impl LocalToolRegistry {
             runner,
             plugins: None,
             goal,
+            plan_mode,
             user_questions,
         })
     }
@@ -238,9 +246,11 @@ impl LocalToolRegistry {
         config: PluginConfig,
         cancellation: CancellationToken,
         goal: Option<GoalRuntime>,
+        plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
     ) -> Result<Self, ToolRegistryBuildError> {
-        let mut registry = Self::from_authority_with_interaction(authority, goal, user_questions)?;
+        let mut registry =
+            Self::from_authority_with_interaction(authority, goal, plan_mode, user_questions)?;
         let plugins = Arc::new(
             PluginHost::start(config, &registry.schemas, cancellation)
                 .await
@@ -280,7 +290,7 @@ impl ToolExecutor for LocalToolRegistry {
     fn claim_profile(&self, tool_name: &str) -> ToolClaimProfile {
         if tool_name == "bash" {
             ToolClaimProfile::shell_action()
-        } else if tool_name == "ask_user_question" {
+        } else if matches!(tool_name, "ask_user_question" | "exit_plan_mode") {
             ToolClaimProfile::user_question()
         } else if let Some(plugin_id) = self
             .plugins
@@ -304,6 +314,16 @@ impl ToolExecutor for LocalToolRegistry {
         if is_goal_tool(request.name()) {
             let goal = self.goal.clone();
             return Box::pin(async move { dispatch_goal(goal, &request) });
+        }
+        if request.name() == "exit_plan_mode" {
+            return Box::pin(async {
+                ToolCallError::model(
+                    "PlanModeError",
+                    "PLAN_PREPARATION_REQUIRED",
+                    "exit_plan_mode must use the Agent preparation stage",
+                )
+                .into_execution_result()
+            });
         }
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
@@ -352,6 +372,7 @@ impl ToolExecutor for LocalToolRegistry {
         let runner = Arc::clone(&self.runner);
         let plugins = self.plugins.clone();
         let goal = self.goal.clone();
+        let plan_mode = self.plan_mode.clone();
         let user_questions = self.user_questions.clone();
         Box::pin(async move {
             if is_goal_tool(request.name()) {
@@ -359,6 +380,10 @@ impl ToolExecutor for LocalToolRegistry {
             }
             if request.name() == "ask_user_question" {
                 return prepare_user_question(user_questions, &request, cancellation).await;
+            }
+            if request.name() == "exit_plan_mode" {
+                return prepare_exit_plan_mode(plan_mode, user_questions, &request, cancellation)
+                    .await;
             }
             if request.name() == "apply_patch" {
                 return patch::prepare(
@@ -502,6 +527,157 @@ fn normalize_success(text: String) -> Result<ToolExecutionResult, ToolExecutorEr
 
 fn is_goal_tool(name: &str) -> bool {
     matches!(name, "get_goal" | "create_goal" | "update_goal")
+}
+
+async fn prepare_exit_plan_mode(
+    plan_mode: Option<PlanModeRuntime>,
+    broker: Option<UserQuestionBroker>,
+    request: &ToolExecutionRequest,
+    cancellation: CancellationToken,
+) -> Result<ToolPreparation, ToolExecutorError> {
+    let Some(plan_mode) = plan_mode else {
+        return Ok(ToolPreparation::Complete(
+            ToolCallError::unknown_tool().into_execution_result()?,
+        ));
+    };
+    let failure = |code: &'static str, message: String| {
+        ToolCallError::model("PlanModeError", code, message).into_execution_result()
+    };
+    match plan_mode.active() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(ToolPreparation::Complete(failure(
+                "PLAN_MODE_INACTIVE",
+                "exit_plan_mode is only available in Plan Mode".to_owned(),
+            )?));
+        }
+        Err(_) => {
+            return Ok(ToolPreparation::Complete(failure(
+                "PLAN_MODE_UNAVAILABLE",
+                "Plan Mode state is unavailable; no exit was attempted".to_owned(),
+            )?));
+        }
+    }
+    let plan = match parse_exit_plan_mode_arguments(request.arguments().as_value()) {
+        Ok(plan) => plan,
+        Err(error) => return Ok(ToolPreparation::Complete(error.into_execution_result()?)),
+    };
+    let Some(broker) = broker else {
+        return Ok(ToolPreparation::Complete(failure(
+            "NO_PROVIDER",
+            "no terminal user-question answerer is available; use /plan off to leave Plan Mode"
+                .to_owned(),
+        )?));
+    };
+    let review = UserQuestionItem::new(
+        "plan-review".to_owned(),
+        Some("Plan review".to_owned()),
+        "Approve this plan and leave Plan Mode?".to_owned(),
+        vec![
+            UserQuestionOption::new(
+                "Approve".to_owned(),
+                Some("Leave Plan Mode and carry out the plan from the next step.".to_owned()),
+            ),
+            UserQuestionOption::new(
+                "Keep planning".to_owned(),
+                Some("Stay in Plan Mode; feedback goes back to the model.".to_owned()),
+            ),
+        ],
+    )
+    .with_detail(plan)
+    .with_intent(UserQuestionIntent::PlanReview {
+        approve: "Approve".to_owned(),
+    });
+    let answer = match broker
+        .ask(UserQuestionRequest::new(vec![review]), cancellation)
+        .await
+    {
+        Ok(answer) => answer,
+        Err(UserQuestionError::Dismissed) => {
+            return Ok(ToolPreparation::Complete(failure(
+                "ASK_CANCELLED",
+                "The user dismissed the plan review to speak instead; stay in Plan Mode, stop here, and wait for their message."
+                    .to_owned(),
+            )?));
+        }
+        Err(UserQuestionError::Cancelled) => {
+            return Ok(ToolPreparation::Complete(failure(
+                "ASK_ABORTED",
+                "ask_user_question was cancelled before the user answered".to_owned(),
+            )?));
+        }
+        Err(UserQuestionError::Unavailable) => {
+            return Ok(ToolPreparation::Complete(failure(
+                "NO_PROVIDER",
+                "no terminal user-question answerer is available".to_owned(),
+            )?));
+        }
+        Err(UserQuestionError::InvalidResponse) => {
+            return Ok(ToolPreparation::Complete(failure(
+                "INVALID_RESPONSE",
+                "the terminal returned an invalid plan-review answer".to_owned(),
+            )?));
+        }
+    };
+    let item = answer.answers().first();
+    let approved = item.is_some_and(|item| {
+        item.id() == "plan-review" && item.selected() == ["Approve"] && item.custom().is_none()
+    });
+    if !approved {
+        let message = item.and_then(|item| item.custom()).map_or_else(
+            || "The user chose to keep planning; revise the plan and present it again.".to_owned(),
+            |feedback| format!("The user chose to keep planning; their feedback: {feedback}"),
+        );
+        return Ok(ToolPreparation::Complete(failure(
+            "PLAN_KEEP_PLANNING",
+            message,
+        )?));
+    }
+    let exit = match plan_mode.prepare_approved_exit() {
+        Ok(exit) => exit,
+        Err(_) => {
+            return Ok(ToolPreparation::Complete(failure(
+                "PLAN_MODE_CHANGED",
+                "Plan Mode changed while the plan was under review; present the plan again"
+                    .to_owned(),
+            )?));
+        }
+    };
+    let result = normalize_success(
+        "Plan approved — Plan Mode exited; carry out the plan starting with your next step."
+            .to_owned(),
+    )?;
+    Ok(ToolPreparation::PlanExit { exit, result })
+}
+
+fn parse_exit_plan_mode_arguments(arguments: &serde_json::Value) -> ToolCallResult<String> {
+    let fields = arguments
+        .as_object()
+        .ok_or_else(|| ToolCallError::invalid_args("exit_plan_mode arguments must be an object"))?;
+    if fields.keys().any(|key| key != "plan") {
+        return Err(ToolCallError::invalid_args(
+            "exit_plan_mode received an unknown argument",
+        ));
+    }
+    let plan = fields
+        .get("plan")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolCallError::invalid_args("plan must be a string"))?;
+    let trimmed = plan.trim_matches(char::is_whitespace);
+    let has_heading = trimmed
+        .strip_prefix("# ")
+        .is_some_and(|title| !title.lines().next().unwrap_or_default().trim().is_empty());
+    let valid_controls = !plan
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\t'));
+    if plan.len() > MAX_PLAN_BYTES || !has_heading || !valid_controls {
+        return Err(ToolCallError::model(
+            "PlanModeError",
+            "PLAN_INVALID",
+            "exit_plan_mode requires a bounded markdown plan starting with a # heading",
+        ));
+    }
+    Ok(plan.to_owned())
 }
 
 async fn prepare_user_question(
@@ -692,6 +868,10 @@ fn bounded_question_text(
 fn user_question_call_error(error: UserQuestionError) -> ToolCallError {
     let (code, message) = match error {
         UserQuestionError::Cancelled => (
+            "ASK_CANCELLED",
+            "ask_user_question was cancelled before the user answered",
+        ),
+        UserQuestionError::Dismissed => (
             "ASK_CANCELLED",
             "ask_user_question was cancelled before the user answered",
         ),
@@ -1243,6 +1423,26 @@ fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
     ])
 }
 
+fn build_exit_plan_mode_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
+    schema(
+        "exit_plan_mode",
+        "Use only in Plan Mode. Present the complete markdown plan for user review and leave Plan Mode only after exact approval.",
+        json!({
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "string",
+                    "minLength": 3,
+                    "maxLength": MAX_PLAN_BYTES,
+                    "description": "Complete markdown plan beginning with a # heading; runtime maximum is 16384 UTF-8 bytes"
+                }
+            },
+            "required": ["plan"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 fn build_user_question_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
     schema(
         "ask_user_question",
@@ -1331,19 +1531,87 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        MAX_TOOL_CONTENT_BYTES, build_goal_schemas, build_user_question_schema, dispatch_goal,
-        normalize_success, parse_user_question_arguments, prepare_goal, prepare_user_question,
+        MAX_TOOL_CONTENT_BYTES, build_exit_plan_mode_schema, build_goal_schemas,
+        build_user_question_schema, dispatch_goal, normalize_success,
+        parse_exit_plan_mode_arguments, parse_user_question_arguments, prepare_exit_plan_mode,
+        prepare_goal, prepare_user_question,
     };
     use crate::{
         agent::{GoalToolCaller, ToolDispatchBinding, ToolExecutionRequest, ToolPreparation},
         goal::GoalRuntime,
         model::{CallId, ContentBlockKind, JsonValue},
+        plan_mode::PlanModeRuntime,
         tools::EMPTY_TEXT_BLOCK_JSON_BYTES,
         user_question::{UserQuestionBroker, UserQuestionResponseItem},
     };
 
     fn goal_request(name: &str, arguments: serde_json::Value) -> ToolExecutionRequest {
         goal_request_as(name, arguments, GoalToolCaller::Untrusted)
+    }
+
+    #[test]
+    fn exit_plan_mode_schema_and_arguments_are_closed_and_bounded() {
+        let schema = build_exit_plan_mode_schema().unwrap();
+        assert_eq!(schema.name(), "exit_plan_mode");
+        let parameters = schema.parameters().as_value();
+        assert_eq!(parameters["additionalProperties"], false);
+        assert_eq!(parameters["required"], serde_json::json!(["plan"]));
+        assert_eq!(parameters["properties"]["plan"]["maxLength"], 16_384);
+
+        assert_eq!(
+            parse_exit_plan_mode_arguments(&serde_json::json!({
+                "plan": "# Safe plan\n\n- Inspect first"
+            }))
+            .unwrap(),
+            "# Safe plan\n\n- Inspect first"
+        );
+        assert!(
+            parse_exit_plan_mode_arguments(&serde_json::json!({ "plan": "no heading" })).is_err()
+        );
+        assert!(
+            parse_exit_plan_mode_arguments(&serde_json::json!({
+                "plan": "# Safe plan",
+                "extra": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_or_cancelled_plan_exit_fails_without_arming_a_transition() {
+        let request = goal_request(
+            "exit_plan_mode",
+            serde_json::json!({ "plan": "# Safe plan\n\n- Inspect first" }),
+        );
+        let inactive = PlanModeRuntime::new(false);
+        let ToolPreparation::Complete(result) = prepare_exit_plan_mode(
+            Some(inactive.clone()),
+            None,
+            &request,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap() else {
+            panic!("inactive Plan Mode must return an ordinary failed result")
+        };
+        assert!(result.is_error());
+        assert!(!inactive.active().unwrap());
+        assert!(inactive.prepare_boundary().unwrap().is_none());
+
+        let active = PlanModeRuntime::new(true);
+        let (broker, _receiver) = UserQuestionBroker::new();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let ToolPreparation::Complete(result) =
+            prepare_exit_plan_mode(Some(active.clone()), Some(broker), &request, cancellation)
+                .await
+                .unwrap()
+        else {
+            panic!("cancelled review must return an ordinary failed result")
+        };
+        assert!(result.is_error());
+        assert!(active.active().unwrap());
+        assert!(active.prepare_boundary().unwrap().is_none());
     }
 
     fn goal_request_as(

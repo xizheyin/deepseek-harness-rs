@@ -1322,6 +1322,9 @@ pub enum EventKind {
     GoalChange {
         change: crate::goal::GoalChange,
     },
+    PlanMode {
+        change: crate::plan_mode::PlanModeChange,
+    },
     RequestHeader {
         header: EpochHeader,
         reason: RequestHeaderReason,
@@ -1445,6 +1448,12 @@ impl EventKind {
         Self::GoalChange { change }
     }
 
+    /// Construct one durable Plan Mode state transition.
+    #[must_use]
+    pub(crate) fn plan_mode(change: crate::plan_mode::PlanModeChange) -> Self {
+        Self::PlanMode { change }
+    }
+
     #[must_use]
     pub fn llm_retry(retry: LlmRetryEvent) -> Self {
         Self::LlmRetry { retry }
@@ -1500,6 +1509,7 @@ impl EventKind {
             Self::ToolResult { .. } => "tool/result",
             Self::TodoWrite { .. } => "todo/write",
             Self::GoalChange { .. } => "goal/change",
+            Self::PlanMode { .. } => "plan/mode",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",
@@ -1528,6 +1538,7 @@ impl EventKind {
             Self::ToolResult { .. } => "tool/result",
             Self::TodoWrite { .. } => "todo/write",
             Self::GoalChange { .. } => "goal/change",
+            Self::PlanMode { .. } => "plan/mode",
             Self::RequestHeader { .. } => "request/header",
             Self::RequestContext { .. } => "request/context",
             Self::LlmRetry { .. } => "llm/retry",

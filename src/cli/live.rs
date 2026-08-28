@@ -251,7 +251,7 @@ impl LiveFrame {
 
     pub(super) fn help() -> Result<Self, LiveRenderError> {
         Self::trusted(
-            "[commands]\n/goal  show/create/edit/pause/resume/clear the process-local Goal\n/inspect  show committed turn facts\n/review  show the last joined turn summary\n/focus  return to Focus\n/theme  show/select the enhanced palette; linear stays plain\n/motion  show/select enhanced motion; linear has no animation\n/help  show this help\n/exit  exit dsh\n/quit  exit dsh\n",
+            "[commands]\n/goal  show/create/edit/pause/resume/clear the process-local Goal\n/plan [message]  enter Plan Mode and optionally send a planning prompt\n/plan off  leave Plan Mode while idle\n/inspect  show committed turn facts\n/review  show the last joined turn summary\n/focus  return to Focus\n/theme  show/select the enhanced palette; linear stays plain\n/motion  show/select enhanced motion; linear has no animation\n/help  show this help\n/exit  exit dsh\n/quit  exit dsh\n",
         )
     }
 
@@ -363,10 +363,16 @@ impl LiveFrame {
         enhanced: bool,
     ) -> Result<Self, LiveRenderError> {
         let mut text = String::new();
-        text.try_reserve_exact(2 * 1024)
+        let capacity = (2_usize * 1024)
+            .checked_add(request.detail().map_or(0, str::len))
+            .ok_or(LiveRenderError)?;
+        text.try_reserve_exact(capacity)
             .map_err(|_| LiveRenderError)?;
         if let Some(header) = request.header() {
             writeln!(&mut text, "{header}").map_err(|_| LiveRenderError)?;
+        }
+        if let Some(detail) = request.detail() {
+            writeln!(&mut text, "{detail}\n").map_err(|_| LiveRenderError)?;
         }
         writeln!(&mut text, "{}", request.question()).map_err(|_| LiveRenderError)?;
         for (index, option) in request.options().iter().enumerate() {
@@ -410,7 +416,13 @@ impl LiveFrame {
         } else if enhanced {
             let mut hint = String::new();
             hint.try_reserve_exact(64).map_err(|_| LiveRenderError)?;
-            if request.multi_select() {
+            if request.intent().is_some() {
+                writeln!(
+                    &mut hint,
+                    "Press 1 to approve · 2 keep planning · 3 feedback · Esc discuss"
+                )
+                .map_err(|_| LiveRenderError)?;
+            } else if request.multi_select() {
                 writeln!(
                     &mut hint,
                     "Press 1-{} to toggle · Enter submits · {} custom · [/] pages · s skips · Esc cancels",

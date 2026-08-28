@@ -30,6 +30,7 @@ use crate::{
         LlmFailure, Message, MessageRole, MessageSource, MessageSourceKind, StreamChunkKind,
         ToolSchema,
     },
+    plan_mode::{PlanModeRuntime, PreparedPlanModeMutation},
     provider::{
         ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
         ProviderRequest, ProviderRequestDraft, ProviderRequestError, RetryMode,
@@ -357,6 +358,8 @@ fn validate_duration(
 pub struct AgentLoopConfig {
     call: LlmCallConfig,
     system: Option<String>,
+    plan_mode: Option<PlanModeRuntime>,
+    plan_policy: Option<String>,
     tools: Vec<ToolSchema>,
     limits: AgentLimits,
     file_change_policy: FileChangePolicy,
@@ -372,6 +375,10 @@ impl std::fmt::Debug for AgentLoopConfig {
             .field("provider", &self.call.provider())
             .field("model", &self.call.model())
             .field("system_bytes", &self.system.as_ref().map_or(0, String::len))
+            .field(
+                "plan_policy_bytes",
+                &self.plan_policy.as_ref().map_or(0, String::len),
+            )
             .field("tool_count", &self.tools.len())
             .field("limits", &self.limits)
             .field("file_change_policy", &self.file_change_policy)
@@ -388,6 +395,8 @@ impl AgentLoopConfig {
         Self {
             call,
             system: None,
+            plan_mode: None,
+            plan_policy: None,
             tools: Vec::new(),
             limits: AgentLimits::default(),
             file_change_policy: FileChangePolicy::Ask,
@@ -421,6 +430,21 @@ impl AgentLoopConfig {
             return Err(AgentBuildError::InvalidToolNames);
         }
         self.tools = tools;
+        self.validate_fixed_request_size()?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_plan_mode(
+        mut self,
+        runtime: PlanModeRuntime,
+        policy: impl Into<String>,
+    ) -> Result<Self, AgentBuildError> {
+        let policy = policy.into();
+        if policy.trim().is_empty() {
+            return Err(AgentBuildError::InvalidSystemPrompt);
+        }
+        self.plan_mode = Some(runtime);
+        self.plan_policy = Some(policy);
         self.validate_fixed_request_size()?;
         Ok(self)
     }
@@ -498,6 +522,13 @@ impl AgentLoopConfig {
             .encoded_len()
             .checked_add(self.system.as_ref().map_or(0, String::len))
             .and_then(|total| {
+                total.checked_add(
+                    self.plan_policy
+                        .as_ref()
+                        .map_or(0, |policy| policy.len() + 2),
+                )
+            })
+            .and_then(|total| {
                 self.tools.iter().try_fold(total, |total, tool| {
                     total.checked_add(tool.raw().encoded_len())
                 })
@@ -510,6 +541,30 @@ impl AgentLoopConfig {
             });
         }
         Ok(())
+    }
+
+    fn effective_system(&self) -> Result<Option<String>, ()> {
+        let active = self
+            .plan_mode
+            .as_ref()
+            .map(PlanModeRuntime::active)
+            .transpose()
+            .map_err(|_| ())?
+            .unwrap_or(false);
+        let Some(policy) = self.plan_policy.as_deref().filter(|_| active) else {
+            return Ok(self.system.clone());
+        };
+        let base = self.system.as_deref().unwrap_or_default();
+        let mut system = String::new();
+        system
+            .try_reserve_exact(base.len().saturating_add(policy.len()).saturating_add(2))
+            .map_err(|_| ())?;
+        if !base.is_empty() {
+            system.push_str(base);
+            system.push_str("\n\n");
+        }
+        system.push_str(policy);
+        Ok(Some(system))
     }
 }
 
@@ -802,6 +857,20 @@ impl AgentLoop {
             .map_err(|_| AgentLoopError::Invariant("committed Goal state was not installable"))
     }
 
+    /// Commit an idle terminal Plan Mode change through the Session owner.
+    pub(crate) async fn commit_plan_mode_mutation(
+        &mut self,
+        mutation: PreparedPlanModeMutation,
+    ) -> Result<(), AgentLoopError> {
+        self.session.materialize_if_needed().await?;
+        self.session
+            .append_settled(NewEvent::log(EventKind::plan_mode(mutation.change())))
+            .await?;
+        mutation
+            .commit()
+            .map_err(|_| AgentLoopError::Invariant("committed Plan Mode state was not installable"))
+    }
+
     /// Stop tool-owned workers, then return the still-active Session.
     ///
     /// This replaces the old synchronous extraction seam, which could drop a
@@ -976,6 +1045,7 @@ enum AttemptPreparation {
     PreparedFailure {
         prepared: PreparedProviderCall,
         failure: LlmFailure,
+        system: Option<String>,
     },
     DeferredFailure(LlmFailure),
     HardLimit {
@@ -996,6 +1066,7 @@ fn preparation_context_window(preparation: &AttemptPreparation, session: &Sessio
         AttemptPreparation::PreparedFailure { prepared, .. }
         | AttemptPreparation::HardLimit {
             prepared: Some(prepared),
+            ..
         } => prepared.context_window(),
         AttemptPreparation::DeferredFailure(_)
         | AttemptPreparation::HardLimit { prepared: None } => session
@@ -1025,6 +1096,7 @@ fn pre_step_compaction_trigger(
 struct PreflightedRequest {
     proposed: LlmCallConfig,
     messages: Vec<Message>,
+    system: Option<String>,
     expected_surface_generation: u64,
     preflight: PreparedRequestPreflight,
 }
@@ -1045,7 +1117,7 @@ impl PreflightedRequest {
         config: &AgentLoopConfig,
     ) -> Result<ProviderRequest, ProviderRequestError> {
         let mut draft = ProviderRequestDraft::new(&self.proposed, &self.messages)?;
-        if let Some(system) = &config.system {
+        if let Some(system) = &self.system {
             draft = draft.with_system(system)?;
         }
         if !config.tools.is_empty() {
@@ -1355,6 +1427,14 @@ async fn run_entered_turn(
             Err(error) => return Err(error.into()),
         };
         let unstarted = UnstartedStepClaims::new(claims)?;
+        if let Some(reason) = pre_step_stop(driver, cancellation)? {
+            unstarted.release(reservation)?;
+            return Ok(reason);
+        }
+        if let Err(error) = flush_pending_plan_mode(reservation, driver).await {
+            unstarted.release(reservation)?;
+            return Err(error);
+        }
         let first_preparation = if driver.counters.attempts
             >= driver.config.limits.max_attempts_per_turn
         {
@@ -1634,6 +1714,27 @@ async fn run_entered_turn(
     }
 }
 
+async fn flush_pending_plan_mode(
+    reservation: &mut SessionReservation<'_>,
+    driver: &Driver<'_>,
+) -> Result<(), AgentLoopError> {
+    let Some(runtime) = driver.config.plan_mode.as_ref() else {
+        return Ok(());
+    };
+    let Some(mutation) = runtime
+        .prepare_boundary()
+        .map_err(|_| AgentLoopError::Invariant("Plan Mode boundary state is unavailable"))?
+    else {
+        return Ok(());
+    };
+    reservation
+        .append_settled(NewEvent::log(EventKind::plan_mode(mutation.change())))
+        .await?;
+    mutation
+        .commit()
+        .map_err(|_| AgentLoopError::Invariant("committed Plan Mode boundary was not installable"))
+}
+
 fn pre_step_stop(
     driver: &Driver<'_>,
     cancellation: &CancellationToken,
@@ -1762,6 +1863,15 @@ fn prepare_conversation_request(
             )?));
         }
     };
+    let system = match driver.config.effective_system() {
+        Ok(system) => system,
+        Err(()) => {
+            return Ok(AttemptPreparation::DeferredFailure(failure_reason(
+                "AGENT_INTERNAL",
+                "the agent stopped after an internal failure",
+            )?));
+        }
+    };
     let messages = match session.try_messages_with(pending_messages) {
         Ok(messages) => messages,
         Err(()) => {
@@ -1771,7 +1881,13 @@ fn prepare_conversation_request(
             )?));
         }
     };
-    let draft = match conversation_request_draft(&proposed, &messages, driver.config, session) {
+    let draft = match conversation_request_draft(
+        &proposed,
+        &messages,
+        system.as_deref(),
+        &driver.config.tools,
+        session,
+    ) {
         Ok(draft) => draft,
         Err(error) if is_hard_request_limit(&error) => {
             return Ok(AttemptPreparation::HardLimit { prepared: None });
@@ -1804,7 +1920,11 @@ fn prepare_conversation_request(
             )?));
         }
         Ok(Err(ProviderPreflightError::InvalidRequest { failure, prepared })) => {
-            return Ok(AttemptPreparation::PreparedFailure { prepared, failure });
+            return Ok(AttemptPreparation::PreparedFailure {
+                prepared,
+                failure,
+                system,
+            });
         }
         Err(_) => {
             return Ok(AttemptPreparation::DeferredFailure(failure_reason(
@@ -1816,6 +1936,7 @@ fn prepare_conversation_request(
     Ok(AttemptPreparation::Ready(PreflightedRequest {
         proposed,
         messages,
+        system,
         expected_surface_generation,
         preflight,
     }))
@@ -1824,15 +1945,16 @@ fn prepare_conversation_request(
 fn conversation_request_draft<'a>(
     proposed: &'a LlmCallConfig,
     messages: &'a [Message],
-    config: &'a AgentLoopConfig,
+    system: Option<&'a str>,
+    tools: &'a [ToolSchema],
     session: &'a Session,
 ) -> Result<ProviderRequestDraft<'a>, ProviderRequestError> {
     let mut draft = ProviderRequestDraft::new(proposed, messages)?;
-    if let Some(system) = &config.system {
+    if let Some(system) = system {
         draft = draft.with_system(system)?;
     }
-    if !config.tools.is_empty() {
-        draft = draft.with_tools(&config.tools)?;
+    if !tools.is_empty() {
+        draft = draft.with_tools(tools)?;
     }
     draft.with_session_id(session.id())
 }
@@ -1904,6 +2026,7 @@ async fn run_step(
             adapter_defaults,
             context_window,
             prepared_failure,
+            request_system,
         ) = match preparation {
             AttemptPreparation::Ready(preflighted) => {
                 let prepared = preflighted.prepared_call();
@@ -1911,6 +2034,7 @@ async fn run_step(
                 let retry_policy = prepared.retry_policy().clone();
                 let adapter_defaults = prepared.adapter_defaults().clone();
                 let context_window = prepared.context_window();
+                let request_system = preflighted.system.clone();
                 (
                     Some(preflighted),
                     effective_config,
@@ -1918,20 +2042,26 @@ async fn run_step(
                     adapter_defaults,
                     context_window,
                     None,
+                    request_system,
                 )
             }
-            AttemptPreparation::PreparedFailure { prepared, failure } => (
+            AttemptPreparation::PreparedFailure {
+                prepared,
+                failure,
+                system,
+            } => (
                 None,
                 prepared.config().clone(),
                 prepared.retry_policy().clone(),
                 prepared.adapter_defaults().clone(),
                 prepared.context_window(),
                 Some(failure),
+                system,
             ),
             AttemptPreparation::DeferredFailure(failure) => {
                 return Ok(StepResolution::new(StepOutcome::Error(failure)));
             }
-            AttemptPreparation::HardLimit { prepared } => {
+            AttemptPreparation::HardLimit { prepared, .. } => {
                 let _context_window = prepared.and_then(|prepared| prepared.context_window());
                 return Ok(StepResolution::new(StepOutcome::Error(
                     context_limit_failure()?,
@@ -1949,7 +2079,7 @@ async fn run_step(
         let header = EpochHeader {
             config: effective_config.clone(),
             adapter_defaults: Some(adapter_defaults),
-            system: driver.config.system.clone(),
+            system: request_system,
             tools: (!driver.config.tools.is_empty()).then(|| driver.config.tools.clone()),
         }
         .canonicalized();
@@ -2866,6 +2996,24 @@ async fn commit_tool_round(
                     pending_goal_wrapup = wrapup;
                 }
             }
+            ToolRun::PlanExit { exit, result } => {
+                let committed = settle_tool_result(
+                    reservation,
+                    driver,
+                    plan,
+                    result,
+                    ResultSettlement::PreferredRequired,
+                )
+                .await?;
+                if !committed {
+                    return Err(AgentLoopError::Invariant(
+                        "approved Plan Mode exit result used its fallback",
+                    ));
+                }
+                exit.commit().map_err(|_| {
+                    AgentLoopError::Invariant("approved Plan Mode exit was not installable")
+                })?;
+            }
             ToolRun::Mutation(mutation) => {
                 let resolved =
                     resolve_mutation(reservation, driver, plan, mutation, cancellation).await?;
@@ -3206,6 +3354,10 @@ enum ToolRun {
         stop: ToolStop,
     },
     Goal(PreparedGoalMutation),
+    PlanExit {
+        exit: crate::plan_mode::PreparedPlanExit,
+        result: ToolExecutionResult,
+    },
     Mutation(PreparedToolMutation),
     Action(PreparedToolActionSetup),
     ModelError {
@@ -3392,6 +3544,15 @@ async fn run_one_tool(
                         }
                     } else {
                         ToolRun::Goal(mutation)
+                    }
+                }
+                Ok(Ok(ToolPreparation::PlanExit { exit, result })) => {
+                    if plan.claim_profile.is_owned_action() {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::PlanExit { exit, result }
                     }
                 }
                 Ok(Ok(ToolPreparation::Mutation(mutation))) => {

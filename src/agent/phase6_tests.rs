@@ -3132,6 +3132,7 @@ fn preflight_snapshot_rejects_an_identical_surface_with_a_new_generation() {
     let snapshot = super::PreflightedRequest {
         proposed,
         messages,
+        system: None,
         expected_surface_generation: session.surface_generation(),
         preflight,
     };

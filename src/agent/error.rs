@@ -29,6 +29,8 @@ pub enum AgentBuildError {
     TooManyTools { maximum: usize, actual: usize },
     #[error("agent tool schema names must be non-empty and unique")]
     InvalidToolNames,
+    #[error("agent Plan Mode policy must contain non-whitespace text")]
+    InvalidSystemPrompt,
     #[error("agent fixed request facts are {actual} bytes; maximum is {maximum}")]
     FixedRequestTooLarge { maximum: usize, actual: usize },
 }

@@ -1596,6 +1596,29 @@ Latest `origin/master` remains
 Phase 22 maps the behavior to bounded terminal keys while preserving the exact
 ordered tool-result shape; see `docs/design/user-question-pager.md`.
 
+## Phase 23 Plan Mode inspection — 2026-08-28
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/plan/plan-mode/src/{index,types}.ts`, `README.md`, and
+  `tests/{plan-mode,projection}.spec.ts` for the last-value `plan/mode` fold,
+  idle versus next-pre-step commits, prompt policy, stable exit schema, review
+  decisions, feedback, dismissal, cancellation, and resume projection;
+- `packages/interaction/user-questions/src/{index,types}.ts` and tests for
+  `plan-review` intent validation and unchanged answer encoding;
+- `packages/client/ui-user-questions/src/client/{PlanReviewPanel,contract/slots}.tsx`
+  plus `tests/plan-review-panel.client.spec.tsx` for the single-question,
+  binary, non-multi review presentation boundary.
+
+The observable core is: Plan Mode is durable soft guidance; the tool catalogue
+does not change; only an exact reviewed approval arms exit; `plan/mode false`
+lands at the next accepted pre-step before the next request; feedback and
+dismissal keep planning. Latest `origin/master`
+`cd5ef8148158c3a752a658978873241fdf8e2bbc` retains this contract while adding
+command-settlement and image-bearing `/plan` support. Rust Phase 23 follows the
+fixed contract and records the terminal/image/active-steering differences in
+`docs/design/plan-mode.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:
