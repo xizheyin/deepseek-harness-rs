@@ -1,7 +1,8 @@
 //! Bounded provider-neutral web-search tool contract.
 
-use std::{future::Future, pin::Pin};
+use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc};
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +17,7 @@ use super::{MAX_TOOL_CONTENT_BYTES, error::ToolCallError};
 
 pub(crate) const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 pub(crate) const WEB_SEARCH_MAX_RESULTS: usize = 8;
+const WEB_SEARCH_MAX_QUERIES: usize = 4;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_SOURCE_URL_BYTES: usize = 2 * 1024;
 const MAX_SOURCE_TITLE_BYTES: usize = 512;
@@ -67,56 +69,139 @@ pub(crate) trait WebSearchProvider: Send + Sync {
 pub(crate) fn schema() -> Result<ToolSchema, crate::model::ModelError> {
     ToolSchema::new(
         WEB_SEARCH_TOOL_NAME,
-        "Search the web for current information. Returns up to eight source URLs and bounded snippets.",
+        "Search the web with one to four related queries. Returns up to eight fairly merged source URLs and bounded snippets.",
         JsonValue::new(json!({
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The nonblank search query; runtime maximum is 4096 UTF-8 bytes",
-                    "minLength": 1,
-                    "maxLength": MAX_QUERY_BYTES,
-                    "pattern": "^(?=.*\\S)[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+                "queries": {
+                    "type": "array",
+                    "description": "One to four nonblank search queries; exact duplicates are run once",
+                    "minItems": 1,
+                    "maxItems": WEB_SEARCH_MAX_QUERIES,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_QUERY_BYTES,
+                        "pattern": "^(?=.*\\S)[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+                    }
                 }
             },
-            "required": ["query"],
+            "required": ["queries"],
             "additionalProperties": false
         }))?,
     )
 }
 
-pub(crate) fn parse_query(arguments: &Value) -> Result<String, ToolCallError> {
+pub(crate) fn parse_queries(arguments: &Value) -> Result<Vec<String>, ToolCallError> {
     let object = arguments.as_object().ok_or_else(|| {
         ToolCallError::invalid_args("web_search arguments must be one closed object")
     })?;
-    if object.len() != 1 || !object.contains_key("query") {
+    if object.len() != 1 || !object.contains_key("queries") {
         return Err(ToolCallError::invalid_args(
-            "web_search accepts only the required query field",
+            "web_search accepts only the required queries field",
         ));
     }
-    let query = object
-        .get("query")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolCallError::invalid_args("web_search.query must be a string"))?;
-    if query.trim().is_empty() {
+    let queries = object
+        .get("queries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ToolCallError::invalid_args("web_search.queries must be an array"))?;
+    if queries.is_empty() || queries.len() > WEB_SEARCH_MAX_QUERIES {
         return Err(ToolCallError::invalid_args(
-            "web_search.query must be a non-empty string",
+            "web_search.queries must contain one to four strings",
         ));
     }
-    if query.len() > MAX_QUERY_BYTES {
-        return Err(ToolCallError::invalid_args(
-            "web_search.query exceeds the 4096-byte limit",
-        ));
+    let mut seen = HashSet::new();
+    let mut parsed = Vec::with_capacity(queries.len());
+    for query in queries {
+        let query = query.as_str().ok_or_else(|| {
+            ToolCallError::invalid_args("every web_search query must be a string")
+        })?;
+        if query.trim().is_empty() {
+            return Err(ToolCallError::invalid_args(
+                "every web_search query must be non-empty",
+            ));
+        }
+        if query.len() > MAX_QUERY_BYTES {
+            return Err(ToolCallError::invalid_args(
+                "a web_search query exceeds the 4096-byte limit",
+            ));
+        }
+        if query.chars().any(|character| {
+            character.is_control() || ('\u{007f}'..='\u{009f}').contains(&character)
+        }) {
+            return Err(ToolCallError::invalid_args(
+                "a web_search query contains an unsafe control character",
+            ));
+        }
+        if seen.insert(query.to_owned()) {
+            parsed.push(query.to_owned());
+        }
     }
-    if query
-        .chars()
-        .any(|character| character.is_control() || ('\u{007f}'..='\u{009f}').contains(&character))
-    {
-        return Err(ToolCallError::invalid_args(
-            "web_search.query contains an unsafe control character",
-        ));
+    Ok(parsed)
+}
+
+pub(crate) async fn search_all(
+    provider: Arc<dyn WebSearchProvider>,
+    queries: Vec<String>,
+    cancellation: CancellationToken,
+) -> Result<WebSearchResult, WebSearchProviderError> {
+    let batch_cancellation = cancellation.child_token();
+    let mut pending = FuturesUnordered::new();
+    let query_count = queries.len();
+    for (index, query) in queries.into_iter().enumerate() {
+        let provider = Arc::clone(&provider);
+        let query_cancellation = batch_cancellation.clone();
+        pending.push(async move { (index, provider.search(query, query_cancellation).await) });
     }
-    Ok(query.to_owned())
+
+    let mut results = vec![None; query_count];
+    let mut first_error = None;
+    while let Some((index, outcome)) = pending.next().await {
+        match outcome {
+            Ok(result) if first_error.is_none() => results[index] = Some(result),
+            Ok(_) => {}
+            Err(error) if first_error.is_none() => {
+                first_error = Some(error);
+                batch_cancellation.cancel();
+            }
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    let results = results
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(WebSearchProviderError::Provider)?;
+    Ok(merge_results(results))
+}
+
+fn merge_results(results: Vec<WebSearchResult>) -> WebSearchResult {
+    let mut truncated = results.iter().any(|result| result.truncated);
+    let maximum_rank = results
+        .iter()
+        .map(|result| result.sources.len())
+        .max()
+        .unwrap_or(0);
+    let mut seen = HashSet::new();
+    let mut sources = Vec::new();
+    for rank in 0..maximum_rank {
+        for result in &results {
+            let Some(source) = result.sources.get(rank) else {
+                continue;
+            };
+            if !seen.insert(source.url.clone()) {
+                continue;
+            }
+            if sources.len() == WEB_SEARCH_MAX_RESULTS {
+                truncated = true;
+                continue;
+            }
+            sources.push(source.clone());
+        }
+    }
+    WebSearchResult { sources, truncated }
 }
 
 pub(crate) fn normalize_source(
@@ -304,27 +389,111 @@ fn metadata(result: &WebSearchResult) -> Result<JsonValue, ToolExecutorError> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
 
-    use super::{WebSearchResult, normalize_source, parse_query, render_result, schema};
+    use serde_json::json;
+    use tokio::sync::Barrier;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{
+        WebSearchFuture, WebSearchProvider, WebSearchProviderError, WebSearchResult, merge_results,
+        normalize_source, parse_queries, render_result, schema, search_all,
+    };
+
+    struct FailingBatchProvider {
+        barrier: Arc<Barrier>,
+        sibling_cancelled: Arc<AtomicBool>,
+    }
+
+    impl WebSearchProvider for FailingBatchProvider {
+        fn search(&self, query: String, cancellation: CancellationToken) -> WebSearchFuture<'_> {
+            let barrier = Arc::clone(&self.barrier);
+            let sibling_cancelled = Arc::clone(&self.sibling_cancelled);
+            Box::pin(async move {
+                barrier.wait().await;
+                if query == "fail" {
+                    return Err(WebSearchProviderError::Provider);
+                }
+                cancellation.cancelled().await;
+                sibling_cancelled.store(true, Ordering::SeqCst);
+                Err(WebSearchProviderError::Cancelled)
+            })
+        }
+    }
 
     #[test]
-    fn schema_and_runtime_accept_only_one_bounded_nonblank_query() {
+    fn schema_and_runtime_accept_one_to_four_bounded_queries_and_deduplicate_exactly() {
         let schema = schema().unwrap();
         assert_eq!(schema.name(), "web_search");
         assert_eq!(
-            parse_query(&json!({"query":"Rust news"})).unwrap(),
-            "Rust news"
+            parse_queries(&json!({"queries":["Rust news", "Rust news", " rust news "]})).unwrap(),
+            vec!["Rust news", " rust news "]
         );
         for invalid in [
             json!({}),
-            json!({"query":" "}),
-            json!({"query":1}),
-            json!({"query":"ok","extra":true}),
-            json!({"query":"bad\nquery"}),
+            json!({"queries":[]}),
+            json!({"queries":[" "]}),
+            json!({"queries":[1]}),
+            json!({"queries":["ok"],"extra":true}),
+            json!({"queries":["bad\nquery"]}),
+            json!({"queries":["a","b","c","d","e"]}),
         ] {
-            assert!(parse_query(&invalid).is_err(), "accepted {invalid}");
+            assert!(parse_queries(&invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn multi_query_results_merge_by_rank_deduplicate_and_cap() {
+        let make = |prefix: &str, count: usize| WebSearchResult {
+            sources: (0..count)
+                .map(|index| {
+                    normalize_source(
+                        format!("https://example.test/{prefix}/{index}"),
+                        Some(format!("{prefix}{index}")),
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+            truncated: false,
+        };
+        let mut second = make("b", 5);
+        second.sources[1] = make("a", 2).sources[0].clone();
+        let merged = merge_results(vec![make("a", 5), second]);
+        assert_eq!(merged.sources.len(), 8);
+        assert_eq!(merged.sources[0].title.as_deref(), Some("a0"));
+        assert_eq!(merged.sources[1].title.as_deref(), Some("b0"));
+        assert_eq!(merged.sources[2].title.as_deref(), Some("a1"));
+        assert_eq!(merged.sources[3].title.as_deref(), Some("a2"));
+        assert!(merged.truncated);
+    }
+
+    #[tokio::test]
+    async fn queries_start_concurrently_and_first_failure_cancels_and_drains_siblings() {
+        let sibling_cancelled = Arc::new(AtomicBool::new(false));
+        let provider: Arc<dyn WebSearchProvider> = Arc::new(FailingBatchProvider {
+            barrier: Arc::new(Barrier::new(2)),
+            sibling_cancelled: Arc::clone(&sibling_cancelled),
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            search_all(
+                provider,
+                vec!["fail".to_owned(), "slow".to_owned()],
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("queries did not start concurrently");
+        assert_eq!(outcome, Err(WebSearchProviderError::Provider));
+        assert!(sibling_cancelled.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–28 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–29 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -36,6 +36,7 @@ for behavior that users can run today.
 | 26 | Tool-driven nested workspace-instruction refresh | `complete` | [`validation/phase-26.md`](validation/phase-26.md) |
 | 27 | Idle manual `/compact` command | `complete` | [`validation/phase-27.md`](validation/phase-27.md) |
 | 28 | Bounded DeepSeek-backed `web_search` tool | `complete` | [`validation/phase-28.md`](validation/phase-28.md) |
+| 29 | Current-master multi-query search and public `web_fetch` | `complete` | [`validation/phase-29.md`](validation/phase-29.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -456,6 +457,31 @@ fetch path. This phase deliberately lands the fixed search-only contract first
 and records the latest extensions as follow-up gaps. Acceptance is local-only:
 fake providers, a loopback DeepSeek-shaped server, focused Agent ordering, and
 the required local Rust gates; no real API request or remote CI.
+
+## Phase 29 current-master web-tools boundary (2026-08-29)
+
+Phase 29 closes the two explicit Phase 28 follow-up gaps from inspected master
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`: `web_search` accepts one to four
+queries and merges them fairly, while `web_fetch` retrieves one anonymous
+public HTTP(S) page with no cookies, credentials, proxy inheritance, or human
+approval. Search keeps the existing DeepSeek native provider; fetch uses a
+separate local HTTP provider and never consumes the DeepSeek API key.
+
+The fixed baseline's fetch provider explicitly lacked private-network/SSRF
+protection and was disabled in the shipped preset. The current implementation
+must therefore follow the newer safety boundary: validate the URL, reject any
+DNS answer set containing a non-public destination, pin the connection to the
+validated addresses, follow only same-origin redirects, and re-resolve and
+revalidate every accepted hop. Responses, decoded text, conversion work,
+redirects, time, and final tool output are all bounded. External page content
+is labelled untrusted and HTML is converted conservatively rather than exposed
+as active markup.
+
+Acceptance remains local-only. Deterministic fake-provider and policy tests plus
+a real CLI journey use an injected resolver and loopback HTTP server to prove
+the production transport shape without weakening production's loopback block.
+No public network, real API call, remote CI, or unrelated exhaustive check is
+required; the local Rust gates still protect the repository-wide build.
 
 ## Still deferred
 

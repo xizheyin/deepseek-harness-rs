@@ -1754,6 +1754,44 @@ explicit external-untrusted-content notice, and enables separately hardened
 single-query, search-only contract while adopting the later trust notice; the
 multi-query and fetch expansions remain explicit follow-up gaps.
 
+## Phase 29 current-master web-tools inspection — 2026-08-29
+
+The fixed baseline remains
+`47f943859bef60e4160492346772ded9b24f765a`. Its
+`packages/web/web-fetch-http/src/{index,provider,policy}.ts`, README, tests, and
+`packages/web/tool-web/src/fetch.ts` were inspected for anonymous GET behavior,
+HTTP(S)-only URL validation, same-origin redirects, content classification and
+decoding, byte/character/timeout limits, and HTML-to-Markdown presentation. The
+fixed provider explicitly says private-network/SSRF protection is not
+implemented and the fixed code/standard presets leave fetch disabled; that
+transport is therefore research evidence, not a safe production target.
+
+Latest inspected master `cd5ef8148158c3a752a658978873241fdf8e2bbc` was
+inspected at:
+
+- `packages/web/tool-web/src/{index,search,fetch}.ts` and
+  `tests/tool-web.spec.ts` for the one-to-four `queries` array, exact duplicate
+  removal, concurrent fail-fast-and-drain execution, fair round-robin source
+  merge, eight-source cap, `{url}` fetch schema, untrusted-content notice,
+  bounded HTML conversion, output footer, and generic/web presentation facts;
+- `packages/web/web-fetch-http/src/{index,provider,network,policy}.ts`, README,
+  and `tests/fetch-http.spec.ts` for URL/credential refusal, full DNS-answer-set
+  validation, address-pinned connections, public IPv4/IPv6 classification,
+  dynamic DNS64 discovery and NAT64 translation checks, same-origin redirect
+  revalidation, anonymous headers, stable failures, 30-second deadline, five
+  redirects, 5,000,000-byte response and 100,000-character decoded limits,
+  content-type/charset rules, exact-cap behavior, cancellation, and cleanup;
+- `packages/bundle/base/cordis.patch.yml` and
+  `packages/preset/agent-presets/presets/standard/agent.cordis.yml` for the
+  `http` fetch provider, default tool registration, and current standard-preset
+  `fetch: true` composition.
+
+Phase 29 adopts the latest public-address and DNS-pinning boundary rather than
+the fixed unsafe transport. Rust deliberately uses a smaller conservative
+HTML/charset implementation, ordinary tool call/result Session facts, and the
+generic terminal card. These differences and their local tests are specified
+in `docs/design/web-fetch.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

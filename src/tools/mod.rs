@@ -15,6 +15,7 @@ mod read;
 mod registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod shell;
+mod web_fetch;
 mod web_search;
 mod workspace;
 
@@ -24,8 +25,14 @@ pub(crate) use plugin::{PluginConfig, PluginConfigError};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use registry::LocalToolRegistry;
 pub use registry::ReadOnlyToolRegistry;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use registry::WebToolProviders;
 #[cfg(unix)]
 pub use registry::WorkspaceToolRegistry;
+pub(crate) use web_fetch::{
+    WEB_FETCH_MAX_URL_BYTES, WebFetchBodyKind, WebFetchFuture, WebFetchProvider,
+    WebFetchProviderError, WebFetchResult,
+};
 pub(crate) use web_search::{
     WEB_SEARCH_MAX_RESULTS, WebSearchFuture, WebSearchProvider, WebSearchProviderError,
     WebSearchResult, normalize_source,

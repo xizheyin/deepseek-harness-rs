@@ -3,6 +3,7 @@
 mod retry;
 
 pub mod deepseek;
+pub(crate) mod web_fetch;
 
 use std::{pin::Pin, sync::Arc};
 

@@ -46,6 +46,28 @@ for loopback HTTP, disables redirects and the system proxy, and does not send an
 anonymous device identifier. Pointing it at a custom HTTPS service still grants
 that service the request content and API credential selected by the operator.
 
+### Public web retrieval
+
+`web_search` sends one to four model-chosen queries to DeepSeek's separate
+native-search endpoint using the same API key. `web_fetch` does not send that
+key: it performs an anonymous HTTP(S) GET with fixed headers, no cookies, no
+ambient proxy, and no browser session. Both tool arguments and bounded results
+are recorded in Session history and become model-visible.
+
+Before a fetch connection, `dsh` rejects embedded URL credentials, validates
+the complete DNS answer set as public, and pins the client to those validated
+addresses. It repeats this process for each allowed same-origin redirect and
+refuses cross-origin redirects. This is an application-level SSRF defense, not
+an operating-system network sandbox. DNS and IP classification mistakes or a
+future transport bug are still security-sensitive; do not use `web_fetch` as a
+gateway to a network that requires a stronger isolation boundary.
+
+Fetched text is hostile input even when it came from a public address. The tool
+labels it untrusted, removes active/hidden HTML, and bounds conversion and
+output, but those controls do not prove a page is true or free of prompt
+injection. Web tools do not require approval because they are read-only; they
+can still disclose a model-generated query or URL to an external service.
+
 ### Local Session data
 
 Session JSONL files use a private local directory and bounded records, but their

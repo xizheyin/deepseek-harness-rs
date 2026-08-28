@@ -59,10 +59,20 @@ model-visible request content.
 `web_search` uses the same `DEEPSEEK_API_KEY`, but it deliberately does not use
 `DEEPSEEK_BASE_URL`: DeepSeek native search is a separate Anthropic-compatible
 Messages API. Its default base is `https://api.deepseek.com/anthropic/v1`, and
-`/messages` is appended. One search has a 60-second whole-operation limit,
-returns at most eight sources, follows no redirects, and uses no ambient proxy.
-The tool sends the model-provided query to DeepSeek without a separate approval;
-it does not fetch arbitrary URLs or read browser cookies.
+`/messages` is appended. One tool call accepts one to four queries, executes
+them concurrently under the ordinary turn limit, fairly merges at most eight
+sources, follows no redirects, and uses no ambient proxy. Each provider request
+has a 60-second whole-operation limit. The tool sends the model-provided queries
+to DeepSeek without a separate approval.
+
+`web_fetch` is separate from both DeepSeek endpoints and needs no environment
+variable or credential. It anonymously retrieves one public HTTP(S) page after
+validating every DNS answer and pins the connection to those addresses. It uses
+no ambient proxy, cookies, browser state, or authentication; follows at most
+five same-origin, revalidated redirects; and has a 30-second whole-operation
+limit plus fixed response, decoded-text, and final-output caps. Loopback,
+private, link-local, reserved, transition, multicast, and DNS64-translated
+private destinations are refused without a separate approval.
 
 ## Workspace instructions
 

@@ -28,6 +28,7 @@ use super::{
     MAX_TOOL_CONTENT_BYTES,
     arguments::{parse_glob, parse_grep, parse_list, parse_read},
     error::{ToolCallError, ToolCallResult, ToolRegistryBuildError},
+    web_fetch::{self, WebFetchProvider},
     web_search::{self, WebSearchProvider},
     workspace::Workspace,
     {glob, grep, list, read},
@@ -147,9 +148,25 @@ impl WorkspaceToolRegistry {
     }
 }
 
-/// Explicit local authority containing read/search, file mutation, and one
-/// approval-gated foreground Bash action. It retains exactly one workspace
-/// capability shared by all six tools.
+/// Explicit local authority containing workspace, web, interaction, and
+/// approval-gated action tools. Workspace tools share one retained capability.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Default)]
+pub(crate) struct WebToolProviders {
+    search: Option<Arc<dyn WebSearchProvider>>,
+    fetch: Option<Arc<dyn WebFetchProvider>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl WebToolProviders {
+    pub(crate) fn new(
+        search: Option<Arc<dyn WebSearchProvider>>,
+        fetch: Option<Arc<dyn WebFetchProvider>>,
+    ) -> Self {
+        Self { search, fetch }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct LocalToolRegistry {
     workspace: Arc<Workspace>,
@@ -161,6 +178,7 @@ pub struct LocalToolRegistry {
     plan_mode: Option<PlanModeRuntime>,
     user_questions: Option<UserQuestionBroker>,
     web_search: Option<Arc<dyn WebSearchProvider>>,
+    web_fetch: Option<Arc<dyn WebFetchProvider>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -183,6 +201,7 @@ impl std::fmt::Debug for LocalToolRegistry {
             .field("plan_mode_enabled", &self.plan_mode.is_some())
             .field("user_questions_enabled", &self.user_questions.is_some())
             .field("web_search_enabled", &self.web_search.is_some())
+            .field("web_fetch_enabled", &self.web_fetch.is_some())
             .finish()
     }
 }
@@ -210,7 +229,13 @@ impl LocalToolRegistry {
         authority: WorkspaceAuthority,
         goal: Option<GoalRuntime>,
     ) -> Result<Self, ToolRegistryBuildError> {
-        Self::from_authority_with_interaction(authority, goal, None, None, None)
+        Self::from_authority_with_interaction(
+            authority,
+            goal,
+            None,
+            None,
+            WebToolProviders::default(),
+        )
     }
 
     pub(crate) fn from_authority_with_interaction(
@@ -218,7 +243,7 @@ impl LocalToolRegistry {
         goal: Option<GoalRuntime>,
         plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
-        web_search: Option<Arc<dyn WebSearchProvider>>,
+        web: WebToolProviders,
     ) -> Result<Self, ToolRegistryBuildError> {
         let workspace = Arc::new(Workspace::from_authority(authority));
         let environment = ShellEnvironment::capture()?;
@@ -237,10 +262,18 @@ impl LocalToolRegistry {
         if user_questions.is_some() {
             schemas.push(build_user_question_schema()?);
         }
-        if web_search.is_some() {
+        if web.search.is_some() {
             schemas.push(web_search::schema().map_err(|source| {
                 ToolRegistryBuildError::InvalidSchema {
                     tool: web_search::WEB_SEARCH_TOOL_NAME,
+                    source,
+                }
+            })?);
+        }
+        if web.fetch.is_some() {
+            schemas.push(web_fetch::schema().map_err(|source| {
+                ToolRegistryBuildError::InvalidSchema {
+                    tool: web_fetch::WEB_FETCH_TOOL_NAME,
                     source,
                 }
             })?);
@@ -254,7 +287,8 @@ impl LocalToolRegistry {
             goal,
             plan_mode,
             user_questions,
-            web_search,
+            web_search: web.search,
+            web_fetch: web.fetch,
         })
     }
 
@@ -265,15 +299,10 @@ impl LocalToolRegistry {
         goal: Option<GoalRuntime>,
         plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
-        web_search: Option<Arc<dyn WebSearchProvider>>,
+        web: WebToolProviders,
     ) -> Result<Self, ToolRegistryBuildError> {
-        let mut registry = Self::from_authority_with_interaction(
-            authority,
-            goal,
-            plan_mode,
-            user_questions,
-            web_search,
-        )?;
+        let mut registry =
+            Self::from_authority_with_interaction(authority, goal, plan_mode, user_questions, web)?;
         let plugins = Arc::new(
             PluginHost::start(config, &registry.schemas, cancellation)
                 .await
@@ -364,6 +393,12 @@ impl ToolExecutor for LocalToolRegistry {
                 async move { dispatch_web_search(provider, &request, cancellation).await },
             );
         }
+        if request.name() == web_fetch::WEB_FETCH_TOOL_NAME {
+            let provider = self.web_fetch.clone();
+            return Box::pin(
+                async move { dispatch_web_fetch(provider, &request, cancellation).await },
+            );
+        }
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
         }
@@ -414,6 +449,7 @@ impl ToolExecutor for LocalToolRegistry {
         let plan_mode = self.plan_mode.clone();
         let user_questions = self.user_questions.clone();
         let web_search = self.web_search.clone();
+        let web_fetch = self.web_fetch.clone();
         Box::pin(async move {
             if is_goal_tool(request.name()) {
                 return prepare_goal(goal, &request);
@@ -430,6 +466,10 @@ impl ToolExecutor for LocalToolRegistry {
             }
             if request.name() == web_search::WEB_SEARCH_TOOL_NAME {
                 let result = dispatch_web_search(web_search, &request, cancellation).await?;
+                return Ok(ToolPreparation::Complete(result));
+            }
+            if request.name() == web_fetch::WEB_FETCH_TOOL_NAME {
+                let result = dispatch_web_fetch(web_fetch, &request, cancellation).await?;
                 return Ok(ToolPreparation::Complete(result));
             }
             if request.name() == "apply_patch" {
@@ -492,11 +532,29 @@ async fn dispatch_web_search(
     if cancellation.is_cancelled() {
         return ToolCallError::aborted().into_execution_result();
     }
-    let query = match web_search::parse_query(request.arguments().as_value()) {
-        Ok(query) => query,
+    let queries = match web_search::parse_queries(request.arguments().as_value()) {
+        Ok(queries) => queries,
         Err(error) => return error.into_execution_result(),
     };
-    web_search::execution_result(provider.search(query, cancellation).await)
+    web_search::execution_result(web_search::search_all(provider, queries, cancellation).await)
+}
+
+async fn dispatch_web_fetch(
+    provider: Option<Arc<dyn WebFetchProvider>>,
+    request: &ToolExecutionRequest,
+    cancellation: CancellationToken,
+) -> Result<ToolExecutionResult, ToolExecutorError> {
+    let Some(provider) = provider else {
+        return ToolCallError::unknown_tool().into_execution_result();
+    };
+    if cancellation.is_cancelled() {
+        return ToolCallError::aborted().into_execution_result();
+    }
+    let url = match web_fetch::parse_url(request.arguments().as_value()) {
+        Ok(url) => url,
+        Err(error) => return error.into_execution_result(),
+    };
+    web_fetch::execution_result(provider.fetch(url, cancellation).await)
 }
 
 #[cfg(unix)]
@@ -1796,8 +1854,9 @@ mod tests {
         plan_mode::PlanModeRuntime,
         session::TodoStatus,
         tools::{
-            EMPTY_TEXT_BLOCK_JSON_BYTES, WebSearchFuture, WebSearchProvider,
-            WebSearchProviderError, WebSearchResult, normalize_source,
+            EMPTY_TEXT_BLOCK_JSON_BYTES, WebFetchBodyKind, WebFetchFuture, WebFetchProvider,
+            WebFetchResult, WebSearchFuture, WebSearchProvider, WebSearchProviderError,
+            WebSearchResult, normalize_source,
         },
         user_question::{UserQuestionBroker, UserQuestionResponseItem},
         workspace_authority::WorkspaceAuthority,
@@ -1821,6 +1880,22 @@ mod tests {
                         )
                         .unwrap(),
                     ],
+                    truncated: false,
+                })
+            })
+        }
+    }
+
+    struct FakeWebFetch;
+
+    impl WebFetchProvider for FakeWebFetch {
+        fn fetch(&self, url: String, _cancellation: CancellationToken) -> WebFetchFuture<'_> {
+            Box::pin(async move {
+                Ok(WebFetchResult {
+                    url,
+                    status_code: 200,
+                    body_kind: WebFetchBodyKind::Html,
+                    content: "<h1>Fetched page</h1><script>ignore()</script>".to_owned(),
                     truncated: false,
                 })
             })
@@ -1894,7 +1969,10 @@ mod tests {
             None,
             None,
             None,
-            Some(Arc::new(FakeWebSearch)),
+            super::WebToolProviders::new(
+                Some(Arc::new(FakeWebSearch)),
+                Some(Arc::new(FakeWebFetch)),
+            ),
         )
         .unwrap();
         let schema = registry
@@ -1904,10 +1982,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             schema.parameters().as_value()["required"],
-            serde_json::json!(["query"])
+            serde_json::json!(["queries"])
         );
 
-        let request = goal_request("web_search", serde_json::json!({"query":"current Rust"}));
+        let request = goal_request(
+            "web_search",
+            serde_json::json!({"queries":["current Rust"]}),
+        );
         let ToolPreparation::Complete(result) = registry
             .prepare(request, CancellationToken::new())
             .await
@@ -1925,7 +2006,7 @@ mod tests {
 
         let failed = registry
             .execute(
-                goal_request("web_search", serde_json::json!({"query":"fail"})),
+                goal_request("web_search", serde_json::json!({"queries":["fail"]})),
                 CancellationToken::new(),
             )
             .await
@@ -1934,6 +2015,36 @@ mod tests {
             failed.error().map(|error| error.code.as_str()),
             Some("WEB_PROVIDER_ERROR")
         );
+
+        let fetch_schema = registry
+            .schemas()
+            .iter()
+            .find(|schema| schema.name() == "web_fetch")
+            .unwrap();
+        assert_eq!(
+            fetch_schema.parameters().as_value()["required"],
+            serde_json::json!(["url"])
+        );
+        let ToolPreparation::Complete(fetched) = registry
+            .prepare(
+                goal_request(
+                    "web_fetch",
+                    serde_json::json!({"url":"https://example.test/page"}),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("web fetch must complete without an approval action")
+        };
+        assert!(!fetched.is_error());
+        let ContentBlockKind::Text { text } = fetched.content()[0].kind() else {
+            panic!("web fetch result must be text")
+        };
+        assert!(text.contains("# Fetched page"));
+        assert!(text.contains("untrusted data"));
+        assert!(!text.contains("ignore"));
         fs::remove_dir_all(root).unwrap();
     }
 
