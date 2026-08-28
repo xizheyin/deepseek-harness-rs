@@ -2,8 +2,8 @@
 
 `dsh-rs` keeps configuration deliberately small. The installed command is
 `dsh`; it reads command-line flags, process environment variables, and bounded
-workspace instruction files. Phase 10 adds one explicit local tool-plugin file,
-but there is still no general global profile or hot reload.
+workspace instruction files. Explicit local files can enable tool plugins or
+language servers, but there is still no general global profile or hot reload.
 
 ## Required credential
 
@@ -26,6 +26,7 @@ events are model-visible. Do not put unrelated secrets in those values.
 | `--list-sessions` | off | List bounded local Session headers |
 | `--resume <SESSION_ID>` | new Session | Continue one validated stored Session |
 | `--plugin-config <PATH>` | no plugins | Start the explicitly configured local tool plugins for this process |
+| `--lsp-config <PATH>` | no language server | Enable explicitly configured local stdio language servers for this process |
 | `--tui <MODE>` | `auto` | Choose `auto`, `enhanced`, or strict zero-ESC `linear` terminal presentation |
 | `--no-color` | color when supported | Disable ANSI and force the linear terminal presentation |
 
@@ -148,6 +149,58 @@ automatically: pass `--plugin-config` again with
 unknown tool outcome is never replayed to a restarted plugin. The closed
 protocol/schema limits are documented in
 [the Phase 10 design](design/subprocess-tool-plugins.md).
+
+## Local stdio language servers
+
+`--lsp-config` enables the experimental read-only `lsp` tool. Passing the flag
+authorizes `dsh` to start the listed native executables lazily; those programs
+run with your account and are **not sandboxed**. The model can only choose one
+of four queries—definition, references, implementation, or hover—and a source
+cursor. It cannot choose the executable, environment, workspace, timeout or
+protocol method, and server requests to edit files or run commands are refused.
+
+Create an owner-private JSON file. This Rust boundary requires a canonical
+absolute executable without a symbolic-link shim. For Rust installed by
+`rustup`, copy the path printed by `rustup which rust-analyzer` rather than
+`~/.cargo/bin/rust-analyzer`, which is normally a symlink:
+
+```json
+{
+  "version": 1,
+  "toolTimeoutMs": 60000,
+  "servers": {
+    "rust": {
+      "command": "/absolute/toolchain/path/bin/rust-analyzer",
+      "args": [],
+      "extensionToLanguage": { ".rs": "rust" },
+      "env": {},
+      "initializationOptions": null,
+      "configuration": null
+    }
+  }
+}
+```
+
+```console
+chmod 600 /absolute/path/to/lsp.json
+dsh --workspace . --lsp-config /absolute/path/to/lsp.json
+```
+
+The config allows at most eight servers and 32 total unique final-extension
+routes. `toolTimeoutMs` defaults to 60,000 and accepts 100–295,000 ms. A source
+must be a non-symlink UTF-8 file inside the retained workspace and is capped at
+4,000,000 bytes. Each server starts on its first matching query, is reused
+serially, and is shut down and process-group reaped when `dsh` exits. One
+message is capped at 16,000,000 bytes; presentation keeps at most 100 locations
+and 16,000 characters.
+
+The child gets the same bounded allowlisted environment used by built-in Shell,
+then the config's `env` entries replace matching names. Values are not written
+to Debug output or Session JSONL by configuration loading, but they are sent to
+the trusted server process and may be visible to same-account process
+inspection. Do not put unrelated credentials there. Pass `--lsp-config` again
+on resume; old LSP calls are never replayed. Full protocol and intentional
+differences are documented in [the Phase 37 design](design/lsp-navigation.md).
 
 ## Session locations
 

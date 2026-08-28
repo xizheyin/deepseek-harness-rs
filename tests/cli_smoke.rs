@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     process::{Child, Command, Output, Stdio},
@@ -7,6 +7,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 
 #[cfg(unix)]
 use std::{
@@ -488,6 +491,65 @@ fn run_script(base_url: &str, workspace: &std::path::Path, prompt: &str) -> Outp
             .expect("the real dsh script entry should run"),
     )
     .wait_with_output(Duration::from_secs(10))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn lsp_fixture_binary() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("DSH_LSP_FIXTURE") {
+        return std::fs::canonicalize(path).expect("configured LSP fixture should exist");
+    }
+    let test_binary = std::env::current_exe().expect("test binary path should be available");
+    let debug = test_binary
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("test binary should live under target/debug/deps");
+    std::fs::canonicalize(debug.join("examples").join("lsp_fixture"))
+        .expect("run `cargo build --example lsp_fixture` before this focused test")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_lsp_config(
+    workspace: &std::path::Path,
+    mode: &str,
+    marker: &std::path::Path,
+) -> std::path::PathBuf {
+    write_lsp_config_with_timeout(workspace, mode, marker, None)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_lsp_config_with_timeout(
+    workspace: &std::path::Path,
+    mode: &str,
+    marker: &std::path::Path,
+    timeout_ms: Option<u64>,
+) -> std::path::PathBuf {
+    let path = workspace.join("lsp.json");
+    let mut body = serde_json::json!({
+        "version": 1,
+        "servers": {
+            "rust": {
+                "command": lsp_fixture_binary(),
+                "args": [mode, marker],
+                "extensionToLanguage": {".rs": "rust"},
+                "env": {},
+                "initializationOptions": null,
+                "configuration": {"fixture": "configured"}
+            }
+        }
+    });
+    if let Some(timeout_ms) = timeout_ms {
+        body["toolTimeoutMs"] = serde_json::json!(timeout_ms);
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("LSP config should be created once");
+    file.write_all(serde_json::to_string(&body).unwrap().as_bytes())
+        .unwrap();
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .unwrap();
+    path
 }
 
 fn script_command(base_url: &str, workspace: &std::path::Path) -> Command {
@@ -1733,6 +1795,364 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
     assert!(!rows.iter().any(|row| row["type"] == "approval/asked"));
 
     std::fs::remove_dir_all(workspace).expect("test workspace should be removed");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn real_script_queries_the_configured_lsp_and_cleans_up_the_server() {
+    let workspace = script_workspace("configured-lsp");
+    let source = workspace.join("src/main.rs");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(
+        &source,
+        "fn first() {}\n\nfn target() -> usize { 1 }\n\nfn definition() {}\n",
+    )
+    .unwrap();
+    let marker = workspace.join("lsp-lifecycle.log");
+    let config = write_lsp_config(&workspace, "normal", &marker);
+    let (base_url, server) = spawn_response_server(vec![
+        tool_round_sse(&[(
+            "lsp-call-1",
+            "lsp",
+            serde_json::json!({
+                "operation":"goToDefinition",
+                "file_path":"src/main.rs",
+                "line":3,
+                "character":5
+            }),
+        )]),
+        text_sse("used the precise definition"),
+    ]);
+    let mut command = prompt_script_command(
+        &base_url,
+        &workspace,
+        "Use the language server to find the target definition.",
+    );
+    command
+        .args(["--lsp-config", config.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = OwnedScriptChild::new(command.spawn().expect("LSP script should spawn"))
+        .wait_with_output(Duration::from_secs(15));
+    let requests = server.join().expect("model server should join");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "used the precise definition\n");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(requests.len(), 2);
+    let first = request_json(&requests[0]);
+    let schema = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "lsp")
+        .expect("configured CLI should advertise lsp");
+    assert_eq!(
+        schema["function"]["parameters"]["required"],
+        serde_json::json!(["operation", "file_path", "line", "character"])
+    );
+    assert!(
+        first
+            .to_string()
+            .contains("Positions are one-based line and character (UTF-16)")
+    );
+    let second = request_json(&requests[1]).to_string();
+    assert!(second.contains("src/main.rs:5:3"), "{second}");
+
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "initialize\nconfiguration\ninitialized\ndidOpen\ntextDocument/definition\ndidClose\nshutdown\nexit\n"
+    );
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let rows = std::fs::read_to_string(only_journal_path(&root))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let call = rows
+        .iter()
+        .position(|row| {
+            row["type"] == "tool/call"
+                && row["data"]["callId"] == "lsp-call-1"
+                && row["data"]["name"] == "lsp"
+        })
+        .unwrap();
+    let result = rows
+        .iter()
+        .position(|row| {
+            row["type"] == "tool/result"
+                && row["data"]["message"]["content"][0]["toolCallId"] == "lsp-call-1"
+        })
+        .unwrap();
+    assert!(call < result);
+    assert!(!rows.iter().any(|row| row["type"] == "approval/asked"));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn real_script_restarts_one_dead_lsp_transport_before_returning_the_result() {
+    let workspace = script_workspace(&format!("lsp-retry-{}", uuid::Uuid::new_v4()));
+    let source = workspace.join("main.rs");
+    std::fs::write(&source, "fn target() -> usize { 1 }\n").unwrap();
+    let marker = workspace.join("lsp-retry.log");
+    let config = write_lsp_config(&workspace, "crash-once", &marker);
+    let (base_url, server) = spawn_response_server(vec![
+        tool_round_sse(&[(
+            "lsp-retry-call",
+            "lsp",
+            serde_json::json!({
+                "operation":"goToDefinition","file_path":"main.rs","line":3,"character":5
+            }),
+        )]),
+        text_sse("recovered the precise definition"),
+    ]);
+    let mut command = prompt_script_command(&base_url, &workspace, "retry a dead LSP transport");
+    command
+        .args(["--lsp-config", config.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output =
+        OwnedScriptChild::new(command.spawn().unwrap()).wait_with_output(Duration::from_secs(15));
+    let requests = server.join().unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "recovered the precise definition\n");
+    assert_eq!(requests.len(), 2);
+    assert!(marker.with_extension("first-crash").exists());
+    assert!(
+        request_json(&requests[1])
+            .to_string()
+            .contains("main.rs:5:3")
+    );
+    assert!(
+        std::fs::read_to_string(marker)
+            .unwrap()
+            .ends_with("shutdown\nexit\n")
+    );
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn malformed_lsp_result_is_a_correlated_error_and_the_cli_continues() {
+    let workspace = script_workspace(&format!("lsp-malformed-{}", uuid::Uuid::new_v4()));
+    std::fs::write(workspace.join("main.rs"), "fn target() -> usize { 1 }\n").unwrap();
+    let marker = workspace.join("lsp-malformed.log");
+    let config = write_lsp_config(&workspace, "malformed", &marker);
+    let (base_url, server) = spawn_response_server(vec![
+        tool_round_sse(&[(
+            "lsp-malformed-call",
+            "lsp",
+            serde_json::json!({
+                "operation":"goToDefinition","file_path":"main.rs","line":3,"character":5
+            }),
+        )]),
+        text_sse("handled the malformed language-server result"),
+    ]);
+    let mut command = prompt_script_command(&base_url, &workspace, "handle malformed LSP output");
+    command
+        .args(["--lsp-config", config.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output =
+        OwnedScriptChild::new(command.spawn().unwrap()).wait_with_output(Duration::from_secs(15));
+    let requests = server.join().unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "handled the malformed language-server result\n"
+    );
+    assert_eq!(requests.len(), 2);
+    assert!(
+        request_json(&requests[1])
+            .to_string()
+            .contains("malformed result")
+    );
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    assert!(
+        std::fs::read_to_string(only_journal_path(&root))
+            .unwrap()
+            .contains("LSP_MALFORMED_RESPONSE")
+    );
+    assert!(
+        std::fs::read_to_string(marker)
+            .unwrap()
+            .ends_with("shutdown\nexit\n")
+    );
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn signal_cancellation_sends_lsp_cancel_and_reaps_the_server_process_group() {
+    use rustix::{
+        io::Errno,
+        process::{Pid, Signal},
+    };
+
+    let workspace = script_workspace(&format!("lsp-cancel-{}", uuid::Uuid::new_v4()));
+    std::fs::write(workspace.join("main.rs"), "fn target() -> usize { 1 }\n").unwrap();
+    let marker = workspace.join("lsp-cancel.log");
+    let config = write_lsp_config(&workspace, "stall-query", &marker);
+    let (base_url, server) = spawn_response_server(vec![tool_round_sse(&[(
+        "lsp-cancel-call",
+        "lsp",
+        serde_json::json!({
+            "operation":"hover","file_path":"main.rs","line":3,"character":5
+        }),
+    )])]);
+    let mut command = prompt_script_command(&base_url, &workspace, "cancel a stalled LSP query");
+    command
+        .args(["--lsp-config", config.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = OwnedScriptChild::new(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let child_pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&marker) {
+            if let Some(raw) = text
+                .lines()
+                .find_map(|line| line.strip_prefix("child="))
+                .and_then(|value| value.parse::<i32>().ok())
+            {
+                break Pid::from_raw(raw).unwrap();
+            }
+        }
+        assert!(Instant::now() < deadline, "fixture child did not start");
+        thread::sleep(Duration::from_millis(10));
+    };
+    send_signal(child.child(), Signal::INT);
+    let output = child.wait_with_output(Duration::from_secs(10));
+    assert_eq!(output.status.code(), Some(130), "{}", stderr(&output));
+    assert_eq!(server.join().unwrap().len(), 1);
+    assert!(
+        std::fs::read_to_string(&marker)
+            .unwrap()
+            .contains("cancel=\"$/cancelRequest\"")
+    );
+    assert_eq!(
+        rustix::process::test_kill_process(child_pid),
+        Err(Errno::SRCH)
+    );
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn configured_lsp_timeout_is_correlated_and_reaps_the_server_process_group() {
+    use rustix::{io::Errno, process::Pid};
+
+    let workspace = script_workspace(&format!("lsp-timeout-{}", uuid::Uuid::new_v4()));
+    std::fs::write(workspace.join("main.rs"), "fn target() -> usize { 1 }\n").unwrap();
+    let marker = workspace.join("lsp-timeout.log");
+    let config = write_lsp_config_with_timeout(&workspace, "stall-query", &marker, Some(1_000));
+    let (base_url, server) = spawn_response_server(vec![
+        tool_round_sse(&[(
+            "lsp-timeout-call",
+            "lsp",
+            serde_json::json!({
+                "operation":"hover","file_path":"main.rs","line":3,"character":5
+            }),
+        )]),
+        text_sse("handled the bounded LSP timeout"),
+    ]);
+    let mut command = prompt_script_command(&base_url, &workspace, "bound a stalled LSP query");
+    command
+        .args(["--lsp-config", config.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output =
+        OwnedScriptChild::new(command.spawn().unwrap()).wait_with_output(Duration::from_secs(15));
+    let requests = server.join().unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "handled the bounded LSP timeout\n");
+    assert_eq!(requests.len(), 2);
+    let marker_text = std::fs::read_to_string(&marker).unwrap();
+    let child_pid = marker_text
+        .lines()
+        .find_map(|line| line.strip_prefix("child="))
+        .and_then(|value| value.parse::<i32>().ok())
+        .and_then(Pid::from_raw)
+        .unwrap();
+    assert!(marker_text.contains("cancel=\"$/cancelRequest\""));
+    assert_eq!(
+        rustix::process::test_kill_process(child_pid),
+        Err(Errno::SRCH)
+    );
+
+    let second = request_json(&requests[1]).to_string();
+    assert!(second.contains("configured timeout"), "{second}");
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let rows = std::fs::read_to_string(only_journal_path(&root)).unwrap();
+    assert!(rows.contains("LSP_TIMEOUT"), "{rows}");
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn invalid_lsp_config_fails_before_session_or_network_work() {
+    let workspace = script_workspace(&format!("lsp-invalid-{}", uuid::Uuid::new_v4()));
+    let config = workspace.join("invalid-lsp.json");
+    let missing = workspace.join("missing-language-server");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&config)
+        .unwrap();
+    file.write_all(
+        serde_json::to_string(&serde_json::json!({
+            "version":1,
+            "servers":{
+                "broken":{
+                    "command":missing,
+                    "extensionToLanguage":{".rs":"rust"}
+                }
+            }
+        }))
+        .unwrap()
+        .as_bytes(),
+    )
+    .unwrap();
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let session_root = workspace.join("sessions-must-not-exist");
+    let output = Command::new(env!("CARGO_BIN_EXE_dsh"))
+        .args(["--prompt", "must not run", "--workspace"])
+        .arg(&workspace)
+        .args(["--lsp-config", config.to_str().unwrap(), "--no-color"])
+        .env_clear()
+        .env("DEEPSEEK_BASE_URL", &base_url)
+        .env("DEEPSEEK_API_KEY", "lsp-config-sentinel-secret")
+        .env("DSH_SESSION_ROOT", &session_root)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "");
+    let error = stderr(&output);
+    assert!(error.contains("CLI_LSP_CONFIG_INVALID"), "{error}");
+    assert!(error.contains("broken"), "{error}");
+    assert!(!error.contains("missing-language-server"));
+    assert!(!error.contains("lsp-config-sentinel-secret"));
+    assert!(!session_root.exists());
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    std::fs::remove_dir_all(workspace).unwrap();
 }
 
 #[test]

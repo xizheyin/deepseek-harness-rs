@@ -91,7 +91,7 @@ impl PluginConfig {
         } else {
             startup_directory.join(configured_path)
         };
-        let value = read_config(&path)?;
+        let value = read_private_config(&path)?;
         let fields = value
             .as_value()
             .as_object()
@@ -206,6 +206,32 @@ impl PluginProgram {
             }
             arguments.push(value.to_owned());
         }
+        Self::from_parts(id, path, arguments)
+    }
+
+    pub(crate) fn from_parts(
+        id: String,
+        path: PathBuf,
+        arguments: Vec<String>,
+    ) -> Result<Self, PluginEntryError> {
+        if !is_plugin_id(&id) {
+            return Err(PluginEntryError::InvalidEntry);
+        }
+        if arguments.len() > MAX_PLUGIN_ARGUMENTS {
+            return Err(PluginEntryError::TooManyArguments);
+        }
+        let mut argument_bytes = 0_usize;
+        for argument in &arguments {
+            if argument.contains('\0') {
+                return Err(PluginEntryError::InvalidEntry);
+            }
+            argument_bytes = argument_bytes
+                .checked_add(argument.len())
+                .ok_or(PluginEntryError::ArgumentsTooLarge)?;
+            if argument_bytes > MAX_PLUGIN_ARGUMENT_BYTES {
+                return Err(PluginEntryError::ArgumentsTooLarge);
+            }
+        }
         let (path, identity, descriptor) =
             admit_program(&path).map_err(|_| PluginEntryError::InvalidProgram)?;
         Ok(Self {
@@ -319,7 +345,7 @@ impl ConfigFingerprint {
     }
 }
 
-fn read_config(path: &Path) -> Result<JsonValue, PluginConfigError> {
+pub(crate) fn read_private_config(path: &Path) -> Result<JsonValue, PluginConfigError> {
     let descriptor = rustix::fs::open(
         path,
         rustix::fs::OFlags::RDONLY

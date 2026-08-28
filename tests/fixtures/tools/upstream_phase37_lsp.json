@@ -1,0 +1,55 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "sources": [
+      "packages/lsp/lsp/src/types.ts",
+      "packages/lsp/lsp/src/index.ts",
+      "packages/lsp/lsp-stdio/src/framing.ts",
+      "packages/lsp/lsp-stdio/src/instance.ts",
+      "packages/lsp/lsp-stdio/src/translate.ts",
+      "packages/lsp/tool-lsp/src/index.ts",
+      "packages/lsp/tool-lsp/src/render.ts"
+    ],
+    "tests": [
+      "packages/lsp/lsp/tests/lsp.spec.ts",
+      "packages/lsp/lsp-stdio/tests/framing.spec.ts",
+      "packages/lsp/lsp-stdio/tests/translate.spec.ts",
+      "packages/lsp/tool-lsp/tests/tool-lsp.spec.ts"
+    ]
+  },
+  "tool": {
+    "name": "lsp",
+    "operations": [
+      "goToDefinition",
+      "findReferences",
+      "goToImplementation",
+      "hover"
+    ],
+    "required": ["operation", "file_path", "line", "character"],
+    "additionalProperties": false,
+    "coordinates": "positive-one-based-utf16",
+    "findReferencesIncludesDeclaration": true,
+    "maxLocations": 100,
+    "maxResultCharacters": 16000,
+    "emptyLocations": "No results.",
+    "emptyHover": "No hover information."
+  },
+  "methods": {
+    "goToDefinition": "textDocument/definition",
+    "findReferences": "textDocument/references",
+    "goToImplementation": "textDocument/implementation",
+    "hover": "textDocument/hover"
+  },
+  "rustStableErrors": [
+    "INVALID_ARGS",
+    "LSP_UNAVAILABLE",
+    "LSP_UNSUPPORTED_OPERATION",
+    "LSP_MALFORMED_RESPONSE",
+    "LSP_PROTOCOL_ERROR",
+    "LSP_PROCESS_FAILED",
+    "LSP_BUSY",
+    "LSP_TIMEOUT",
+    "ABORTED"
+  ]
+}

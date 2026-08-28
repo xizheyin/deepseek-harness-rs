@@ -2027,6 +2027,66 @@ filters, titles, live corpus, SQLite, cursors, surface/lineage reads and the
 other four tools, and uses deterministic occurrence/recency ranking. The
 fixture therefore supports `partial`, not `compatible`.
 
+## Phase 37 configured stdio LSP inspection — 2026-08-29
+
+Pinned baseline: `47f943859bef60e4160492346772ded9b24f765a`.
+
+Inspected fixed sources and tests:
+
+- `packages/lsp/lsp/src/{index,types}.ts` and `tests/lsp.spec.ts` for the
+  provider registry, extension normalization, exact four-operation vocabulary,
+  zero-based UTF-16 normalized values, conflict handling and cancellation
+  forwarding;
+- `packages/lsp/lsp-stdio/src/{index,host,framing,connection,instance,translate,protocol,abort}.ts`
+  and its framing, translation, connection, instance, lifecycle, host,
+  provider and fixture-server tests for executable/config ownership, workspace
+  containment, source reads, JSON-RPC correlation, persistent process pooling,
+  transient document synchronization, capability checks, retry, cancellation
+  and bounded shutdown;
+- `packages/lsp/tool-lsp/src/{index,render,session-cwd}.ts` and its registration,
+  render, path, tool and integration tests for the exact model schema,
+  one-based coordinate conversion, prompt guidance, 100-location/16,000-
+  character presentation caps and model-safe failures;
+- the package READMEs and `.agents/notes/implemented/architecture/2026-07-15-lsp-capability-seam.md`
+  for scope and the deliberate absence of generic JSON-RPC, mutation, rename,
+  symbols and call hierarchy.
+
+Observed fixed behavior:
+
+- the model sees one read-only `lsp` tool with exactly
+  `goToDefinition`, `findReferences`, `goToImplementation`, and `hover`;
+  positive one-based line/character arguments convert to zero-based UTF-16,
+  and `findReferences` always includes the declaration;
+- provider selection uses the final case-insensitive extension and a static
+  extension-to-language-id table; command, provider, workspace, server config,
+  limits and timeout are not model arguments;
+- a generic stdio provider reads a complete contained UTF-8 document before
+  lazily starting one initialized server per canonical workspace, serializes
+  `didOpen` → semantic request → `didClose`, keeps the process for later calls,
+  and retries one read-only query after a transport death;
+- the client accepts only UTF-16 position encoding and an open/close-capable
+  text synchronization mode, normalizes Location/LocationLink/Hover responses,
+  and rejects malformed results with a stable code;
+- JSON-RPC framing, source bytes, message bytes, stderr, rendered results,
+  tool duration, cancel grace and teardown are bounded; cancellation sends
+  `$/cancelRequest` and kills an unresponsive owned process tree;
+- server configuration requests receive one static value; lifecycle bookkeeping
+  receives `null`; `workspace/applyEdit` and unsupported server requests are
+  rejected, so the LSP host cannot edit files or run server commands.
+
+Latest reference: fetched `origin/master` at
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. The model schema, four operations,
+stdio lifecycle and bounds remain. The relevant production changes obtain the
+workspace through the newer session/agent scope seam and refine documentation;
+they do not add model-controlled process or mutation authority.
+
+Rust Phase 37 will implement the same useful semantic boundary through an
+explicit private versioned local config and the existing macOS/Linux process-
+group owner. It will retain one workspace per CLI process, require a stable
+absolute non-symlink executable, use fixed stricter aggregate environment and
+protocol budgets, and omit diagnostics and other LSP operations. A source-
+attributed fixture can therefore support `partial`, not `compatible`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

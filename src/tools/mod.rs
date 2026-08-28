@@ -5,6 +5,8 @@ mod error;
 mod glob;
 mod grep;
 mod list;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod lsp;
 #[cfg(unix)]
 mod patch;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -27,10 +29,14 @@ mod write_edit;
 
 pub use error::ToolRegistryBuildError;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use lsp::{LSP_PROMPT_TEXT, LspConfig, LspConfigError};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use plugin::{PluginConfig, PluginConfigError};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use registry::LocalToolRegistry;
 pub use registry::ReadOnlyToolRegistry;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use registry::ToolAssemblyOptions;
 #[cfg(unix)]
 pub use registry::WorkspaceToolRegistry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

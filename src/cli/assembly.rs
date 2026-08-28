@@ -20,7 +20,8 @@ use crate::{
         CommittedUiReceiver, Session, SessionSearchRuntime, SessionStore, StoreError, SystemClock,
     },
     tools::{
-        LocalToolRegistry, PluginConfig, PluginLaunch, WebToolProviders, WorkspaceFileCatalogue,
+        LSP_PROMPT_TEXT, LocalToolRegistry, LspConfig, PluginConfig, PluginLaunch,
+        ToolAssemblyOptions, WebToolProviders, WorkspaceFileCatalogue,
     },
     user_question::{UserQuestionBroker, UserQuestionReceiver},
     workspace_authority::WorkspaceAuthority,
@@ -99,6 +100,8 @@ pub(super) enum AssemblyError {
     Agent,
     #[error("CLI_PLUGIN_UNAVAILABLE")]
     Plugin { plugin_id: Option<String> },
+    #[error("CLI_LSP_UNAVAILABLE")]
+    Lsp,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -126,6 +129,7 @@ pub(super) async fn assemble_session(
     interactive: bool,
     approval_mode: ApprovalMode,
     plugin_config: Option<PluginConfig>,
+    lsp_config: Option<LspConfig>,
     cancellation: CancellationToken,
 ) -> Result<AgentAssembly, AssemblyFailure> {
     let AssemblySession {
@@ -207,6 +211,8 @@ pub(super) async fn assemble_session(
         authority.identity(),
         session.header().id().clone(),
     );
+    let lsp_enabled = lsp_config.is_some();
+    let tool_options = ToolAssemblyOptions::new(web.clone(), Some(session_search), lsp_config);
 
     let registry = match plugin_config {
         Some(plugin_config) => {
@@ -216,8 +222,7 @@ pub(super) async fn assemble_session(
                 goal.clone(),
                 Some(plan_mode.clone()),
                 user_questions.clone(),
-                web.clone(),
-                Some(session_search.clone()),
+                tool_options,
             )
             .await
         }
@@ -226,8 +231,7 @@ pub(super) async fn assemble_session(
             goal.clone(),
             Some(plan_mode.clone()),
             user_questions,
-            web,
-            Some(session_search),
+            tool_options,
         ),
     };
     let registry = match registry {
@@ -245,6 +249,7 @@ pub(super) async fn assemble_session(
                 crate::tools::ToolRegistryBuildError::Plugin => {
                     AssemblyError::Plugin { plugin_id: None }
                 }
+                crate::tools::ToolRegistryBuildError::Lsp => AssemblyError::Lsp,
                 _ => AssemblyError::Agent,
             };
             return Err(AssemblyFailure::new(error, session));
@@ -253,8 +258,13 @@ pub(super) async fn assemble_session(
     let skill_runtime = registry.skill_runtime();
     let schemas = registry.schemas().to_vec();
 
+    let system_prompt = if lsp_enabled {
+        format!("{SYSTEM_PROMPT} {LSP_PROMPT_TEXT}")
+    } else {
+        SYSTEM_PROMPT.to_owned()
+    };
     let config = match AgentLoopConfig::new(call)
-        .with_system(SYSTEM_PROMPT)
+        .with_system(system_prompt)
         .and_then(|config| config.with_tools(schemas))
         .and_then(|config| config.with_plan_mode(plan_mode.clone(), PLAN_MODE_POLICY))
     {

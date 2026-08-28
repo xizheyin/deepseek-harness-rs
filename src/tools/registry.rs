@@ -36,6 +36,8 @@ use super::{
     {glob, grep, list, read},
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::lsp::{self, LSP_TOOL_NAME, LspConfig, LspHost};
 #[cfg(unix)]
 use super::patch;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -208,6 +210,29 @@ impl WebToolProviders {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Default)]
+pub(crate) struct ToolAssemblyOptions {
+    web: WebToolProviders,
+    session_search: Option<SessionSearchRuntime>,
+    lsp: Option<LspConfig>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ToolAssemblyOptions {
+    pub(crate) fn new(
+        web: WebToolProviders,
+        session_search: Option<SessionSearchRuntime>,
+        lsp: Option<LspConfig>,
+    ) -> Self {
+        Self {
+            web,
+            session_search,
+            lsp,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub struct LocalToolRegistry {
     workspace: Arc<Workspace>,
     skills: SkillRuntime,
@@ -221,6 +246,7 @@ pub struct LocalToolRegistry {
     web_search: Option<Arc<dyn WebSearchProvider>>,
     web_fetch: Option<Arc<dyn WebFetchProvider>>,
     session_search: Option<SessionSearchRuntime>,
+    lsp: Option<Arc<LspHost>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -246,6 +272,7 @@ impl std::fmt::Debug for LocalToolRegistry {
             .field("web_search_enabled", &self.web_search.is_some())
             .field("web_fetch_enabled", &self.web_fetch.is_some())
             .field("session_search_enabled", &self.session_search.is_some())
+            .field("lsp_enabled", &self.lsp.is_some())
             .finish()
     }
 }
@@ -278,8 +305,7 @@ impl LocalToolRegistry {
             goal,
             None,
             None,
-            WebToolProviders::default(),
-            None,
+            ToolAssemblyOptions::default(),
         )
     }
 
@@ -288,10 +314,15 @@ impl LocalToolRegistry {
         goal: Option<GoalRuntime>,
         plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
-        web: WebToolProviders,
-        session_search: Option<SessionSearchRuntime>,
+        options: ToolAssemblyOptions,
     ) -> Result<Self, ToolRegistryBuildError> {
+        let ToolAssemblyOptions {
+            web,
+            session_search,
+            lsp: lsp_config,
+        } = options;
         let skills = SkillRuntime::from_authority(&authority);
+        let lsp_authority = authority.clone();
         let workspace = Arc::new(Workspace::from_authority(authority));
         let environment = ShellEnvironment::capture()?;
         let runner = Arc::new(
@@ -333,6 +364,22 @@ impl LocalToolRegistry {
                 }
             })?);
         }
+        if lsp_config.is_some() {
+            schemas.push(lsp::schema()?);
+        }
+        let lsp = lsp_config
+            .map(|config| {
+                LspHost::start(
+                    config,
+                    runner.as_ref().clone(),
+                    lsp_authority,
+                    Arc::clone(&workspace),
+                    environment.entries().as_ref(),
+                )
+                .map(Arc::new)
+                .map_err(|()| ToolRegistryBuildError::Lsp)
+            })
+            .transpose()?;
         Ok(Self {
             workspace,
             skills,
@@ -346,6 +393,7 @@ impl LocalToolRegistry {
             web_search: web.search,
             web_fetch: web.fetch,
             session_search,
+            lsp,
         })
     }
 
@@ -355,32 +403,36 @@ impl LocalToolRegistry {
         goal: Option<GoalRuntime>,
         plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
-        web: WebToolProviders,
-        session_search: Option<SessionSearchRuntime>,
+        options: ToolAssemblyOptions,
     ) -> Result<Self, ToolRegistryBuildError> {
         let mut registry = Self::from_authority_with_interaction(
             authority,
             goal,
             plan_mode,
             user_questions,
-            web,
-            session_search,
+            options,
         )?;
-        let plugins = Arc::new(
-            PluginHost::start(plugin.config, &registry.schemas, plugin.cancellation)
-                .await
-                .map_err(|error| match error {
+        let plugins = match PluginHost::start(plugin.config, &registry.schemas, plugin.cancellation)
+            .await
+        {
+            Ok(plugins) => Arc::new(plugins),
+            Err(error) => {
+                let mapped = match error {
                     super::plugin::PluginHostError::Startup { plugin_id } => {
                         ToolRegistryBuildError::PluginStartup { plugin_id }
                     }
                     super::plugin::PluginHostError::ToolCollision
                     | super::plugin::PluginHostError::TooManyTools
                     | super::plugin::PluginHostError::Shutdown => ToolRegistryBuildError::Plugin,
-                })?,
-        );
+                };
+                let _ = registry.shutdown().await;
+                return Err(mapped);
+            }
+        };
         let mut schemas = registry.schemas.to_vec();
         if schemas.try_reserve_exact(plugins.schemas().len()).is_err() {
             let _ = plugins.shutdown().await;
+            let _ = registry.shutdown().await;
             return Err(ToolRegistryBuildError::UnsupportedProcessObserver);
         }
         schemas.extend_from_slice(plugins.schemas());
@@ -409,7 +461,7 @@ impl ToolExecutor for LocalToolRegistry {
     fn execution_mode(&self, tool_name: &str) -> ToolExecutionMode {
         if matches!(
             tool_name,
-            "read" | SKILL_TOOL_NAME | "web_search" | "web_fetch"
+            "read" | SKILL_TOOL_NAME | "web_search" | "web_fetch" | LSP_TOOL_NAME
         ) {
             ToolExecutionMode::Parallel
         } else {
@@ -487,6 +539,17 @@ impl ToolExecutor for LocalToolRegistry {
                 session_search::execute(runtime, request.arguments().as_value(), cancellation).await
             });
         }
+        if request.name() == LSP_TOOL_NAME {
+            let runtime = self.lsp.clone();
+            return Box::pin(async move {
+                let Some(runtime) = runtime else {
+                    return ToolCallError::unknown_tool().into_execution_result();
+                };
+                runtime
+                    .execute(request.arguments().as_value(), cancellation)
+                    .await
+            });
+        }
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
         }
@@ -554,6 +617,7 @@ impl ToolExecutor for LocalToolRegistry {
         let web_fetch = self.web_fetch.clone();
         let skills = self.skills.clone();
         let session_search = self.session_search.clone();
+        let lsp = self.lsp.clone();
         Box::pin(async move {
             if is_goal_tool(request.name()) {
                 return prepare_goal(goal, &request);
@@ -587,6 +651,16 @@ impl ToolExecutor for LocalToolRegistry {
                     cancellation,
                 )
                 .await?;
+                return Ok(ToolPreparation::Complete(result));
+            }
+            if request.name() == LSP_TOOL_NAME {
+                let result = match lsp {
+                    Some(lsp) => {
+                        lsp.execute(request.arguments().as_value(), cancellation)
+                            .await?
+                    }
+                    None => ToolCallError::unknown_tool().into_execution_result()?,
+                };
                 return Ok(ToolPreparation::Complete(result));
             }
             if request.name() == "apply_patch" {
@@ -643,14 +717,20 @@ impl ToolExecutor for LocalToolRegistry {
 
     fn shutdown(&self) -> ToolShutdownFuture<'_> {
         let plugins = self.plugins.clone();
+        let lsp = self.lsp.clone();
         Box::pin(async move {
-            let Some(plugins) = plugins else {
-                return Ok(());
-            };
-            plugins
-                .shutdown()
-                .await
-                .map_err(|_| ToolExecutorError::new("plugin host shutdown failed"))
+            let mut failed = false;
+            if let Some(lsp) = lsp {
+                failed |= lsp.shutdown().await.is_err();
+            }
+            if let Some(plugins) = plugins {
+                failed |= plugins.shutdown().await.is_err();
+            }
+            if failed {
+                Err(ToolExecutorError::new("tool subprocess shutdown failed"))
+            } else {
+                Ok(())
+            }
         })
     }
 }
@@ -2398,11 +2478,14 @@ mod tests {
             None,
             None,
             None,
-            super::WebToolProviders::new(
-                Some(Arc::new(FakeWebSearch)),
-                Some(Arc::new(FakeWebFetch)),
+            super::ToolAssemblyOptions::new(
+                super::WebToolProviders::new(
+                    Some(Arc::new(FakeWebSearch)),
+                    Some(Arc::new(FakeWebFetch)),
+                ),
+                None,
+                None,
             ),
-            None,
         )
         .unwrap();
         let schema = registry

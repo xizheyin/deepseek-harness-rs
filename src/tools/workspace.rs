@@ -1111,13 +1111,36 @@ impl Workspace {
         maximum_bytes: usize,
         cancellation: &CancellationToken,
     ) -> ToolCallResult<ReadFile> {
+        self.read_file_with_symlink_policy(path, maximum_bytes, cancellation, true)
+            .await
+    }
+
+    pub(crate) async fn read_file_without_symlinks(
+        &self,
+        path: &ResolvedPath,
+        maximum_bytes: usize,
+        cancellation: &CancellationToken,
+    ) -> ToolCallResult<ReadFile> {
+        self.read_file_with_symlink_policy(path, maximum_bytes, cancellation, false)
+            .await
+    }
+
+    async fn read_file_with_symlink_policy(
+        &self,
+        path: &ResolvedPath,
+        maximum_bytes: usize,
+        cancellation: &CancellationToken,
+        permit_final_symlink: bool,
+    ) -> ToolCallResult<ReadFile> {
         check_cancel(cancellation)?;
         let root = Arc::clone(self.authority.root());
         let relative = path.relative.clone();
         let display = path.display.clone();
         let opened = task::spawn_blocking(move || {
             let symlinks = path_symlinks(&root, &relative)?;
-            if symlinks == PathSymlinks::Intermediate {
+            if symlinks == PathSymlinks::Intermediate
+                || (!permit_final_symlink && symlinks == PathSymlinks::Final)
+            {
                 return Err(BlockingError::UnsafeSymlink);
             }
             let metadata = root.metadata(&relative).map_err(map_resolve_error)?;

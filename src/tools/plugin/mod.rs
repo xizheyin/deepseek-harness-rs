@@ -11,7 +11,7 @@ pub(crate) use action::{approval_required_result, prepare_action};
 pub(crate) use actor::{
     PluginCallControl, PluginCallOutcome, PluginHost, PluginHostError, PluginStop,
 };
-pub(crate) use config::{PluginConfig, PluginConfigError};
+pub(crate) use config::{PluginConfig, PluginConfigError, PluginProgram, read_private_config};
 pub(crate) use protocol::PluginResultPayload;
 
 const MAX_PLUGINS: usize = 8;

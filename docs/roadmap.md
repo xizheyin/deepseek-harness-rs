@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–36 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–37 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -44,6 +44,7 @@ for behavior that users can run today.
 | 34 | Fixed-upstream `write` and `edit` file tools | `complete` | [`validation/phase-34.md`](validation/phase-34.md) |
 | 35 | Bounded project-local Skills catalog and loader | `complete` | [`validation/phase-35.md`](validation/phase-35.md) |
 | 36 | Bounded same-workspace persisted-session search | `complete` | [`validation/phase-36.md`](validation/phase-36.md) |
+| 37 | Configured bounded stdio LSP code navigation | `complete` | [`validation/phase-37.md`](validation/phase-37.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -697,12 +698,56 @@ one real CLI two-session journey; and the normal local Rust gates. No public
 network, real model call, remote CI, SQLite dependency or unrelated stress run
 is required.
 
+## Phase 37 configured stdio LSP boundary (2026-08-29)
+
+Phase 37 adds the fixed upstream's model-facing `lsp` tool and a generic local
+stdio language-server host. The tool exposes exactly four read-only operations:
+`goToDefinition`, `findReferences`, `goToImplementation`, and `hover`. Model
+coordinates are positive one-based UTF-16 positions; the protocol uses
+zero-based UTF-16 positions. The model cannot choose a language server,
+program, environment, workspace, timeout, or output cap.
+
+Language servers are enabled only by an explicit private version-1 JSON file
+passed through `--lsp-config`. The configuration maps file extensions to a
+trusted absolute executable and language id. Executables are validated before
+the tool schema is published, while server processes start lazily on the first
+matching query. One owned actor serializes each server's transient
+`didOpen` → query → `didClose` lifecycle and keeps the initialized process for
+later calls in the same CLI process. An optional bounded `toolTimeoutMs` remains
+user-controlled and invisible to the model; its default is 60 seconds.
+
+Every source is resolved and read through the existing retained workspace
+capability, rejects symbolic links and invalid UTF-8, and is capped at 4 MiB.
+JSON-RPC headers, messages, queues, stderr, total protocol output, rendered
+locations, rendered characters, call duration, cancellation grace and process
+teardown are bounded. Cancellation sends `$/cancelRequest`; a server that does
+not settle is terminated as an owned process group. Server requests for
+`workspace/configuration` receive the static configured value, bookkeeping
+requests receive `null`, and `workspace/applyEdit` or any other authority-
+seeking request is rejected. LSP never edits files and needs no per-call
+approval after the user explicitly enabled its executable at launch.
+
+The Rust config deliberately requires an absolute, stable regular executable
+rather than resolving a mutable `PATH` entry or symbolic-link shim. It uses the
+existing stricter macOS/Linux process observer, environment scrub and aggregate
+protocol-output limits. It has one workspace per CLI process rather than the
+official provider's multi-workspace pool. These differences reduce race and
+cleanup ambiguity without changing the four model-visible query operations.
+
+Acceptance is local-only: fixed-source schema/result fixture, parser,
+normalization, framing, config, workspace, capability, response-bound,
+cancellation and process-cleanup tests; one real fake-stdio-server CLI journey
+covering schema → initialize → open → query → close → next model request; and
+the normal local Rust gates. A real third-party language server, public network,
+real DeepSeek request, remote CI and unrelated platform/stress matrix are not
+required.
+
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
 - MCP, Hooks, ambient/remote Skills, subagents, and background jobs
-- LSP, complete session-query/lineage reads, and a persistent derived search index
+- LSP diagnostics, rename/symbol/call-hierarchy operations, complete session-query/lineage reads, and a persistent derived search index
 - Multiple model providers
 - Untested operating systems or sandbox claims
 - Feature-for-feature or visual copying of Claude Code

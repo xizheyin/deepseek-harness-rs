@@ -8,7 +8,11 @@ use std::{
 use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 
-use crate::{session::SessionStore, tools::PluginConfig, workspace_authority::WorkspaceAuthority};
+use crate::{
+    session::SessionStore,
+    tools::{LspConfig, PluginConfig},
+    workspace_authority::WorkspaceAuthority,
+};
 
 use super::{
     args::{
@@ -41,6 +45,7 @@ const HELP: &str = concat!(
     "  -m, --model <MODEL>          DeepSeek model (new: deepseek-v4-flash; resume: stored model)\n",
     "  -w, --workspace <PATH>       Workspace (new: current; resume: optional identity check)\n",
     "      --plugin-config <PATH>   Enable explicitly configured local tool plugins\n",
+    "      --lsp-config <PATH>      Enable explicitly configured local language servers\n",
     "      --tui <MODE>             Terminal UI: auto (default), enhanced, or linear\n",
     "      --approval-mode <MODE>   Interactive edits: ask (default) or auto-edit\n",
     "      --reduced-motion         Disable periodic enhanced-UI animation\n",
@@ -106,6 +111,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         model,
         workspace,
         plugin_config,
+        lsp_config,
         resume,
         no_color,
         reduced_motion,
@@ -139,6 +145,13 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             let startup_directory = std::env::current_dir().map_err(|_| EntryError::workspace())?;
             PluginConfig::load(&startup_directory, std::path::Path::new(&path))
                 .map_err(EntryError::plugin_config)
+        })
+        .transpose()?;
+    let lsp_config = lsp_config
+        .map(|path| {
+            let startup_directory = std::env::current_dir().map_err(|_| EntryError::workspace())?;
+            LspConfig::load(&startup_directory, std::path::Path::new(&path))
+                .map_err(EntryError::lsp_config)
         })
         .transpose()?;
     let color = color_enabled(no_color);
@@ -310,6 +323,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
                 interactive,
                 approval_mode,
                 plugin_config,
+                lsp_config,
                 startup_cancellation.clone(),
             ),
             &startup_cancellation,
@@ -596,6 +610,7 @@ impl EntryError {
                 detail: plugin_id.map(|id| format!("plugin {id} could not be started safely")),
                 emit_diagnostic: true,
             },
+            AssemblyError::Lsp => Self::stable("CLI_LSP_UNAVAILABLE", 1),
             AssemblyError::Store(error) => Self::storage(error),
         }
     }
@@ -603,6 +618,15 @@ impl EntryError {
     fn plugin_config(error: crate::tools::PluginConfigError) -> Self {
         Self {
             code: "CLI_PLUGIN_CONFIG_INVALID",
+            exit: 1,
+            detail: Some(error.to_string()),
+            emit_diagnostic: true,
+        }
+    }
+
+    fn lsp_config(error: crate::tools::LspConfigError) -> Self {
+        Self {
+            code: "CLI_LSP_CONFIG_INVALID",
             exit: 1,
             detail: Some(error.to_string()),
             emit_diagnostic: true,
@@ -688,6 +712,7 @@ mod tests {
         assert!(HELP.contains("--plugin-config <PATH>"));
         assert!(HELP.contains("--tui <MODE>"));
         assert!(HELP.contains("--approval-mode <MODE>"));
+        assert!(HELP.contains("--lsp-config <PATH>"));
         assert!(HELP.contains("ask (default) or auto-edit"));
         assert!(HELP.contains("auto (default), enhanced, or linear"));
         assert!(HELP.contains("force the linear terminal UI"));
