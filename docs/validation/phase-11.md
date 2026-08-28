@@ -5,8 +5,8 @@
 `in-progress`
 
 Phase 11 is the user-approved TUI v2 extension. This record intentionally has
-no final release candidate, Phase 11 completion claim, real-emulator result, or
-same-candidate platform success yet. A production-reachable enhanced composer, inline Dock,
+no Phase 11 completion claim, real-emulator result, or final independent
+release review yet. A production-reachable enhanced composer, inline Dock,
 truth-safe final tool cards, and joined turn receipt now exist on conservative
 terminal profiles; the strict Phase 9 linear path remains the fallback. Phase
 11 now also has bounded assistant-only Markdown/code/fenced-diff presentation
@@ -19,8 +19,9 @@ transactionally share that ledger. An explicit process-local `auto-edit` mode
 now removes repeated built-in patch prompts without granting Shell or plugin
 authority. The bounded Session picker, local installed Phase 11 acceptance,
 and three real-PTY screenshot captures are now green. It is still partial
-because real-emulator evidence and same-candidate dual-platform CI are not
-complete.
+because real-emulator evidence and the final independent release review are
+not complete. The installed candidate now passes the same-commit macOS/Ubuntu
+CI matrix.
 
 ## Frozen boundary
 
@@ -43,9 +44,9 @@ The implementation work is divided into these checkpoints:
 5. bounded Focus/Inspect/Review, context estimates, and compaction facts;
 6. themes (green), tables (green), commands (green), file suggestions (green),
    Reduced Motion (green), and Session picker (green);
-7. installed-binary PTY journey and real screenshots (green locally), then
-   clean-target repository gates, independent review, real-emulator evidence,
-   and same-candidate macOS/Ubuntu CI.
+7. installed-binary PTY journey, real screenshots, clean-target repository
+   gates, and same-candidate macOS/Ubuntu CI (green), then independent review
+   and real-emulator evidence.
 
 ## Semantic foundation slice — 2026-08-19
 
@@ -139,7 +140,7 @@ This is a green implementation checkpoint, not a Phase 11 release candidate.
 Its docs evidence is committed immediately after the implementation anchor and
 both commits are published together without force. Real iTerm/Terminal/VS Code
 resize/reflow/copy capture, Phase 11 installed acceptance, and current enhanced
-screenshots remain pending.
+screenshots were pending at that checkpoint.
 
 ## Truthful tool cards and receipt slice — 2026-08-19
 
@@ -199,7 +200,7 @@ locally interrupted turn still uses the already accepted signal-safe
 sections record bounded assistant markup and the canonical-patch approval
 slice; tables, Inspect/Review, context/compaction presentation, themes, Session
 picker, final screenshots, real-emulator capture, installed Phase 11
-acceptance, and same-candidate macOS/Ubuntu CI remain pending.
+acceptance, and same-candidate macOS/Ubuntu CI were pending at that checkpoint.
 
 ## Bounded assistant-markup slice — 2026-08-19
 
@@ -259,7 +260,8 @@ or integration issue.
 This is a green implementation checkpoint, not Phase 11 completion. The next
 section records the canonical-patch approval slice. Tables, alternate views,
 themes, Session picker, installed-binary acceptance, current screenshots,
-real-emulator capture, and same-candidate macOS/Ubuntu CI remain pending.
+real-emulator capture, and same-candidate macOS/Ubuntu CI were pending at that
+checkpoint.
 
 ## Canonical patch-approval slice — 2026-08-19
 
@@ -448,7 +450,7 @@ test-coverage problem after the identified documentation and recovery/resume
 evidence gaps were closed. This is a green product checkpoint, not Phase 11
 completion. Reduced motion, tables, commands/file suggestions, Session picker,
 installed Phase 11 acceptance, screenshots, real-emulator capture, and the
-same-candidate macOS/Ubuntu CI remain pending.
+same-candidate macOS/Ubuntu CI were pending at that checkpoint.
 
 ## Bounded source-preserving table slice — 2026-08-23
 
@@ -496,7 +498,8 @@ fragmentation, resource-accounting, terminal, or test-evidence problem after
 the identified physical-line and retained-budget issues were fixed. This is a
 green product checkpoint, not Phase 11 completion. Commands/file suggestions,
 Reduced Motion, Session picker, installed Phase 11 acceptance, screenshots,
-real-emulator capture, and same-candidate macOS/Ubuntu CI remain pending.
+real-emulator capture, and same-candidate macOS/Ubuntu CI were pending at that
+checkpoint.
 
 ## Closed local-command palette slice — 2026-08-26
 
@@ -547,7 +550,8 @@ Three independent read-only reviews found no remaining P0/P1/P2 algorithm,
 safety, queue/Session, approval, terminal, or test-evidence problem. This is a
 green product checkpoint, not Phase 11 completion. File suggestions, Reduced
 Motion, the Session picker, installed Phase 11 acceptance, screenshots,
-real-emulator capture, and same-candidate macOS/Ubuntu CI remain pending.
+real-emulator capture, and same-candidate macOS/Ubuntu CI were pending at that
+checkpoint.
 
 ## Bounded workspace-file suggestion slice — 2026-08-26
 
@@ -607,8 +611,8 @@ a forced gated trusted-UI panic ordering regression, direct wide-fanout file-
 descriptor peak measurement, deterministic coverage for every fallible
 allocation site and forced FNV collisions, and the remaining paste/detail/
 transaction permutations in the frozen acceptance list. The Session picker,
-installed Phase 11 acceptance, screenshots, real-emulator
-capture, and same-candidate macOS/Ubuntu CI also remain pending.
+installed Phase 11 acceptance, screenshots, real-emulator capture, and same-
+candidate macOS/Ubuntu CI were also pending at that checkpoint.
 
 ## Reduced Motion slice — 2026-08-26
 
@@ -686,7 +690,7 @@ misreported as completed coverage.
 
 This is a green product checkpoint, not Phase 11 completion. The Session
 picker, installed Phase 11 acceptance, screenshots, real-emulator capture, and
-same-candidate macOS/Ubuntu CI remain pending.
+same-candidate macOS/Ubuntu CI were pending at that checkpoint.
 
 ## Explicit auto-edit approval slice — 2026-08-26
 
@@ -748,7 +752,8 @@ safety, or test-matrix defect remains from the review.
 
 This is a green, explicit opt-in approval-usability checkpoint, not permission
 to auto-run arbitrary commands and not Phase 11 completion. The Session picker
-and the previously listed terminal/release evidence remain pending.
+and the previously listed terminal/release evidence were pending at that
+checkpoint.
 
 ## Exact Shell process grant slice — 2026-08-26
 
@@ -813,7 +818,8 @@ in addition to the current same-Session Agent rebuild test.
 This is a green approval-usability checkpoint, not general automatic Shell
 permission, not a sandbox, and not Phase 11 completion. Exact repetition can
 repeat destructive filesystem or network side effects. The Session picker and
-the previously listed terminal/release evidence remain pending.
+the previously listed terminal/release evidence were pending at that
+checkpoint.
 
 ## Header-only Session picker slice — 2026-08-28
 
@@ -884,19 +890,81 @@ transactions and signal priority, authority/security boundary, and test
 oracles. All final reports contain P0/P1 = 0; algorithm and safety also report
 P2 = 0. The test review records one optional P2 evidence debt for a
 picker-specific simultaneous-signal PTY, while the shared latch and existing
-signal-priority PTYs cover the implemented rule. This closes the remaining
-Phase 11 product-feature checkpoint, but not Phase 11 itself: installed
+signal-priority PTYs cover the implemented rule. This closed the remaining
+Phase 11 product-feature checkpoint, but not Phase 11 itself; installed
 same-candidate screenshots, real-emulator evidence, final acceptance, and
-macOS/Ubuntu validation are still pending.
+macOS/Ubuntu validation were still pending at that checkpoint.
+
+## Installed Phase 11 candidate and screenshots — 2026-08-28
+
+Candidate commit `d5dd5723e7d25bc4f17b8e09c0dcb9420f494851`
+adds `scripts/accept-phase11.sh` and runs one installed `dsh` binary through
+the existing read/search/patch/Shell/cancel/resume/compaction journey, a new
+queued-follow-up plus Focus/Inspect/Review journey, and the real text-stats and
+JSON-format plugin approval journey. Local view commands create no Provider
+request, the queued prompt enters only the second request, and both turns end
+with their joined receipts.
+
+The screenshot path now accepts only the additional closed ANSI vocabulary
+actually emitted by the Phase 11 Dock: bounded absolute cursor positions,
+scroll-region reset, reverse video, bracketed-paste mode, cursor visibility,
+and origin-mode reset. Unknown/private modes, alternate-screen controls,
+out-of-range cursor positions, and non-full scroll regions still fail closed.
+The renderer self-test fixes those accepted and rejected cases. README assets
+come from the installed candidate's real PTY bytes and a deterministic bounded
+terminal model, not from a hand-authored mockup:
+
+- `docs/assets/dsh-overview.png`: 1128×558,
+  SHA-256 `f9f9c4c1f7fc829ad87f19eb769cd0f4f665d507f7731aaf94ecf08ec9531a5e`;
+- `docs/assets/dsh-approval.png`: 1128×558,
+  SHA-256 `e500027dfdefbd779f947188458757d8178d5434c076b8b312fe0ca90523b4e0`;
+- `docs/assets/dsh-review.png`: 1128×558,
+  SHA-256 `4d3a1637f90e15c4e46eeddb6ad631e92f88021e4c5cffe0c026f3f4cd25cd13`.
+
+Local validation used Rust 1.85.0 on Darwin 27.0.0 arm64. The exact commands
+were:
+
+```console
+./scripts/capture-readme-screenshots.sh
+RUST_TEST_THREADS=4 ./scripts/verify.sh
+./scripts/capture-readme-screenshots.sh --check
+git diff --check
+bash -n scripts/accept-phase11.sh scripts/capture-readme-screenshots.sh
+```
+
+The first capture ran five release-acceptance tests and the selected installed
+plugin journey before writing any asset. The subsequent check installed the
+same source tree again, repeated all six journeys, regenerated all three
+images, and found them byte-identical. Repository verification passed 777
+library tests plus 361 binary/integration/example tests (1,138 total), zero
+failed or ignored, along with format, all-target/all-feature check and build,
+example build, Clippy with warnings denied, and both whitespace gates.
+
+All model traffic used bounded loopback fixtures and obvious fake credentials;
+no DeepSeek endpoint, real API key, or model billing was used. Cargo did update
+the public crates.io index while installing locked dependencies. The candidate
+is pushed non-forced to `origin/main`. GitHub Actions run
+[`33172586814`](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/33172586814)
+passed every step for the exact candidate: macOS job
+[`98853113142`](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/33172586814/job/98853113142)
+completed successfully in 5 minutes 14 seconds, and Ubuntu job
+[`98853113335`](https://github.com/xizheyin/deepseek-harness-rs/actions/runs/33172586814/job/98853113335)
+completed successfully in 6 minutes 6 seconds. Both ran repository checks,
+Phase 9 release acceptance, Phase 10 plugin acceptance, and the new installed
+Phase 11 journey. This is not yet a Phase 11 completion claim: a real terminal-
+emulator capture, final independent review, and the separate completion-status
+commit remain pending.
+
+An attempted automated capture in macOS Terminal.app and iTerm2 was denied by
+the local Computer Use safety policy. No bypass was attempted, and the real-
+emulator item remains explicitly unrun rather than being inferred from PTY or
+deterministic-renderer evidence.
 
 ## Evidence pending
 
-- remaining product files and default-enabled Phase 11 acceptance tests;
 - exact-limit and one-over tests for remaining card/receipt/Dock fields and
   the Review activity/text and reasoning omission-step caps;
-- installed candidate SHA and release acceptance output;
-- screenshot sizes and digests generated from real installed PTY bytes;
-- macOS and Ubuntu job URLs for the same candidate;
+- real terminal-emulator capture and final independent review;
 - final compatibility status and README truth audit.
 
 Phase 11 must remain `in-progress` until all of those fields are supported by a
