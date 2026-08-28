@@ -1727,6 +1727,33 @@ Current master `cd5ef8148158c3a752a658978873241fdf8e2bbc` keeps the production
 `command-compact/src/index.ts` behavior unchanged; its tests and docs add more
 explicit coverage but do not change the command contract used here.
 
+## Phase 28 `web_search` inspection — 2026-08-29
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/web/tool-web/src/{index,search}.ts`, its README, and
+  `tests/tool-web.spec.ts` for the required nonblank `query`, eight-source
+  default, result projection, Markdown rendering, citation instruction,
+  60-second shipped timeout, and search-only composition;
+- `packages/web/web/src/{index,types}.ts` and tests for provider selection,
+  cancellation, source truncation, and provider-neutral result types;
+- `packages/web/web-search-deepseek/src/{index,provider,types}.ts`, its README,
+  and `tests/deepseek.spec.ts` for the separate Anthropic-compatible endpoint,
+  shared API-key reference, native `web_search_20250305` request, redirect
+  refusal, structured-result/citation mapping, URL deduplication, strict
+  no-prose fallback, secret-free errors, and pre-dispatch request record;
+- `packages/bundle/base/cordis.patch.yml` and
+  `apps/cli/config/agent-presets/{standard,code}/agent.cordis.yml` for default
+  search enablement and `web_fetch: false`.
+
+Latest inspected master `cd5ef8148158c3a752a658978873241fdf8e2bbc`
+retains the provider wire behavior but changes the model-facing search input to
+a one-to-four `queries` array with concurrent merge/deduplication, adds an
+explicit external-untrusted-content notice, and enables separately hardened
+`web_fetch` in the current standard preset. Phase 28 implements the fixed
+single-query, search-only contract while adopting the later trust notice; the
+multi-query and fetch expansions remain explicit follow-up gaps.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

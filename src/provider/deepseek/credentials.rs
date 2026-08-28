@@ -58,7 +58,7 @@ impl SecretValue {
         Self(SecretString::from(value.into()))
     }
 
-    pub(super) fn expose(&self) -> &str {
+    pub(crate) fn expose(&self) -> &str {
         self.0.expose_secret()
     }
 }

@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–27 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–28 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -35,6 +35,7 @@ for behavior that users can run today.
 | 25 | Durable startup/resume workspace instructions | `complete` | [`validation/phase-25.md`](validation/phase-25.md) |
 | 26 | Tool-driven nested workspace-instruction refresh | `complete` | [`validation/phase-26.md`](validation/phase-26.md) |
 | 27 | Idle manual `/compact` command | `complete` | [`validation/phase-27.md`](validation/phase-27.md) |
+| 28 | Bounded DeepSeek-backed `web_search` tool | `complete` | [`validation/phase-28.md`](validation/phase-28.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -431,6 +432,30 @@ bounded `sourceCommandId` on every started manual compaction event instead of
 adding a one-command-only generic event family. Exact source paths and this
 intentional difference are recorded in `docs/upstream.md`,
 `docs/design/manual-compaction.md`, and `docs/compatibility.md`.
+
+## Phase 28 bounded web-search boundary (2026-08-29)
+
+Phase 28 closes the largest remaining ordinary-tool gap in the fixed official
+CLI composition: a search-only `web_search` tool backed by DeepSeek's separate
+Anthropic-compatible Messages endpoint and native server-side search. The
+conversation tool takes one nonblank query, returns at most eight deduplicated
+sources with bounded title/snippet/date fields, and tells the model to cite the
+returned URLs. It does not add arbitrary URL fetch, browser cookies, ambient
+HTTP headers, a second credential, or a new approval prompt.
+
+The query is already durably recorded in the ordinary `tool/call` before the
+network request. The search uses `DEEPSEEK_API_KEY`, a separate
+`DEEPSEEK_SEARCH_BASE_URL` override, no redirects or proxy inheritance, a
+60-second whole-operation deadline, cooperative cancellation, and strict
+response/body/output limits. Missing credentials and failures remain ordinary
+correlated tool errors, so they cannot crash or poison the Agent.
+
+The fixed baseline exposes one `query` and disables `web_fetch`; current master
+changes search to a bounded multi-query array and enables a separately hardened
+fetch path. This phase deliberately lands the fixed search-only contract first
+and records the latest extensions as follow-up gaps. Acceptance is local-only:
+fake providers, a loopback DeepSeek-shaped server, focused Agent ordering, and
+the required local Rust gates; no real API request or remote CI.
 
 ## Still deferred
 

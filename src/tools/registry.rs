@@ -28,6 +28,7 @@ use super::{
     MAX_TOOL_CONTENT_BYTES,
     arguments::{parse_glob, parse_grep, parse_list, parse_read},
     error::{ToolCallError, ToolCallResult, ToolRegistryBuildError},
+    web_search::{self, WebSearchProvider},
     workspace::Workspace,
     {glob, grep, list, read},
 };
@@ -159,6 +160,7 @@ pub struct LocalToolRegistry {
     goal: Option<GoalRuntime>,
     plan_mode: Option<PlanModeRuntime>,
     user_questions: Option<UserQuestionBroker>,
+    web_search: Option<Arc<dyn WebSearchProvider>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -180,6 +182,7 @@ impl std::fmt::Debug for LocalToolRegistry {
             .field("goal_enabled", &self.goal.is_some())
             .field("plan_mode_enabled", &self.plan_mode.is_some())
             .field("user_questions_enabled", &self.user_questions.is_some())
+            .field("web_search_enabled", &self.web_search.is_some())
             .finish()
     }
 }
@@ -207,7 +210,7 @@ impl LocalToolRegistry {
         authority: WorkspaceAuthority,
         goal: Option<GoalRuntime>,
     ) -> Result<Self, ToolRegistryBuildError> {
-        Self::from_authority_with_interaction(authority, goal, None, None)
+        Self::from_authority_with_interaction(authority, goal, None, None, None)
     }
 
     pub(crate) fn from_authority_with_interaction(
@@ -215,6 +218,7 @@ impl LocalToolRegistry {
         goal: Option<GoalRuntime>,
         plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
+        web_search: Option<Arc<dyn WebSearchProvider>>,
     ) -> Result<Self, ToolRegistryBuildError> {
         let workspace = Arc::new(Workspace::from_authority(authority));
         let environment = ShellEnvironment::capture()?;
@@ -233,6 +237,14 @@ impl LocalToolRegistry {
         if user_questions.is_some() {
             schemas.push(build_user_question_schema()?);
         }
+        if web_search.is_some() {
+            schemas.push(web_search::schema().map_err(|source| {
+                ToolRegistryBuildError::InvalidSchema {
+                    tool: web_search::WEB_SEARCH_TOOL_NAME,
+                    source,
+                }
+            })?);
+        }
         Ok(Self {
             workspace,
             schemas: schemas.into(),
@@ -242,6 +254,7 @@ impl LocalToolRegistry {
             goal,
             plan_mode,
             user_questions,
+            web_search,
         })
     }
 
@@ -252,9 +265,15 @@ impl LocalToolRegistry {
         goal: Option<GoalRuntime>,
         plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
+        web_search: Option<Arc<dyn WebSearchProvider>>,
     ) -> Result<Self, ToolRegistryBuildError> {
-        let mut registry =
-            Self::from_authority_with_interaction(authority, goal, plan_mode, user_questions)?;
+        let mut registry = Self::from_authority_with_interaction(
+            authority,
+            goal,
+            plan_mode,
+            user_questions,
+            web_search,
+        )?;
         let plugins = Arc::new(
             PluginHost::start(config, &registry.schemas, cancellation)
                 .await
@@ -339,6 +358,12 @@ impl ToolExecutor for LocalToolRegistry {
                 .into_execution_result()
             });
         }
+        if request.name() == web_search::WEB_SEARCH_TOOL_NAME {
+            let provider = self.web_search.clone();
+            return Box::pin(
+                async move { dispatch_web_search(provider, &request, cancellation).await },
+            );
+        }
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
         }
@@ -388,6 +413,7 @@ impl ToolExecutor for LocalToolRegistry {
         let goal = self.goal.clone();
         let plan_mode = self.plan_mode.clone();
         let user_questions = self.user_questions.clone();
+        let web_search = self.web_search.clone();
         Box::pin(async move {
             if is_goal_tool(request.name()) {
                 return prepare_goal(goal, &request);
@@ -401,6 +427,10 @@ impl ToolExecutor for LocalToolRegistry {
             }
             if request.name() == "todo_write" {
                 return prepare_todo_write(&request);
+            }
+            if request.name() == web_search::WEB_SEARCH_TOOL_NAME {
+                let result = dispatch_web_search(web_search, &request, cancellation).await?;
+                return Ok(ToolPreparation::Complete(result));
             }
             if request.name() == "apply_patch" {
                 return patch::prepare(
@@ -449,6 +479,24 @@ impl ToolExecutor for LocalToolRegistry {
                 .map_err(|_| ToolExecutorError::new("plugin host shutdown failed"))
         })
     }
+}
+
+async fn dispatch_web_search(
+    provider: Option<Arc<dyn WebSearchProvider>>,
+    request: &ToolExecutionRequest,
+    cancellation: CancellationToken,
+) -> Result<ToolExecutionResult, ToolExecutorError> {
+    let Some(provider) = provider else {
+        return ToolCallError::unknown_tool().into_execution_result();
+    };
+    if cancellation.is_cancelled() {
+        return ToolCallError::aborted().into_execution_result();
+    }
+    let query = match web_search::parse_query(request.arguments().as_value()) {
+        Ok(query) => query,
+        Err(error) => return error.into_execution_result(),
+    };
+    web_search::execution_result(provider.search(query, cancellation).await)
 }
 
 #[cfg(unix)]
@@ -1724,7 +1772,7 @@ fn schema(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::Arc};
 
     use futures_util::poll;
     use tokio_util::sync::CancellationToken;
@@ -1739,14 +1787,45 @@ mod tests {
     };
     use crate::tools::workspace::Workspace;
     use crate::{
-        agent::{GoalToolCaller, ToolDispatchBinding, ToolExecutionRequest, ToolPreparation},
+        agent::{
+            GoalToolCaller, ToolDispatchBinding, ToolExecutionRequest, ToolExecutor,
+            ToolPreparation,
+        },
         goal::GoalRuntime,
         model::{CallId, ContentBlockKind, JsonValue},
         plan_mode::PlanModeRuntime,
         session::TodoStatus,
-        tools::EMPTY_TEXT_BLOCK_JSON_BYTES,
+        tools::{
+            EMPTY_TEXT_BLOCK_JSON_BYTES, WebSearchFuture, WebSearchProvider,
+            WebSearchProviderError, WebSearchResult, normalize_source,
+        },
         user_question::{UserQuestionBroker, UserQuestionResponseItem},
+        workspace_authority::WorkspaceAuthority,
     };
+
+    struct FakeWebSearch;
+
+    impl WebSearchProvider for FakeWebSearch {
+        fn search(&self, query: String, _cancellation: CancellationToken) -> WebSearchFuture<'_> {
+            Box::pin(async move {
+                if query == "fail" {
+                    return Err(WebSearchProviderError::Provider);
+                }
+                Ok(WebSearchResult {
+                    sources: vec![
+                        normalize_source(
+                            "https://example.test/result".to_owned(),
+                            Some("Example".to_owned()),
+                            Some(format!("result for {query}")),
+                            None,
+                        )
+                        .unwrap(),
+                    ],
+                    truncated: false,
+                })
+            })
+        }
+    }
 
     fn goal_request(name: &str, arguments: serde_json::Value) -> ToolExecutionRequest {
         goal_request_as(name, arguments, GoalToolCaller::Untrusted)
@@ -1801,6 +1880,60 @@ mod tests {
 
         let public_result = crate::agent::ToolExecutionResult::success(vec![]).unwrap();
         assert!(public_result.workspace_touch().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabled_web_search_is_declared_and_uses_the_ordinary_preparation_path() {
+        let root =
+            std::env::temp_dir().join(format!("dsh-registry-web-search-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let authority = WorkspaceAuthority::open(&root).unwrap();
+        let registry = super::LocalToolRegistry::from_authority_with_interaction(
+            authority,
+            None,
+            None,
+            None,
+            Some(Arc::new(FakeWebSearch)),
+        )
+        .unwrap();
+        let schema = registry
+            .schemas()
+            .iter()
+            .find(|schema| schema.name() == "web_search")
+            .unwrap();
+        assert_eq!(
+            schema.parameters().as_value()["required"],
+            serde_json::json!(["query"])
+        );
+
+        let request = goal_request("web_search", serde_json::json!({"query":"current Rust"}));
+        let ToolPreparation::Complete(result) = registry
+            .prepare(request, CancellationToken::new())
+            .await
+            .unwrap()
+        else {
+            panic!("web search must complete without an approval action")
+        };
+        assert!(!result.is_error());
+        let ContentBlockKind::Text { text } = result.content()[0].kind() else {
+            panic!("web search result must be text")
+        };
+        assert!(text.contains("result for current Rust"));
+        assert!(text.contains("external, untrusted data"));
+        assert!(result.meta().is_some());
+
+        let failed = registry
+            .execute(
+                goal_request("web_search", serde_json::json!({"query":"fail"})),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.error().map(|error| error.code.as_str()),
+            Some("WEB_PROVIDER_ERROR")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

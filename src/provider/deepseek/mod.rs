@@ -8,6 +8,7 @@ mod request;
 mod response;
 mod sse;
 mod transport;
+mod web_search;
 
 #[cfg(test)]
 mod tests;
@@ -26,3 +27,4 @@ pub use credentials::{
 pub use response::{MAX_DEEPSEEK_BLOCKS, MAX_DEEPSEEK_EMITTED_BYTES, MAX_DEEPSEEK_OUTPUT_BYTES};
 pub use sse::{MAX_DEEPSEEK_RESPONSE_BYTES, MAX_SSE_EVENT_BYTES, MAX_SSE_LINE_BYTES};
 pub use transport::DeepSeekProviderBuildError;
+pub(crate) use web_search::DeepSeekSearchProvider;

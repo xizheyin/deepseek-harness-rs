@@ -37,6 +37,7 @@ Run `dsh --help` for exact syntax and mutually exclusive combinations.
 | --- | --- |
 | `DEEPSEEK_API_KEY` | Required when a model request is made |
 | `DEEPSEEK_BASE_URL` | Optional trusted base URL; HTTPS only, except loopback HTTP for offline tests |
+| `DEEPSEEK_SEARCH_BASE_URL` | Optional DeepSeek Anthropic-compatible web-search base; HTTPS only, except loopback HTTP for offline tests |
 | `DSH_SESSION_ROOT` | Optional absolute Session directory override |
 | `DSH_HOME` | Optional absolute home for user-level `AGENTS.md`; defaults to `$HOME/.dsh` |
 | `XDG_STATE_HOME` | Linux state base when `DSH_SESSION_ROOT` is absent |
@@ -54,6 +55,14 @@ resize rescue; below that it restores the terminal and fails closed.
 The HTTP client does not follow redirects and ignores system proxy settings.
 Choosing a custom HTTPS endpoint still grants that endpoint the API key and
 model-visible request content.
+
+`web_search` uses the same `DEEPSEEK_API_KEY`, but it deliberately does not use
+`DEEPSEEK_BASE_URL`: DeepSeek native search is a separate Anthropic-compatible
+Messages API. Its default base is `https://api.deepseek.com/anthropic/v1`, and
+`/messages` is appended. One search has a 60-second whole-operation limit,
+returns at most eight sources, follows no redirects, and uses no ambient proxy.
+The tool sends the model-provided query to DeepSeek without a separate approval;
+it does not fetch arbitrary URLs or read browser cookies.
 
 ## Workspace instructions
 

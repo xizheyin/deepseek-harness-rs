@@ -15,6 +15,7 @@ mod read;
 mod registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod shell;
+mod web_search;
 mod workspace;
 
 pub use error::ToolRegistryBuildError;
@@ -25,6 +26,10 @@ pub use registry::LocalToolRegistry;
 pub use registry::ReadOnlyToolRegistry;
 #[cfg(unix)]
 pub use registry::WorkspaceToolRegistry;
+pub(crate) use web_search::{
+    WEB_SEARCH_MAX_RESULTS, WebSearchFuture, WebSearchProvider, WebSearchProviderError,
+    WebSearchResult, normalize_source,
+};
 #[cfg(unix)]
 pub(crate) use workspace::{WorkspaceFileCatalogue, WorkspaceFileCatalogueError};
 
