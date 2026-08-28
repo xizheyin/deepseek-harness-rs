@@ -4311,6 +4311,7 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         .unwrap(),
         durable_limit: None,
         deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+        goal_tool_caller: super::GoalToolCaller::Untrusted,
     };
     let budget_failure = super::failure_reason(
         "AGENT_EVENT_BUDGET",

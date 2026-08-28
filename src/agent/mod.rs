@@ -27,7 +27,8 @@ use crate::{
     goal::PreparedGoalMutation,
     model::{
         CallId, ContentBlock, ContentBlockKind, FinishReasonKind, JsonValue, LlmCallConfig,
-        LlmFailure, Message, MessageRole, MessageSource, StreamChunkKind, ToolSchema,
+        LlmFailure, Message, MessageRole, MessageSource, MessageSourceKind, StreamChunkKind,
+        ToolSchema,
     },
     provider::{
         ModelProvider, PreparedProviderCall, PreparedRequestPreflight, ProviderPreflightError,
@@ -56,6 +57,7 @@ pub use approval::{
 pub use error::{
     AgentBuildError, AgentLoopError, AgentReleaseError, AgentRuntimeError, AgentShutdownError,
 };
+pub(crate) use tool::GoalToolCaller;
 pub(crate) use tool::{
     ActionContract, ActionDeclineReason, ToolActionControl, ToolActionDeclineFn, ToolActionOutcome,
     ToolActionRunFn, ToolActionSetupControl, ToolActionSetupOutcome, ToolActionTurnStop,
@@ -1099,6 +1101,7 @@ struct Driver<'a> {
     session_limit_failure: LlmFailure,
     durable_limit: Option<AppendError>,
     deadline: Instant,
+    goal_tool_caller: GoalToolCaller,
 }
 
 impl Driver<'_> {
@@ -1146,6 +1149,7 @@ async fn run_turn_inner(
     proposal: TurnProposal,
     cancellation: CancellationToken,
 ) -> Result<TurnOutcome, AgentLoopError> {
+    let goal_tool_caller = classify_goal_tool_caller(&proposal);
     let turn = session.state().next_turn();
     let budget_reason = failure_reason(
         "AGENT_EVENT_BUDGET",
@@ -1188,6 +1192,7 @@ async fn run_turn_inner(
         session_limit_failure,
         durable_limit: None,
         deadline: Instant::now() + config.limits.turn_duration,
+        goal_tool_caller,
     };
 
     let mut reason = if cancellation.is_cancelled() {
@@ -1243,6 +1248,67 @@ async fn run_turn_inner(
         tool_calls: driver.counters.tool_calls,
         reported_output_tokens: driver.counters.reported_output_tokens,
     })
+}
+
+fn classify_goal_tool_caller(proposal: &TurnProposal) -> GoalToolCaller {
+    let TurnProposal::Enter(messages) = proposal else {
+        return GoalToolCaller::Untrusted;
+    };
+    if messages
+        .iter()
+        .any(|message| matches!(message.source().kind(), MessageSourceKind::User))
+    {
+        return GoalToolCaller::DirectHuman;
+    }
+    if messages.iter().any(|message| {
+        matches!(message.source().kind(), MessageSourceKind::Other { kind } if kind == "goal")
+    }) {
+        GoalToolCaller::GoalRound
+    } else {
+        GoalToolCaller::Untrusted
+    }
+}
+
+#[cfg(test)]
+mod goal_tool_caller_tests {
+    use super::{GoalToolCaller, TurnProposal, classify_goal_tool_caller};
+    use crate::model::{ContentBlock, Message, MessageSource};
+
+    fn message(id: &str, source: MessageSource) -> Message {
+        Message::user(id, vec![ContentBlock::text("input").unwrap()], source).unwrap()
+    }
+
+    #[test]
+    fn direct_human_wins_mixed_turn_and_other_sources_are_untrusted() {
+        let goal_source = MessageSource::from_value(serde_json::json!({
+            "kind": "goal",
+            "goalId": "goal-test",
+            "revision": 1,
+            "round": 1,
+        }))
+        .unwrap();
+        let goal = message("goal", goal_source.clone());
+        assert_eq!(
+            classify_goal_tool_caller(&TurnProposal::Enter(vec![goal.clone()])),
+            GoalToolCaller::GoalRound
+        );
+
+        let human = message("human", MessageSource::user().unwrap());
+        assert_eq!(
+            classify_goal_tool_caller(&TurnProposal::Enter(vec![goal, human])),
+            GoalToolCaller::DirectHuman
+        );
+
+        let plugin = message("plugin", MessageSource::plugin("test").unwrap());
+        assert_eq!(
+            classify_goal_tool_caller(&TurnProposal::Enter(vec![plugin])),
+            GoalToolCaller::Untrusted
+        );
+        assert_eq!(
+            classify_goal_tool_caller(&TurnProposal::Reject),
+            GoalToolCaller::Untrusted
+        );
+    }
 }
 
 async fn run_entered_turn(
@@ -2585,7 +2651,7 @@ async fn commit_tool_round(
         planned.push(PlannedTool {
             call,
             claim_profile,
-            dispatch: ToolDispatchBinding::new(),
+            dispatch: ToolDispatchBinding::with_goal_caller(driver.goal_tool_caller),
             call_seq: maximum_source_seq,
             result_message_id,
             call_claim,

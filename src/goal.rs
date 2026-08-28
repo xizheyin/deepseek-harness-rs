@@ -351,7 +351,6 @@ impl GoalReplayState {
             GoalOperation::Block => {
                 current.goal.phase == GoalPhase::Active
                     && next.goal.phase == GoalPhase::Blocked
-                    && next.rounds_started >= MIN_BLOCKED_ROUNDS
                     && next.goal.blocked_reason.is_some()
             }
             GoalOperation::Create | GoalOperation::Clear => false,
@@ -433,6 +432,10 @@ impl GoalSnapshot {
 
     pub(crate) fn revision(&self) -> u64 {
         self.durable.goal.revision
+    }
+
+    pub(crate) fn rounds_started(&self) -> u32 {
+        self.durable.rounds_started
     }
 }
 
@@ -758,9 +761,6 @@ impl GoalRuntime {
                 (GoalOperation::Complete, false)
             }
             GoalUpdate::Blocked if current.goal.phase == GoalPhase::Active => {
-                if current.rounds_started < MIN_BLOCKED_ROUNDS {
-                    return Err(GoalError::BlockThreshold);
-                }
                 next.goal.phase = GoalPhase::Blocked;
                 next.goal.blocked_reason = Some(GoalBlockReason::repeated());
                 (GoalOperation::Block, false)
@@ -1104,17 +1104,9 @@ mod tests {
     }
 
     #[test]
-    fn three_started_rounds_are_required_before_blocking() {
+    fn event_domain_allows_blocking_before_tool_policy_threshold() {
         let goal = GoalRuntime::new();
         let created = goal.create("blocked work".to_owned()).unwrap();
-        for _ in 0..2 {
-            let _ = goal.next_round().unwrap().unwrap();
-        }
-        assert_eq!(
-            goal.update(created.revision(), GoalUpdate::Blocked, None),
-            Err(GoalError::BlockThreshold)
-        );
-        let _ = goal.next_round().unwrap().unwrap();
         let blocked = goal
             .update(created.revision(), GoalUpdate::Blocked, None)
             .unwrap();

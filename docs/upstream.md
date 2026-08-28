@@ -1433,6 +1433,23 @@ configuration, and the image attachments present on latest `master`. Design
 and local evidence are in `docs/design/goal-persistence.md` and
 `docs/validation/phase-13.md`.
 
+## Phase 14 Goal tool-authority inspection — 2026-08-28
+
+`packages/goal/tool-goal/src/authority.ts`, `src/index.ts`, and the execution-
+authority cases in `tests/tool-goal.spec.ts` were inspected at the same fixed
+commit. The official matrix requires direct top-level human input for
+create/edit/pause/resume, permits complete/block from direct human or the exact
+current Goal round, and applies the configured block threshold only to an
+automatic Goal round. A human may block earlier. Direct human input wins a
+mixed human/Goal turn, while forged plugin/other sources grant no mutation
+authority.
+
+Rust Phase 14 carries that source classification in the Agent's sealed
+per-call dispatch identity and enforces it during side-effect-free Goal tool
+preparation. Rust has no product subagents, so its single interactive Agent is
+the only possible top-level root. The focused evidence is recorded in
+`docs/design/goal-tool-authority.md` and `docs/validation/phase-14.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

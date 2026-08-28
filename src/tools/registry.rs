@@ -32,7 +32,7 @@ use super::shell::{self, ShellEnvironment};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::agent::ToolClaimProfile;
 #[cfg(unix)]
-use crate::agent::{ToolPreparation, ToolPreparationFuture};
+use crate::agent::{GoalToolCaller, ToolPreparation, ToolPreparationFuture};
 
 /// Immutable catalogue and capability root for the four Phase 4 read-only tools.
 pub struct ReadOnlyToolRegistry {
@@ -544,11 +544,29 @@ fn prepare_goal(
     if request.name() == "get_goal" {
         return dispatch_goal(Some(goal), request).map(ToolPreparation::Complete);
     }
+    let caller = request.dispatch_binding().goal_caller();
     let prepared = match request.name() {
-        "create_goal" => parse_create_goal_arguments(request.arguments().as_value())
+        "create_goal" => require_goal_authority(caller, GoalAuthorityNeed::DirectHuman)
+            .and_then(|()| parse_create_goal_arguments(request.arguments().as_value()))
             .and_then(|objective| goal.prepare_create(objective).map_err(goal_call_error)),
         "update_goal" => parse_update_goal_arguments(request.arguments().as_value()).and_then(
             |(revision, operation, objective)| {
+                let need = match operation {
+                    GoalUpdate::Edit | GoalUpdate::Pause | GoalUpdate::Resume => {
+                        GoalAuthorityNeed::DirectHuman
+                    }
+                    GoalUpdate::Complete | GoalUpdate::Blocked => GoalAuthorityNeed::Completion,
+                };
+                require_goal_authority(caller, need)?;
+                if operation == GoalUpdate::Blocked
+                    && caller == GoalToolCaller::GoalRound
+                    && goal
+                        .snapshot()
+                        .map_err(goal_call_error)?
+                        .is_none_or(|snapshot| snapshot.rounds_started() < 3)
+                {
+                    return Err(goal_call_error(GoalError::BlockThreshold));
+                }
                 goal.prepare_update(revision, operation, objective)
                     .map_err(goal_call_error)
             },
@@ -558,6 +576,31 @@ fn prepare_goal(
     match prepared {
         Ok(mutation) => Ok(ToolPreparation::Goal(mutation)),
         Err(error) => Ok(ToolPreparation::Complete(error.into_execution_result()?)),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GoalAuthorityNeed {
+    DirectHuman,
+    Completion,
+}
+
+fn require_goal_authority(caller: GoalToolCaller, need: GoalAuthorityNeed) -> ToolCallResult<()> {
+    let allowed = match need {
+        GoalAuthorityNeed::DirectHuman => caller == GoalToolCaller::DirectHuman,
+        GoalAuthorityNeed::Completion => matches!(
+            caller,
+            GoalToolCaller::DirectHuman | GoalToolCaller::GoalRound
+        ),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(ToolCallError::model(
+            "GoalError",
+            "GOAL_TOOL_AUTHORITY_REQUIRED",
+            "this Goal operation is not allowed from the current turn source",
+        ))
     }
 }
 
@@ -849,22 +892,32 @@ fn schema(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_TOOL_CONTENT_BYTES, build_goal_schemas, dispatch_goal, normalize_success};
+    use super::{
+        MAX_TOOL_CONTENT_BYTES, build_goal_schemas, dispatch_goal, normalize_success, prepare_goal,
+    };
     use crate::{
-        agent::{ToolDispatchBinding, ToolExecutionRequest},
+        agent::{GoalToolCaller, ToolDispatchBinding, ToolExecutionRequest, ToolPreparation},
         goal::GoalRuntime,
         model::{CallId, ContentBlockKind, JsonValue},
         tools::EMPTY_TEXT_BLOCK_JSON_BYTES,
     };
 
     fn goal_request(name: &str, arguments: serde_json::Value) -> ToolExecutionRequest {
+        goal_request_as(name, arguments, GoalToolCaller::Untrusted)
+    }
+
+    fn goal_request_as(
+        name: &str,
+        arguments: serde_json::Value,
+        caller: GoalToolCaller,
+    ) -> ToolExecutionRequest {
         let raw_arguments = serde_json::to_string(&arguments).unwrap();
         ToolExecutionRequest::new(
             CallId::new(format!("call-{name}")),
             name.to_owned(),
             raw_arguments,
             JsonValue::new(arguments).unwrap(),
-            ToolDispatchBinding::new(),
+            ToolDispatchBinding::with_goal_caller(caller),
         )
     }
 
@@ -936,5 +989,118 @@ mod tests {
             rejected.error().map(|error| error.code.as_str()),
             Some("INVALID_ARGS")
         );
+    }
+
+    #[test]
+    fn goal_tool_authority_distinguishes_human_goal_round_and_untrusted_turns() {
+        let goal = GoalRuntime::new();
+        let rejected_create = prepare_goal(
+            Some(goal.clone()),
+            &goal_request_as(
+                "create_goal",
+                serde_json::json!({ "objective": "forged" }),
+                GoalToolCaller::GoalRound,
+            ),
+        )
+        .unwrap();
+        let ToolPreparation::Complete(rejected_create) = rejected_create else {
+            panic!("a Goal round must not create a Goal")
+        };
+        assert_eq!(
+            rejected_create.error().map(|error| error.code.as_str()),
+            Some("GOAL_TOOL_AUTHORITY_REQUIRED")
+        );
+        assert!(goal.snapshot().unwrap().is_none());
+
+        let created = prepare_goal(
+            Some(goal.clone()),
+            &goal_request_as(
+                "create_goal",
+                serde_json::json!({ "objective": "authorized" }),
+                GoalToolCaller::DirectHuman,
+            ),
+        )
+        .unwrap();
+        let ToolPreparation::Goal(created) = created else {
+            panic!("a direct human turn may prepare Goal creation")
+        };
+        created.commit().unwrap();
+
+        let rejected_edit = prepare_goal(
+            Some(goal.clone()),
+            &goal_request_as(
+                "update_goal",
+                serde_json::json!({
+                    "expected_revision": 1,
+                    "operation": "edit",
+                    "objective": "forged edit"
+                }),
+                GoalToolCaller::GoalRound,
+            ),
+        )
+        .unwrap();
+        let ToolPreparation::Complete(rejected_edit) = rejected_edit else {
+            panic!("a Goal round must not edit its own objective")
+        };
+        assert_eq!(
+            rejected_edit.error().map(|error| error.code.as_str()),
+            Some("GOAL_TOOL_AUTHORITY_REQUIRED")
+        );
+
+        let completion = prepare_goal(
+            Some(goal),
+            &goal_request_as(
+                "update_goal",
+                serde_json::json!({
+                    "expected_revision": 1,
+                    "operation": "complete"
+                }),
+                GoalToolCaller::GoalRound,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(completion, ToolPreparation::Goal(_)));
+    }
+
+    #[test]
+    fn block_threshold_applies_to_goal_rounds_but_not_direct_human_turns() {
+        let round_goal = GoalRuntime::new();
+        round_goal.create("round blocker".to_owned()).unwrap();
+        let early = prepare_goal(
+            Some(round_goal.clone()),
+            &goal_request_as(
+                "update_goal",
+                serde_json::json!({
+                    "expected_revision": 1,
+                    "operation": "blocked"
+                }),
+                GoalToolCaller::GoalRound,
+            ),
+        )
+        .unwrap();
+        let ToolPreparation::Complete(early) = early else {
+            panic!("an early Goal-round block must be rejected")
+        };
+        assert_eq!(
+            early.error().map(|error| error.code.as_str()),
+            Some("GOAL_BLOCK_THRESHOLD")
+        );
+        assert_eq!(round_goal.snapshot().unwrap().unwrap().revision(), 1);
+
+        let human_goal = GoalRuntime::new();
+        human_goal.create("human blocker".to_owned()).unwrap();
+        let early_human = prepare_goal(
+            Some(human_goal),
+            &goal_request_as(
+                "update_goal",
+                serde_json::json!({
+                    "expected_revision": 1,
+                    "operation": "blocked"
+                }),
+                GoalToolCaller::DirectHuman,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(early_human, ToolPreparation::Goal(_)));
     }
 }

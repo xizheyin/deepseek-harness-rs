@@ -118,19 +118,41 @@ impl Default for ToolClaimProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GoalToolCaller {
+    DirectHuman,
+    GoalRound,
+    Untrusted,
+}
+
+struct ToolDispatchSeal {
+    goal_caller: GoalToolCaller,
+}
+
 /// Per-dispatch unforgeable identity retained by the Agent and sealed action.
 #[derive(Clone)]
-pub(crate) struct ToolDispatchBinding(Arc<()>);
+pub(crate) struct ToolDispatchBinding(Arc<ToolDispatchSeal>);
 
 impl ToolDispatchBinding {
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self(Arc::new(()))
+        Self::with_goal_caller(GoalToolCaller::Untrusted)
+    }
+
+    #[must_use]
+    pub(crate) fn with_goal_caller(goal_caller: GoalToolCaller) -> Self {
+        Self(Arc::new(ToolDispatchSeal { goal_caller }))
     }
 
     #[must_use]
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[must_use]
+    pub(crate) fn goal_caller(&self) -> GoalToolCaller {
+        self.0.goal_caller
     }
 }
 
