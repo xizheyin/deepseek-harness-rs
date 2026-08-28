@@ -15,7 +15,8 @@ use deepseek_harness_cli::{
         MAX_AGENT_TOOL_CALLS_PER_STEP, MAX_AGENT_TOOL_CALLS_PER_TURN, MAX_AGENT_TOOL_DURATION,
         MAX_AGENT_TOOL_RESULT_BYTES, MAX_AGENT_TOOL_RESULTS_PER_TURN_BYTES,
         MAX_AGENT_TURN_DURATION, ToolExecutionFuture, ToolExecutionRequest, ToolExecutionResult,
-        ToolExecutor, ToolExecutorError, ToolShutdownFuture, TurnProposal,
+        ToolExecutor, ToolExecutorError, ToolPreparation, ToolPreparationFuture,
+        ToolShutdownFuture, TurnProposal,
     },
     model::{
         ContentBlock, ContentBlockKind, ContentBlockType, FinishReason, LlmCallConfig,
@@ -28,8 +29,8 @@ use deepseek_harness_cli::{
         ProviderStreamError, RetryBackoff, RetryPolicy,
     },
     session::{
-        Clock, ClockError, EventKind, MAX_SESSION_EVENTS, RequestHeaderReason, Session,
-        TurnEndReason, UnixMillis,
+        Clock, ClockError, EventKind, MAX_SESSION_EVENTS, RequestHeaderReason, Session, TodoItem,
+        TodoStatus, TurnEndReason, UnixMillis,
     },
 };
 use futures_util::stream;
@@ -325,6 +326,10 @@ struct CancellingTools {
     calls: Mutex<Vec<String>>,
 }
 
+struct CancellingTodoTools {
+    turn: CancellationToken,
+}
+
 struct CleanupOnCancelTools {
     turn: CancellationToken,
     cleaned: Arc<AtomicBool>,
@@ -553,6 +558,39 @@ impl ToolExecutor for CancellingTools {
             calls.lock().unwrap().push(call_id);
             turn.cancel();
             std::future::pending().await
+        })
+    }
+}
+
+impl ToolExecutor for CancellingTodoTools {
+    fn execute(
+        &self,
+        _request: ToolExecutionRequest,
+        _cancel: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        Box::pin(async { Err(ToolExecutorError::new("todo preparation required")) })
+    }
+
+    fn prepare(
+        &self,
+        _request: ToolExecutionRequest,
+        _cancel: CancellationToken,
+    ) -> ToolPreparationFuture<'_> {
+        let turn = self.turn.clone();
+        Box::pin(async move {
+            turn.cancel();
+            let result = ToolExecutionResult::success(vec![
+                ContentBlock::text("Updated todo list: 0 pending, 1 in progress, 0 completed.")
+                    .unwrap(),
+            ])
+            .map_err(|error| ToolExecutorError::new(error.to_string()))?;
+            Ok(ToolPreparation::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "must not commit".to_owned(),
+                    status: TodoStatus::InProgress,
+                }],
+                result,
+            })
         })
     }
 }
@@ -1187,6 +1225,23 @@ fn config() -> AgentLoopConfig {
         "calculator",
         "adds numbers",
         deepseek_harness_cli::model::JsonValue::new(json!({"type":"object"})).unwrap(),
+    )
+    .unwrap();
+    AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(vec![schema])
+        .unwrap()
+}
+
+fn todo_config() -> AgentLoopConfig {
+    let schema = ToolSchema::new(
+        "todo_write",
+        "replace the task list",
+        deepseek_harness_cli::model::JsonValue::new(json!({
+            "type": "object",
+            "properties": {"todos": {"type": "array"}},
+            "required": ["todos"]
+        }))
+        .unwrap(),
     )
     .unwrap();
     AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
@@ -2525,6 +2580,47 @@ async fn cancelling_one_of_multiple_tools_pairs_every_call_without_later_side_ef
             if error.code == "ABORTED_BEFORE_DISPATCH"
                 && error.name == "AbortError"
     )));
+    assert!(agent.session().events().iter().any(|event| matches!(
+        event.kind(),
+        EventKind::ToolResult { error: Some(error), .. }
+            if error.code == "ABORTED" && error.name == "AbortError"
+    )));
+    assert_eq!(agent.session().state().open_turn(), None);
+}
+
+#[tokio::test]
+async fn cancellation_between_todo_preparation_and_commit_never_writes_the_snapshot() {
+    let cancellation = CancellationToken::new();
+    let tools = Arc::new(CancellingTodoTools {
+        turn: cancellation.clone(),
+    });
+    let provider = Arc::new(FakeProvider::new(vec![named_tool_response("todo_write")]));
+    let mut agent = AgentLoop::with_runtime(
+        session("todo-cancel-before-commit"),
+        provider,
+        tools,
+        Arc::new(FixedRuntime::default()),
+        todo_config(),
+    )
+    .unwrap();
+
+    let outcome = agent
+        .run_turn(
+            TurnProposal::Enter(vec![user("track this work")]),
+            cancellation,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome.reason(), TurnEndReason::Aborted { .. }));
+    assert!(
+        !agent
+            .session()
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind(), EventKind::TodoWrite { .. }))
+    );
+    assert!(agent.session().state().standing_todos().is_none());
     assert!(agent.session().events().iter().any(|event| matches!(
         event.kind(),
         EventKind::ToolResult { error: Some(error), .. }

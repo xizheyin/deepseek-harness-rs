@@ -16,8 +16,8 @@ use crate::model::{ContentBlockKind, ContextForm, MessageSourceKind, StreamChunk
 
 use super::{
     ApprovalOutcome, ApprovalRequestId, CompactionEndError, CompactionTrigger, EventKind, EventSeq,
-    RetryNumber, SessionEvent, StepId, SurfaceOp, ToolFailure, TurnEndCancelCause, TurnEndReason,
-    TurnId, UnixMillis,
+    RetryNumber, SessionEvent, StepId, SurfaceOp, TodoItem, ToolFailure, TurnEndCancelCause,
+    TurnEndReason, TurnId, UnixMillis,
 };
 
 const SOURCE_BITMAP_WORDS: usize = 64;
@@ -103,6 +103,9 @@ pub(crate) enum CommittedUiKind {
         content: UiOpaquePayload,
         meta: UiOpaquePayload,
         surface_replacement_target: Option<EventSeq>,
+    },
+    TodoWrite {
+        todos: Vec<TodoItem>,
     },
     RequestContextChanged {
         provider: Option<UiIdentity>,
@@ -273,6 +276,10 @@ impl fmt::Debug for CommittedUiKind {
                 .field("content", content)
                 .field("meta", meta)
                 .field("surface_replacement_target", surface_replacement_target)
+                .finish(),
+            Self::TodoWrite { todos } => formatter
+                .debug_struct("TodoWrite")
+                .field("todo_count", &todos.len())
                 .finish(),
             Self::RequestContextChanged {
                 provider,
@@ -1062,8 +1069,8 @@ impl CommittedUiEvent {
                 source: project_user_source(message.source().kind())?,
                 content: message_text_payload(message.content())?,
             },
-            EventKind::TodoWrite { .. } => CommittedUiKind::TypeOnly {
-                event_type: "todo/write",
+            EventKind::TodoWrite { todos } => CommittedUiKind::TodoWrite {
+                todos: project_todos(todos)?,
             },
             EventKind::GoalChange { .. } => CommittedUiKind::TypeOnly {
                 event_type: "goal/change",
@@ -1147,6 +1154,20 @@ fn project_tool_failure(failure: &ToolFailure) -> Result<UiToolFailure, UiProjec
         name: try_ui_text(&failure.name)?,
         code: try_ui_text(&failure.code)?,
     })
+}
+
+fn project_todos(todos: &[TodoItem]) -> Result<Vec<TodoItem>, UiProjectionError> {
+    let mut projected = Vec::new();
+    projected
+        .try_reserve_exact(todos.len())
+        .map_err(|_| UiProjectionError)?;
+    for todo in todos {
+        projected.push(TodoItem {
+            content: try_copy(&todo.content)?,
+            status: todo.status,
+        });
+    }
+    Ok(projected)
 }
 
 fn project_user_source(source: &MessageSourceKind) -> Result<UiUserSource, UiProjectionError> {

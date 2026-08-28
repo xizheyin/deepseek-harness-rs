@@ -3014,6 +3014,49 @@ async fn commit_tool_round(
                     AgentLoopError::Invariant("approved Plan Mode exit was not installable")
                 })?;
             }
+            ToolRun::TodoWrite { todos, result } => {
+                if cancellation.is_cancelled() || Instant::now() >= driver.deadline {
+                    let (code, message) = if cancellation.is_cancelled() {
+                        (
+                            "ABORTED",
+                            "Todo update was cancelled before it was committed",
+                        )
+                    } else {
+                        (
+                            "AGENT_TURN_TIMEOUT",
+                            "Todo update was not committed because the turn timed out",
+                        )
+                    };
+                    settle_model_error(reservation, plan, turn, step, code, message).await?;
+                    if cancellation.is_cancelled() {
+                        cancelled = true;
+                        latched_stop = latch_tool_stop(latched_stop, ToolStop::Cancelled);
+                    } else {
+                        infrastructure_failure = Some(failure_reason(
+                            "AGENT_TURN_TIMEOUT",
+                            "the agent turn timed out",
+                        )?);
+                        latched_stop = latch_tool_stop(latched_stop, ToolStop::TurnTimeout);
+                    }
+                    continue;
+                }
+                reservation
+                    .append_settled(NewEvent::log(EventKind::TodoWrite { todos }))
+                    .await?;
+                let committed = settle_tool_result(
+                    reservation,
+                    driver,
+                    plan,
+                    result,
+                    ResultSettlement::PreferredRequired,
+                )
+                .await?;
+                if !committed {
+                    return Err(AgentLoopError::Invariant(
+                        "Todo update result used its fallback",
+                    ));
+                }
+            }
             ToolRun::Mutation(mutation) => {
                 let resolved =
                     resolve_mutation(reservation, driver, plan, mutation, cancellation).await?;
@@ -3358,6 +3401,10 @@ enum ToolRun {
         exit: crate::plan_mode::PreparedPlanExit,
         result: ToolExecutionResult,
     },
+    TodoWrite {
+        todos: Vec<crate::session::TodoItem>,
+        result: ToolExecutionResult,
+    },
     Mutation(PreparedToolMutation),
     Action(PreparedToolActionSetup),
     ModelError {
@@ -3553,6 +3600,15 @@ async fn run_one_tool(
                         }
                     } else {
                         ToolRun::PlanExit { exit, result }
+                    }
+                }
+                Ok(Ok(ToolPreparation::TodoWrite { todos, result })) => {
+                    if plan.claim_profile.is_owned_action() {
+                        ToolRun::Infrastructure {
+                            stop: ToolStop::None,
+                        }
+                    } else {
+                        ToolRun::TodoWrite { todos, result }
                     }
                 }
                 Ok(Ok(ToolPreparation::Mutation(mutation))) => {

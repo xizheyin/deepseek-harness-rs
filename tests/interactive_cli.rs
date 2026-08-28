@@ -2898,6 +2898,98 @@ fn linear_plan_command_enters_sends_and_manually_exits_without_escape_bytes() {
 }
 
 #[test]
+fn todo_write_updates_the_enhanced_standing_plan_in_durable_order() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-todo",
+            "todo_write",
+            serde_json::json!({
+                "todos": [
+                    { "content": "inspect code", "status": "in_progress" },
+                    { "content": "run focused tests", "status": "pending" }
+                ]
+            }),
+        ),
+        text_sse("The task list is recorded."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"track this work\r");
+    dsh.expect(b"Tasks  1 in progress \xc2\xb7 1 pending");
+    dsh.expect(b"inspect code");
+    dsh.expect(b"The task list is recorded.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_message_content(&requests[1], "call-todo"),
+        "Updated todo list: 1 pending, 1 in progress, 0 completed."
+    );
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let journal = std::fs::read_to_string(entry.path()).unwrap();
+    let event_types = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|row| row["type"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    assert!(
+        event_types
+            .windows(3)
+            .any(|window| { window == ["tool/call", "todo/write", "tool/result"] })
+    );
+}
+
+#[test]
+fn todo_write_prints_the_complete_bounded_list_in_zero_escape_linear_mode() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-todo-linear",
+            "todo_write",
+            serde_json::json!({
+                "todos": [
+                    { "content": "inspect code", "status": "completed" },
+                    { "content": "write fix", "status": "in_progress" },
+                    { "content": "run checks", "status": "pending" }
+                ]
+            }),
+        ),
+        text_sse("Linear Todo finished."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"show tasks in linear mode\r");
+    dsh.expect(b"[tasks updated]");
+    dsh.expect(b"[x] inspect code");
+    dsh.expect(b"[~] write fix");
+    dsh.expect(b"[ ] run checks");
+    dsh.expect(b"assistant | Linear Todo finished.");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert!(!transcript.contains(&0x1b));
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
 fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
     let first_server = SequenceSseServer::start(vec![

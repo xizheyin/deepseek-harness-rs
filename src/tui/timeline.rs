@@ -441,6 +441,7 @@ fn display_tool_name(tool: &ToolActivity) -> &str {
         "read" => "Read",
         "apply_patch" => "Patch",
         "bash" => "Command",
+        "todo_write" => "Tasks",
         name => name,
     }
 }

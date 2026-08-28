@@ -3,9 +3,9 @@ use std::{fmt, fmt::Write as _, sync::Arc};
 use thiserror::Error;
 
 use crate::session::{
-    ApprovalOutcome, CommittedUiEvent, CommittedUiKind, EventSeq, SourceSeqBitmap,
-    TurnEndCancelCause, TurnEndReason, UiAssistantBlockKind, UiAssistantContent, UiIdentity,
-    UiTurnEndCancelCause, UiTurnEndReason,
+    ApprovalOutcome, CommittedUiEvent, CommittedUiKind, EventSeq, SourceSeqBitmap, TodoItem,
+    TodoStatus, TurnEndCancelCause, TurnEndReason, UiAssistantBlockKind, UiAssistantContent,
+    UiIdentity, UiTurnEndCancelCause, UiTurnEndReason,
 };
 use crate::tui::{
     approval_preview::present_canonical_patch,
@@ -59,6 +59,7 @@ pub(super) struct LiveUpdate {
     pub(super) lifecycle: LiveLifecycle,
     enhanced_frame: EnhancedFrame,
     dock_notice: DockNoticeUpdate,
+    dock_context_changed: bool,
 }
 
 #[derive(Debug)]
@@ -114,6 +115,10 @@ impl LiveUpdate {
                 changed
             }
         }
+    }
+
+    pub(super) fn take_dock_context_changed(&mut self) -> bool {
+        std::mem::take(&mut self.dock_context_changed)
     }
 }
 
@@ -1234,6 +1239,8 @@ pub(super) struct LiveRenderer {
     semantic: UiProjector,
     views: ViewArchive,
     turn_end: Option<TurnEndAnchor>,
+    standing_todos: Option<Vec<TodoItem>>,
+    todo_summary: Option<String>,
 }
 
 struct TurnEndAnchor {
@@ -1274,7 +1281,49 @@ impl LiveRenderer {
             semantic: UiProjector::default(),
             views: ViewArchive::new(resumed_live_seam),
             turn_end: None,
+            standing_todos: None,
+            todo_summary: None,
         }
+    }
+
+    pub(super) fn restore_standing_todos(
+        &mut self,
+        todos: Option<&[TodoItem]>,
+    ) -> Result<(), LiveRenderError> {
+        let Some(todos) = todos else {
+            self.standing_todos = None;
+            self.todo_summary = None;
+            return Ok(());
+        };
+        let mut restored = Vec::new();
+        restored
+            .try_reserve_exact(todos.len())
+            .map_err(|_| LiveRenderError)?;
+        for todo in todos {
+            restored.push(TodoItem {
+                content: copy_frame_text(&todo.content)?,
+                status: todo.status,
+            });
+        }
+        self.install_todos(restored)
+    }
+
+    pub(super) fn todo_summary(&self) -> Option<&str> {
+        self.todo_summary.as_deref()
+    }
+
+    pub(super) fn standing_todo_frame(&self) -> Result<Option<LiveFrame>, LiveRenderError> {
+        self.standing_todos
+            .as_deref()
+            .filter(|todos| !todos.is_empty())
+            .map(todo_list_frame)
+            .transpose()
+    }
+
+    fn install_todos(&mut self, todos: Vec<TodoItem>) -> Result<(), LiveRenderError> {
+        self.todo_summary = todo_summary(&todos)?;
+        self.standing_todos = Some(todos);
+        Ok(())
     }
 
     pub(super) fn set_context_estimate(&mut self, estimate: Option<ContextEstimate>) {
@@ -1366,10 +1415,13 @@ impl LiveRenderer {
         let mut lifecycle = LiveLifecycle::None;
         let mut enhanced_frame = EnhancedFrame::Same;
         let mut dock_notice = DockNoticeUpdate::Keep;
+        let mut dock_context_changed = false;
         let frame = match event.kind {
             CommittedUiKind::TurnStart { turn } => {
                 let _ = turn;
                 self.turn_end = None;
+                dock_context_changed = self.standing_todos.take().is_some();
+                self.todo_summary = None;
                 enhanced_frame = EnhancedFrame::Suppress;
                 Some(LiveFrame::trusted("[working; press Ctrl+C to stop]\n")?)
             }
@@ -1507,6 +1559,7 @@ impl LiveRenderer {
                         lifecycle: LiveLifecycle::None,
                         enhanced_frame: EnhancedFrame::Suppress,
                         dock_notice: DockNoticeUpdate::Keep,
+                        dock_context_changed: false,
                     });
                 }
                 dock_notice = self
@@ -1565,6 +1618,14 @@ impl LiveRenderer {
                     parts.push(LivePart::TrustedInline("\n"));
                 }
                 LiveFrame::from_parts(parts)
+            }
+            CommittedUiKind::TodoWrite { todos } => {
+                let frame = todo_list_frame(&todos)?;
+                self.install_todos(todos)?;
+                enhanced_frame = EnhancedFrame::Suppress;
+                dock_notice = DockNoticeUpdate::Clear;
+                dock_context_changed = true;
+                Some(frame)
             }
             CommittedUiKind::RequestContextChanged {
                 provider,
@@ -1676,6 +1737,7 @@ impl LiveRenderer {
             lifecycle,
             enhanced_frame,
             dock_notice,
+            dock_context_changed,
         })
     }
 
@@ -2038,6 +2100,74 @@ fn tool_card_frame(view: &ToolCardView) -> Result<LiveFrame, LiveRenderError> {
     Ok(LiveFrame { parts })
 }
 
+fn todo_summary(todos: &[TodoItem]) -> Result<Option<String>, LiveRenderError> {
+    if todos.is_empty() {
+        return Ok(None);
+    }
+    let completed = todos
+        .iter()
+        .filter(|todo| todo.status == TodoStatus::Completed)
+        .count();
+    let active = todos
+        .iter()
+        .filter(|todo| todo.status == TodoStatus::InProgress)
+        .count();
+    let pending = todos.len().saturating_sub(completed).saturating_sub(active);
+    let active_content = todos
+        .iter()
+        .find(|todo| todo.status == TodoStatus::InProgress)
+        .map(|todo| todo.content.as_str());
+    let mut summary = String::new();
+    summary
+        .try_reserve_exact(128 + active_content.map_or(0, str::len))
+        .map_err(|_| LiveRenderError)?;
+    summary.push_str("Tasks  ");
+    let mut separator = "";
+    for (count, label) in [
+        (completed, "completed"),
+        (active, "in progress"),
+        (pending, "pending"),
+    ] {
+        if count != 0 {
+            write!(&mut summary, "{separator}{count} {label}").map_err(|_| LiveRenderError)?;
+            separator = " · ";
+        }
+    }
+    if let Some(content) = active_content {
+        summary.push_str("  —  ");
+        summary.push_str(content);
+    }
+    Ok(Some(summary))
+}
+
+fn todo_list_frame(todos: &[TodoItem]) -> Result<LiveFrame, LiveRenderError> {
+    let mut parts = try_parts(todos.len().saturating_add(1))?;
+    if todos.is_empty() {
+        parts.push(LivePart::TrustedLine("[tasks cleared]\n"));
+        return Ok(LiveFrame { parts });
+    }
+    parts.push(LivePart::TrustedLine("[tasks updated]\n"));
+    for todo in todos {
+        let marker = match todo.status {
+            TodoStatus::Pending => "[ ]",
+            TodoStatus::InProgress => "[~]",
+            TodoStatus::Completed => "[x]",
+        };
+        let mut line = String::new();
+        line.try_reserve_exact(marker.len() + 1 + todo.content.len() + 1)
+            .map_err(|_| LiveRenderError)?;
+        line.push_str(marker);
+        line.push(' ');
+        line.push_str(&todo.content);
+        line.push('\n');
+        parts.push(LivePart::UntrustedStyled {
+            style: TextStyle::Plain,
+            text: line,
+        });
+    }
+    Ok(LiveFrame { parts })
+}
+
 fn tool_activity_notice(
     tool: &crate::tui::projector::ToolActivity,
 ) -> Result<String, LiveRenderError> {
@@ -2048,6 +2178,7 @@ fn tool_activity_notice(
         "read" => "Requested  Read",
         "apply_patch" => "Requested  Patch",
         "bash" => "Requested  Command",
+        "todo_write" => "Requested  Tasks",
         _ => "Tool requested",
     };
     let mut notice = String::new();
@@ -2082,6 +2213,7 @@ fn tool_approved_notice(
         "read" => "Read",
         "apply_patch" => "Patch",
         "bash" => "Command",
+        "todo_write" => "Tasks",
         _ => "Tool",
     };
     copy_frame_text(&format!("Approved; awaiting result  {label}"))
@@ -2362,9 +2494,9 @@ mod tests {
     use crate::model::{CallId, LlmFailure};
     use crate::session::{
         ApprovalRequestId, CommittedUiEvent, CommittedUiKind, EventSeq, RetryNumber,
-        SourceSeqBitmap, StepId, TurnEndReason, TurnId, UiAssistantBlock, UiAssistantBlockKind,
-        UiAssistantContent, UiIdentity, UiOpaquePayload, UiToolFailure, UiTurnEndReason,
-        UnixMillis,
+        SourceSeqBitmap, StepId, TodoItem, TodoStatus, TurnEndReason, TurnId, UiAssistantBlock,
+        UiAssistantBlockKind, UiAssistantContent, UiIdentity, UiOpaquePayload, UiToolFailure,
+        UiTurnEndReason, UnixMillis,
     };
     use crate::tui::presentation::{PresentedItem, TextStyle};
 
@@ -2963,6 +3095,55 @@ mod tests {
             ))
             .unwrap();
         assert!(enhanced_text(end.take_frame(true).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn standing_todos_restore_replace_and_clear_at_the_next_turn() {
+        let mut renderer = LiveRenderer::new();
+        renderer
+            .restore_standing_todos(Some(&[TodoItem {
+                content: "resume investigation".to_owned(),
+                status: TodoStatus::InProgress,
+            }]))
+            .unwrap();
+        assert_eq!(
+            renderer.todo_summary(),
+            Some("Tasks  1 in progress  —  resume investigation")
+        );
+        let restored = enhanced_text(renderer.standing_todo_frame().unwrap().unwrap());
+        assert!(restored.contains("[~] resume investigation"));
+
+        let turn = TurnId::new(1).unwrap();
+        let mut replacement = renderer
+            .consume(event(
+                1,
+                CommittedUiKind::TodoWrite {
+                    todos: vec![
+                        TodoItem {
+                            content: "resume investigation".to_owned(),
+                            status: TodoStatus::Completed,
+                        },
+                        TodoItem {
+                            content: "write fix".to_owned(),
+                            status: TodoStatus::Pending,
+                        },
+                    ],
+                },
+            ))
+            .unwrap();
+        assert!(replacement.take_frame(true).is_none());
+        assert!(replacement.take_dock_context_changed());
+        assert_eq!(
+            renderer.todo_summary(),
+            Some("Tasks  1 completed · 1 pending")
+        );
+
+        let mut start = renderer
+            .consume(event(2, CommittedUiKind::TurnStart { turn }))
+            .unwrap();
+        assert!(start.take_dock_context_changed());
+        assert!(renderer.todo_summary().is_none());
+        assert!(renderer.standing_todo_frame().unwrap().is_none());
     }
 
     #[test]

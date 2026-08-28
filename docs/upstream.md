@@ -1619,6 +1619,32 @@ command-settlement and image-bearing `/plan` support. Rust Phase 23 follows the
 fixed contract and records the terminal/image/active-steering differences in
 `docs/design/plan-mode.md`.
 
+## Phase 24 Todo tool inspection — 2026-08-29
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/todo/tool-todo/src/{index,invariant,types}.ts`, its README, and
+  `tests/{tool-todo,invariant,projection,integration}.spec.ts` for the strict
+  whole-list tool contract, deployment-selected parallel policy, durable
+  invariant, last-value fold, next-turn display lifetime, canonical result,
+  and `tool/call` → `todo/write` → `tool/result` order;
+- `packages/core/session/src/{types,invariant}.ts` and the `todo/write` tests in
+  `packages/core/session/tests/session.spec.ts` for the log-only event shape,
+  cloning/replay behavior, and open-turn requirement;
+- `apps/cli/config/agent-presets/code/agent.cordis.yml` for the official code
+  preset's `allowParallelInProgress: true` choice;
+- `packages/client/ui-conversation/src/client/skeleton/TodoPanel.tsx` and
+  `packages/client/ui-tool/src/client/tool/toolviews/todo-row.tsx` for the
+  collapsed standing-plan counts and specialized tool-row behavior.
+
+Latest `origin/master` `cd5ef8148158c3a752a658978873241fdf8e2bbc`
+preserves the tool schema, validation, canonical text result, event order, and
+next-turn lifetime; its relevant changes move Todo types and projection schema
+ownership without changing observable semantics. Rust Phase 24 selects the
+officially supported single-active configuration because this CLI has no
+parallel product workers, and records its extra resource bounds in
+`docs/design/todo-tool.md`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–23 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–24 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -31,6 +31,7 @@ for behavior that users can run today.
 | 21 | Per-question skip in bounded question batches | `complete` | [`validation/phase-21.md`](validation/phase-21.md) |
 | 22 | Draft-preserving user-question pager | `complete` | [`validation/phase-22.md`](validation/phase-22.md) |
 | 23 | Durable terminal Plan Mode and reviewed exit | `complete` | [`validation/phase-23.md`](validation/phase-23.md) |
+| 24 | Durable model Todo list and terminal standing plan | `complete` | [`validation/phase-24.md`](validation/phase-24.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -338,6 +339,24 @@ pipelines. The Rust terminal does not copy the Web card: it renders the exact
 bounded plan through the existing trusted/untrusted terminal projection and
 uses the existing question answerer. Image attachments and runtime-owned
 subagents remain unavailable. Acceptance is local-only and focused as requested.
+
+## Phase 24 Todo boundary (2026-08-29)
+
+Phase 24 closes the existing half-built Todo gap: the Session already knows the
+official `todo/write` event, but no production model tool can create it. The
+phase adds the fixed upstream `todo_write` whole-list contract, strict bounded
+input, `tool/call` → `todo/write` → `tool/result` ordering, last-write-wins
+recovery, and a terminal standing-plan summary that clears on the next
+`turn/start` without deleting history.
+
+The Rust Agent executes one foreground action at a time and has no product
+subagents or background jobs, so it enforces at most one `in_progress` item.
+This is the upstream tool's supported single-active configuration, although
+the official code preset currently selects parallel mode. Todo writes affect
+only Session/UI state, need no filesystem/Shell approval, and cannot bypass the
+existing tool, cancellation, result, or persistence pipeline. Input is capped
+at 64 items and 512 UTF-8 bytes per trimmed line. Acceptance remains local-only
+and focused as requested.
 
 ## Still deferred
 

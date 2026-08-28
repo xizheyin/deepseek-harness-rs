@@ -94,6 +94,8 @@ pub enum TransitionError {
     },
     #[error("{event_type} requires an open turn")]
     EventOutsideTurn { event_type: &'static str },
+    #[error("todo/write carries an invalid whole-list snapshot")]
+    InvalidTodoSnapshot,
     #[error("tool/result for {call_id} has no prior tool/call in this step")]
     MissingToolCall { call_id: CallId },
     #[error("llm/retry names provider {actual:?}, but the open request uses {expected:?}")]

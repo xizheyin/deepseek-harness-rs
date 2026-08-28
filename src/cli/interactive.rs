@@ -303,6 +303,8 @@ async fn run_enhanced(
     } = assembly;
     let mut file_suggestions = FileSuggestionController::new(file_suggestions);
     let mut live = LiveRenderer::for_session(resumed);
+    live.restore_standing_todos(agent.session().state().standing_todos())
+        .map_err(|_| InteractiveError::Output)?;
     live.set_context_estimate(session_context_estimate(agent.session(), None, None));
     let mut presenter = InteractivePresenter::with_color(true);
     let mut enhanced_presenter = EnhancedPresenter::new();
@@ -2125,6 +2127,7 @@ fn enhanced_surface_frame_for_request(
     file_suggestions: FileSuggestionSnapshot<'_>,
     working: WorkingPresentation,
 ) -> Result<EnhancedSurface, InteractiveError> {
+    let notice = notice.or_else(|| live.todo_summary());
     let working = normalize_working_presentation(working, motion.preference());
     match request.mode() {
         ViewMode::Focus => Ok(EnhancedSurface {
@@ -2477,6 +2480,8 @@ async fn run_linear(
         plan_mode,
     } = assembly;
     let mut live = LiveRenderer::for_session(resumed);
+    live.restore_standing_todos(agent.session().state().standing_todos())
+        .map_err(|_| InteractiveError::Output)?;
     live.set_context_estimate(session_context_estimate(agent.session(), None, None));
     let mut presenter = InteractivePresenter::with_color(color);
     let mut parser = CanonicalRecordParser::new(MAX_INTERACTIVE_PROMPT_BYTES);
@@ -2488,6 +2493,16 @@ async fn run_linear(
         if let Some(signal) = write_frame(banner, &mut presenter, &terminal, signals).await? {
             if let Some(signal) = handle_idle_signal(signal, &terminal, signals).await? {
                 return Ok(InteractiveExit::Signal(signal));
+            }
+        }
+        if let Some(frame) = live
+            .standing_todo_frame()
+            .map_err(|_| InteractiveError::Output)?
+        {
+            if let Some(signal) = write_frame(frame, &mut presenter, &terminal, signals).await? {
+                if let Some(signal) = handle_idle_signal(signal, &terminal, signals).await? {
+                    return Ok(InteractiveExit::Signal(signal));
+                }
             }
         }
 
@@ -3735,7 +3750,8 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     approval_inactive: approval_ui.is_inactive(),
                     no_question: active.joins.question().is_none() && !question_ui.is_active(),
                     focus: dock.view.requested().mode() == ViewMode::Focus,
-                    no_notice: active.queue_notice.as_deref().is_none_or(|notice| notice.is_none()),
+                    no_notice: active.queue_notice.as_deref().is_none_or(|notice| notice.is_none())
+                        && active.live.todo_summary().is_none(),
                     queue_empty: input.queue().len() == 0,
                     file_hidden: !file_snapshot.is_visible(),
                     palette_hidden: !palette_snapshot.is_visible(),
@@ -5970,11 +5986,15 @@ fn process_event(
         }
     }
     if targets.render_committed_prompt {
+        let mut redraw_dock = update.take_dock_context_changed();
         if let Some(notice) = targets.dock_notice.as_deref_mut() {
             if update.apply_dock_notice(notice) {
-                if let Some(redraw) = targets.dock_redraw_requested.as_deref_mut() {
-                    *redraw = true;
-                }
+                redraw_dock = true;
+            }
+        }
+        if redraw_dock {
+            if let Some(redraw) = targets.dock_redraw_requested.as_deref_mut() {
+                *redraw = true;
             }
         }
         if targets.detail_view_requested {

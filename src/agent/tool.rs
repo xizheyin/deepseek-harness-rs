@@ -8,7 +8,7 @@ use crate::{
     goal::PreparedGoalMutation,
     model::{CallId, ContentBlock, JsonValue, MAX_MESSAGE_CONTENT_BLOCKS, ModelError},
     plan_mode::PreparedPlanExit,
-    session::ToolFailure,
+    session::{TodoItem, ToolFailure},
 };
 
 use super::{
@@ -185,6 +185,10 @@ pub enum ToolPreparation {
         exit: PreparedPlanExit,
         result: ToolExecutionResult,
     },
+    TodoWrite {
+        todos: Vec<TodoItem>,
+        result: ToolExecutionResult,
+    },
     Mutation(PreparedToolMutation),
     Action(PreparedToolActionSetup),
 }
@@ -197,6 +201,11 @@ impl std::fmt::Debug for ToolPreparation {
             Self::PlanExit { exit, result } => formatter
                 .debug_struct("PlanExit")
                 .field("exit", exit)
+                .field("result", result)
+                .finish(),
+            Self::TodoWrite { todos, result } => formatter
+                .debug_struct("TodoWrite")
+                .field("todo_count", &todos.len())
                 .field("result", result)
                 .finish(),
             Self::Mutation(mutation) => formatter.debug_tuple("Mutation").field(mutation).finish(),

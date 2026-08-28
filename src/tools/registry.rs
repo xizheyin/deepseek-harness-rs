@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -11,6 +11,7 @@ use crate::{
     goal::{GoalBlockReason, GoalError, GoalRuntime, GoalUpdate, MAX_GOAL_OBJECTIVE_BYTES},
     model::{ContentBlock, JsonValue, ToolSchema},
     plan_mode::{MAX_PLAN_BYTES, PlanModeRuntime},
+    session::{TodoItem, TodoStatus},
     user_question::{
         MAX_QUESTION_HEADER_BYTES, MAX_QUESTION_ID_BYTES, MAX_QUESTION_OPTION_DESCRIPTION_BYTES,
         MAX_QUESTION_OPTION_LABEL_BYTES, MAX_QUESTION_OPTIONS, MAX_QUESTION_TEXT_BYTES,
@@ -19,6 +20,9 @@ use crate::{
     },
     workspace_authority::WorkspaceAuthority,
 };
+
+const MAX_TODO_ITEMS: usize = 64;
+const MAX_TODO_CONTENT_BYTES: usize = 512;
 
 use super::{
     MAX_TOOL_CONTENT_BYTES,
@@ -325,6 +329,16 @@ impl ToolExecutor for LocalToolRegistry {
                 .into_execution_result()
             });
         }
+        if request.name() == "todo_write" {
+            return Box::pin(async {
+                ToolCallError::model(
+                    "TodoError",
+                    "TODO_PREPARATION_REQUIRED",
+                    "todo_write must use the Agent preparation stage",
+                )
+                .into_execution_result()
+            });
+        }
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
         }
@@ -384,6 +398,9 @@ impl ToolExecutor for LocalToolRegistry {
             if request.name() == "exit_plan_mode" {
                 return prepare_exit_plan_mode(plan_mode, user_questions, &request, cancellation)
                     .await;
+            }
+            if request.name() == "todo_write" {
+                return prepare_todo_write(&request);
             }
             if request.name() == "apply_patch" {
                 return patch::prepare(
@@ -527,6 +544,110 @@ fn normalize_success(text: String) -> Result<ToolExecutionResult, ToolExecutorEr
 
 fn is_goal_tool(name: &str) -> bool {
     matches!(name, "get_goal" | "create_goal" | "update_goal")
+}
+
+fn prepare_todo_write(
+    request: &ToolExecutionRequest,
+) -> Result<ToolPreparation, ToolExecutorError> {
+    let todos = match parse_todo_write_arguments(request.arguments().as_value()) {
+        Ok(todos) => todos,
+        Err(error) => return Ok(ToolPreparation::Complete(error.into_execution_result()?)),
+    };
+    let mut pending = 0_usize;
+    let mut in_progress = 0_usize;
+    let mut completed = 0_usize;
+    for todo in &todos {
+        match todo.status {
+            TodoStatus::Pending => pending += 1,
+            TodoStatus::InProgress => in_progress += 1,
+            TodoStatus::Completed => completed += 1,
+        }
+    }
+    let result = normalize_success(format!(
+        "Updated todo list: {pending} pending, {in_progress} in progress, {completed} completed."
+    ))?;
+    Ok(ToolPreparation::TodoWrite { todos, result })
+}
+
+fn parse_todo_write_arguments(arguments: &serde_json::Value) -> ToolCallResult<Vec<TodoItem>> {
+    let invalid = |message: String| ToolCallError::model("TodoError", "TODO_INVALID", message);
+    let fields = arguments
+        .as_object()
+        .ok_or_else(|| invalid("todo_write arguments must be an object".to_owned()))?;
+    if fields.keys().any(|key| key != "todos") {
+        return Err(invalid(
+            "todo_write received an unknown argument".to_owned(),
+        ));
+    }
+    let raw = fields
+        .get("todos")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid("todos must be an array".to_owned()))?;
+    if raw.len() > MAX_TODO_ITEMS {
+        return Err(invalid(format!(
+            "todo_write accepts at most {MAX_TODO_ITEMS} tasks"
+        )));
+    }
+    let mut todos = Vec::new();
+    todos
+        .try_reserve_exact(raw.len())
+        .map_err(|_| invalid("todo_write could not reserve its bounded task list".to_owned()))?;
+    let mut seen = BTreeSet::new();
+    let mut active = 0_usize;
+    for item in raw {
+        let item = item
+            .as_object()
+            .ok_or_else(|| invalid("todo entries must be objects".to_owned()))?;
+        if item
+            .keys()
+            .any(|key| !matches!(key.as_str(), "content" | "status"))
+        {
+            return Err(invalid("todo entry contains an unknown field".to_owned()));
+        }
+        let content = item
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid("todo content must be a string".to_owned()))?
+            .trim();
+        if content.is_empty() {
+            return Err(invalid(
+                "invalid todo: `content` must be a non-empty string".to_owned(),
+            ));
+        }
+        if content.len() > MAX_TODO_CONTENT_BYTES || content.chars().any(char::is_control) {
+            return Err(invalid(format!(
+                "todo content must be one visible line of at most {MAX_TODO_CONTENT_BYTES} UTF-8 bytes"
+            )));
+        }
+        if !seen.insert(content.to_owned()) {
+            return Err(invalid(format!(
+                "invalid todos: duplicate content {content:?}"
+            )));
+        }
+        let status = match item.get("status").and_then(serde_json::Value::as_str) {
+            Some("pending") => TodoStatus::Pending,
+            Some("in_progress") => {
+                active += 1;
+                TodoStatus::InProgress
+            }
+            Some("completed") => TodoStatus::Completed,
+            _ => {
+                return Err(invalid(
+                    "todo status must be pending, in_progress, or completed".to_owned(),
+                ));
+            }
+        };
+        todos.push(TodoItem {
+            content: content.to_owned(),
+            status,
+        });
+    }
+    if active > 1 {
+        return Err(invalid(format!(
+            "invalid todos: at most one task may be in_progress (got {active})"
+        )));
+    }
+    Ok(todos)
 }
 
 async fn prepare_exit_plan_mode(
@@ -1342,7 +1463,44 @@ fn build_workspace_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> 
             "additionalProperties": false
         }),
     )?);
+    schemas.push(build_todo_write_schema()?);
     Ok(schemas)
+}
+
+fn build_todo_write_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
+    schema(
+        "todo_write",
+        "Record a structured task list for non-trivial work. Send the ENTIRE list every call; it replaces the previous list. Keep AT MOST ONE todo in_progress, mark completed work immediately, and use no in_progress item only when all work is complete.",
+        json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "maxItems": MAX_TODO_ITEMS,
+                    "description": "The complete replacement task list; an empty list clears it.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_TODO_CONTENT_BYTES,
+                                "description": "One short imperative task line"
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"]
+                            }
+                        },
+                        "required": ["content", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["todos"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 fn build_goal_schemas() -> Result<[ToolSchema; 3], ToolRegistryBuildError> {
@@ -1531,22 +1689,95 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        MAX_TOOL_CONTENT_BYTES, build_exit_plan_mode_schema, build_goal_schemas,
+        MAX_TODO_CONTENT_BYTES, MAX_TODO_ITEMS, MAX_TOOL_CONTENT_BYTES,
+        build_exit_plan_mode_schema, build_goal_schemas, build_todo_write_schema,
         build_user_question_schema, dispatch_goal, normalize_success,
-        parse_exit_plan_mode_arguments, parse_user_question_arguments, prepare_exit_plan_mode,
-        prepare_goal, prepare_user_question,
+        parse_exit_plan_mode_arguments, parse_todo_write_arguments, parse_user_question_arguments,
+        prepare_exit_plan_mode, prepare_goal, prepare_todo_write, prepare_user_question,
     };
     use crate::{
         agent::{GoalToolCaller, ToolDispatchBinding, ToolExecutionRequest, ToolPreparation},
         goal::GoalRuntime,
         model::{CallId, ContentBlockKind, JsonValue},
         plan_mode::PlanModeRuntime,
+        session::TodoStatus,
         tools::EMPTY_TEXT_BLOCK_JSON_BYTES,
         user_question::{UserQuestionBroker, UserQuestionResponseItem},
     };
 
     fn goal_request(name: &str, arguments: serde_json::Value) -> ToolExecutionRequest {
         goal_request_as(name, arguments, GoalToolCaller::Untrusted)
+    }
+
+    #[test]
+    fn todo_write_schema_parser_and_result_are_closed_bounded_and_canonical() {
+        let schema = build_todo_write_schema().unwrap();
+        assert_eq!(schema.name(), "todo_write");
+        let parameters = schema.parameters().as_value();
+        assert_eq!(parameters["additionalProperties"], false);
+        assert_eq!(
+            parameters["properties"]["todos"]["maxItems"],
+            MAX_TODO_ITEMS
+        );
+        assert_eq!(
+            parameters["properties"]["todos"]["items"]["properties"]["content"]["maxLength"],
+            MAX_TODO_CONTENT_BYTES
+        );
+
+        let request = goal_request(
+            "todo_write",
+            serde_json::json!({
+                "todos": [
+                    { "content": "  inspect code  ", "status": "completed" },
+                    { "content": "write fix", "status": "in_progress" },
+                    { "content": "run checks", "status": "pending" }
+                ]
+            }),
+        );
+        let ToolPreparation::TodoWrite { todos, result } = prepare_todo_write(&request).unwrap()
+        else {
+            panic!("valid Todo arguments must prepare a durable snapshot")
+        };
+        assert_eq!(todos[0].content, "inspect code");
+        assert_eq!(todos[1].status, TodoStatus::InProgress);
+        let ContentBlockKind::Text { text } = result.content()[0].kind() else {
+            panic!("Todo result must be one text block")
+        };
+        assert_eq!(
+            text,
+            "Updated todo list: 1 pending, 1 in progress, 1 completed."
+        );
+        assert!(parse_todo_write_arguments(&serde_json::json!({ "todos": [] })).is_ok());
+
+        for invalid in [
+            serde_json::json!({ "todos": "no" }),
+            serde_json::json!({ "todos": [{ "content": " ", "status": "pending" }] }),
+            serde_json::json!({ "todos": [
+                { "content": "same", "status": "pending" },
+                { "content": " same ", "status": "completed" }
+            ] }),
+            serde_json::json!({ "todos": [
+                { "content": "one", "status": "in_progress" },
+                { "content": "two", "status": "in_progress" }
+            ] }),
+            serde_json::json!({ "todos": [{ "content": "x", "status": "doing" }] }),
+            serde_json::json!({ "todos": [{ "content": "x", "status": "pending", "id": 1 }] }),
+            serde_json::json!({ "todos": [], "extra": true }),
+            serde_json::json!({
+                "todos": [{
+                    "content": "x".repeat(MAX_TODO_CONTENT_BYTES + 1),
+                    "status": "pending"
+                }]
+            }),
+            serde_json::json!({
+                "todos": (0..=MAX_TODO_ITEMS).map(|index| serde_json::json!({
+                    "content": format!("task {index}"),
+                    "status": "pending"
+                })).collect::<Vec<_>>()
+            }),
+        ] {
+            assert!(parse_todo_write_arguments(&invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

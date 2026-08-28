@@ -103,6 +103,76 @@ fn append_surface(session: &mut Session, kind: EventKind) {
 }
 
 #[test]
+fn todo_snapshots_are_last_write_wins_and_clear_from_standing_state_next_turn() {
+    let mut current = session("todo-standing-plan");
+    append_log(&mut current, EventKind::turn_start(turn(1)));
+    append_log(
+        &mut current,
+        EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: "inspect code".to_owned(),
+                status: TodoStatus::InProgress,
+            }],
+        },
+    );
+    append_log(
+        &mut current,
+        EventKind::TodoWrite {
+            todos: vec![
+                TodoItem {
+                    content: "inspect code".to_owned(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "write fix".to_owned(),
+                    status: TodoStatus::InProgress,
+                },
+            ],
+        },
+    );
+    assert_eq!(
+        current.state().standing_todos(),
+        Some(
+            [
+                TodoItem {
+                    content: "inspect code".to_owned(),
+                    status: TodoStatus::Completed,
+                },
+                TodoItem {
+                    content: "write fix".to_owned(),
+                    status: TodoStatus::InProgress,
+                },
+            ]
+            .as_slice()
+        )
+    );
+    append_log(
+        &mut current,
+        EventKind::turn_end(turn(1), TurnEndReason::Completed),
+    );
+    assert!(current.state().standing_todos().is_some());
+    append_log(&mut current, EventKind::turn_start(turn(2)));
+    assert!(current.state().standing_todos().is_none());
+
+    let mut invalid = session("invalid-todo-snapshot");
+    append_log(&mut invalid, EventKind::turn_start(turn(1)));
+    let error = invalid
+        .append(NewEvent::log(EventKind::TodoWrite {
+            todos: vec![TodoItem {
+                content: " not trimmed ".to_owned(),
+                status: TodoStatus::Pending,
+            }],
+        }))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AppendError::Validation(EventValidationError::Transition(
+            TransitionError::InvalidTodoSnapshot
+        ))
+    ));
+}
+
+#[test]
 fn completed_tool_flow_has_contiguous_events_and_correlated_messages() {
     let mut session = session("complete-tool");
     append_log(&mut session, EventKind::turn_start(turn(1)));

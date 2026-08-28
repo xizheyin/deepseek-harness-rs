@@ -941,6 +941,7 @@ impl ViewArchive {
                 )?;
             }
             CommittedUiKind::AssistantTextDelta { .. } => {}
+            CommittedUiKind::TodoWrite { .. } => {}
             CommittedUiKind::TypeOnly { .. } => {}
         }
         Ok(())

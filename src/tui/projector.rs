@@ -503,6 +503,7 @@ impl UiProjector {
             | CommittedUiKind::StepEnd { .. }
             | CommittedUiKind::AssistantTextDelta { .. }
             | CommittedUiKind::AssistantReasoningDelta { .. }
+            | CommittedUiKind::TodoWrite { .. }
             | CommittedUiKind::RetryStarted { .. } => {}
             CommittedUiKind::TypeOnly { event_type } => {
                 if *event_type == "session/end-seed" {
@@ -1032,6 +1033,24 @@ fn summarize_arguments(
             .unwrap_or("command")
             .to_owned(),
         "apply_patch" => "single-file patch".to_owned(),
+        "todo_write" => {
+            let Some(todos) = fields.get("todos").and_then(Value::as_array) else {
+                return Ok(None);
+            };
+            let completed = todos
+                .iter()
+                .filter(|todo| todo.get("status").and_then(Value::as_str) == Some("completed"))
+                .count();
+            let active = todos.iter().find_map(|todo| {
+                (todo.get("status").and_then(Value::as_str) == Some("in_progress"))
+                    .then(|| todo.get("content").and_then(Value::as_str))
+                    .flatten()
+            });
+            active.map_or_else(
+                || format!("{completed}/{} completed", todos.len()),
+                |content| format!("{completed}/{} completed · {content}", todos.len()),
+            )
+        }
         _ => return Ok(None),
     };
     bounded_summary(&summary).map(Some)

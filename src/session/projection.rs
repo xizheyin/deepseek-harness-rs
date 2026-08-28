@@ -15,7 +15,7 @@ use crate::{
 use super::{
     ApprovalOutcome, ApprovalRequestId, CompactionEndError, CompactionId, CompactionRange,
     CompactionTrigger, EventKind, EventSeq, MAX_SAFE_INTEGER, MAX_SOURCE_EVENT_SEQS, SessionEvent,
-    SessionId, StepId, SurfaceOp, TurnId,
+    SessionId, StepId, SurfaceOp, TodoItem, TurnId,
     attempt_anchor::{
         AttemptDisposition, AttemptError, AttemptProjection, AttemptResidentChange,
         CommittedAttemptFacts, PreparedAttempt, PreparedAttemptChunk, PreparedLiveAttempt,
@@ -299,6 +299,7 @@ pub struct SessionState {
     request_context: Option<super::RequestContext>,
     goal: GoalReplayState,
     plan_mode_active: bool,
+    standing_todos: Option<Arc<Vec<TodoItem>>>,
 }
 
 impl SessionState {
@@ -358,6 +359,11 @@ impl SessionState {
     pub(crate) const fn plan_mode_active(&self) -> bool {
         self.plan_mode_active
     }
+
+    #[must_use]
+    pub fn standing_todos(&self) -> Option<&[TodoItem]> {
+        self.standing_todos.as_deref().map(Vec::as_slice)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -375,6 +381,7 @@ pub(crate) struct Projection {
     request_context_seq: Option<EventSeq>,
     goal: GoalReplayState,
     plan_mode_active: bool,
+    standing_todos: Option<Arc<Vec<TodoItem>>>,
     compaction: CompactionState,
     pending_approvals: Vec<ApprovalRequestId>,
     owned_approval_ids: Arc<BTreeSet<ApprovalRequestId>>,
@@ -618,6 +625,7 @@ impl Projection {
             request_context_seq: None,
             goal: GoalReplayState::default(),
             plan_mode_active: false,
+            standing_todos: None,
             compaction: CompactionState::default(),
             pending_approvals: Vec::new(),
             owned_approval_ids: Arc::new(BTreeSet::new()),
@@ -1065,6 +1073,7 @@ impl Projection {
             request_context: self.request_context.clone(),
             goal: self.goal.clone(),
             plan_mode_active: self.plan_mode_active,
+            standing_todos: self.standing_todos.clone(),
         }
     }
 
@@ -1955,6 +1964,7 @@ impl Projection {
                     turn: *turn,
                     next_step: StepId::first(),
                 };
+                self.standing_todos = None;
             }
             EventKind::TurnEnd { turn, .. } => {
                 let open = self.open_turn();
@@ -2186,12 +2196,14 @@ impl Projection {
                 self.decide_durable_approval(decided)?;
                 self.pending_approvals.remove(index);
             }
-            EventKind::TodoWrite { .. } => {
+            EventKind::TodoWrite { todos } => {
                 if self.open_turn().is_none() {
                     return Err(TransitionError::EventOutsideTurn {
                         event_type: event.kind.event_type_static(),
                     });
                 }
+                validate_todo_snapshot(todos)?;
+                self.standing_todos = Some(Arc::new(todos.clone()));
             }
             EventKind::CompactionStart { .. }
             | EventKind::CompactionSummary { .. }
@@ -3211,6 +3223,19 @@ fn validate_durable_call_identity(id: &CallId, name: &str) -> Result<(), Transit
         return Err(TransitionError::InvalidDurableToolCallIdentity {
             call_id: id.clone(),
         });
+    }
+    Ok(())
+}
+
+fn validate_todo_snapshot(todos: &[TodoItem]) -> Result<(), TransitionError> {
+    let mut seen = BTreeSet::new();
+    for todo in todos {
+        if todo.content.is_empty()
+            || todo.content.trim() != todo.content
+            || !seen.insert(todo.content.as_str())
+        {
+            return Err(TransitionError::InvalidTodoSnapshot);
+        }
     }
     Ok(())
 }
