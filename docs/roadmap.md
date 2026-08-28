@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–35 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–36 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -43,6 +43,7 @@ for behavior that users can run today.
 | 33 | Bounded private Shell output spill files | `complete` | [`validation/phase-33.md`](validation/phase-33.md) |
 | 34 | Fixed-upstream `write` and `edit` file tools | `complete` | [`validation/phase-34.md`](validation/phase-34.md) |
 | 35 | Bounded project-local Skills catalog and loader | `complete` | [`validation/phase-35.md`](validation/phase-35.md) |
+| 36 | Bounded same-workspace persisted-session search | `complete` | [`validation/phase-36.md`](validation/phase-36.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -663,11 +664,45 @@ coverage, one real enhanced-PTY journey, and the normal local Rust gates. No
 public network, real DeepSeek call, remote CI or extra platform matrix is
 required.
 
+## Phase 36 bounded persisted-session search boundary (2026-08-29)
+
+Phase 36 adds the highest-value first slice of the fixed upstream's optional
+session-query tool family: `session_search { query }`. The model can search
+semantic text from normally closed persisted sessions that belong to the exact
+opened workspace, while the current session and journals held by another live
+process remain unavailable. Search is read-only and never resumes, repairs,
+rewrites or replays a historical session.
+
+The query is a literal, Unicode-aware, case-insensitive and whitespace-flexible
+phrase. The schema exposes no path, workspace, result limit, cursor or session
+identifier. Rust scans a bounded number of already private store entries on a
+blocking worker, enforces per-session and aggregate byte budgets plus a fixed
+deadline, checks cancellation between records, and returns at most 20 ranked
+sessions with 240-code-point excerpts. Results are explicitly labelled as
+untrusted historical data and enter the ordinary call-before-result Session
+order without approval.
+
+This first slice deliberately omits the official optional filters, SQLite FTS
+index, live-session corpus, titles, lineage, surface classification,
+`session_event_search`, `session_trace`, `session_event_trace`, and
+`session_event_read`. Rust ranks by phrase occurrence count followed by recent
+event/session time instead of SQLite BM25. These limits make the new path small
+and auditable while still solving the common “find what an earlier session
+already learned” workflow.
+
+Acceptance is local-only: a fixed source-attributed schema/result fixture,
+scanner and store-boundary tests for matching, workspace isolation, busy/current
+exclusion, malformed/oversized input, result/output bounds and cancellation;
+one real CLI two-session journey; and the normal local Rust gates. No public
+network, real model call, remote CI, SQLite dependency or unrelated stress run
+is required.
+
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
 - MCP, Hooks, ambient/remote Skills, subagents, and background jobs
+- LSP, complete session-query/lineage reads, and a persistent derived search index
 - Multiple model providers
 - Untested operating systems or sandbox claims
 - Feature-for-feature or visual copying of Claude Code

@@ -1295,6 +1295,16 @@ impl Projection {
             || (self.pending_approvals.is_empty() && !self.has_pending_durable_call())
     }
 
+    /// Whether a validated unlocked journal needs no append-only closure before
+    /// its semantic text can be treated as completed historical work.
+    pub(crate) fn is_quiescent_for_search(&self) -> bool {
+        matches!(self.boundary, Boundary::Idle)
+            && self.pending_approvals.is_empty()
+            && !self.has_pending_durable_call()
+            && self.compaction.open.is_none()
+            && self.attempt.is_outside_step()
+    }
+
     fn next_compaction_state(
         &self,
         event: &SessionEvent,

@@ -95,6 +95,30 @@ pub(crate) struct SessionMetadata {
     workspace_inode: u64,
 }
 
+/// One workspace-authorized, shared-locked journal opened for a bounded
+/// read-only search. Dropping the value releases the shared lock.
+pub(super) struct SessionSearchCandidate {
+    metadata: SessionMetadata,
+    file: File,
+}
+
+impl SessionSearchCandidate {
+    pub(super) fn metadata(&self) -> &SessionMetadata {
+        &self.metadata
+    }
+
+    pub(super) fn into_file(self) -> File {
+        self.file
+    }
+
+    pub(super) fn file_length(&self) -> Result<u64, StoreError> {
+        self.file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|_| StoreError::Io)
+    }
+}
+
 impl SessionMetadata {
     fn new(
         id: SessionId,
@@ -176,6 +200,36 @@ impl SessionStore {
         list_metadata(root.as_ref(), workspace)
     }
 
+    /// Open normally quiescent journals from one exact workspace for a
+    /// read-only search. Busy files are omitted rather than waited on, so the
+    /// current session and other live dsh processes cannot be observed through
+    /// a moving prefix.
+    pub(super) fn search_candidates(
+        &self,
+        workspace: WorkspaceIdentity,
+        caller: &SessionId,
+    ) -> Result<Vec<SessionSearchCandidate>, StoreError> {
+        let Some(root) = self.root.open_for_listing()? else {
+            return Ok(Vec::new());
+        };
+        let metadata = list_metadata(root.as_ref(), Some(workspace))?;
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(metadata.len())
+            .map_err(|_| StoreError::Limit)?;
+        for metadata in metadata {
+            if metadata.id() == caller {
+                continue;
+            }
+            let filename = canonical_filename(metadata.id())?;
+            let Some(file) = open_search_candidate(root.as_ref(), &filename)? else {
+                continue;
+            };
+            candidates.push(SessionSearchCandidate { metadata, file });
+        }
+        Ok(candidates)
+    }
+
     /// Build a deferred Session. This performs all header checks but creates
     /// no journal until `Session::materialize_if_needed` is awaited.
     pub(crate) fn prepare_new(
@@ -225,6 +279,44 @@ impl SessionStore {
             Box::new(clock),
         )
     }
+}
+
+fn open_search_candidate(root: &Dir, filename: &str) -> Result<Option<File>, StoreError> {
+    let descriptor = match rustix::fs::openat(
+        root,
+        filename,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error)
+            if error == rustix::io::Errno::LOOP
+                || error == rustix::io::Errno::NOTDIR
+                || error == rustix::io::Errno::ACCESS =>
+        {
+            return Err(StoreError::UnsafeRoot);
+        }
+        Err(_) => return Err(StoreError::Io),
+    };
+    let file = File::from(descriptor);
+    validate_opened_journal(&file)?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared) {
+        Ok(()) => {}
+        Err(error)
+            if error == rustix::io::Errno::WOULDBLOCK || error == rustix::io::Errno::AGAIN =>
+        {
+            return Ok(None);
+        }
+        Err(_) => return Err(StoreError::Io),
+    }
+    if !named_journal_still_matches(root, std::ffi::OsStr::new(filename), &file)? {
+        return Ok(None);
+    }
+    Ok(Some(file))
 }
 
 pub(super) enum SessionStorage {

@@ -19,6 +19,7 @@ mod phase7_tests;
 mod projection;
 mod recovery;
 mod resume;
+mod search;
 mod store;
 mod tool_result_pruner;
 
@@ -71,6 +72,14 @@ pub(crate) use recovery::{RecoveryCallReport, RecoveryCompactionStage, RecoveryR
 #[cfg(test)]
 pub(crate) use resume::PreparingResume;
 pub(crate) use resume::RecoveredSession;
+pub(crate) use search::{
+    MAX_SESSION_SEARCH_QUERY_BYTES, SessionSearchError, SessionSearchOutcome, SessionSearchQuery,
+    SessionSearchRuntime,
+};
+#[cfg(test)]
+pub(crate) use search::{
+    MAX_SESSION_SEARCH_RESULTS, MAX_SESSION_SEARCH_SNIPPET_CHARS, SessionSearchHit,
+};
 pub(crate) use tool_result_pruner::{
     ToolResultPruneConfig, ToolResultPruneError, ToolResultPruneOutcome, ValidatedRawReplacement,
     ValidatedRawRow,

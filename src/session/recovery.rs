@@ -384,6 +384,10 @@ impl ColdScan {
         self.ends_with_seed
     }
 
+    pub(super) fn is_quiescent_for_search(&self) -> bool {
+        self.projection.is_quiescent_for_search()
+    }
+
     pub(crate) fn physical_sha256(&self) -> &[u8; 32] {
         &self.physical_sha256
     }
@@ -770,10 +774,25 @@ pub(crate) fn scan_jsonl(
 /// before even one body row is parsed. Resume uses that ordering so a wrong
 /// workspace cannot make dsh inspect or repair unrelated session content.
 pub(crate) fn scan_jsonl_validating_header(
+    reader: impl Read,
+    expected_id: &SessionId,
+    cancelled: &AtomicBool,
+    validate_header: impl FnMut(&SessionHeader, WorkspaceIdentity) -> Result<(), StoreError>,
+) -> Result<ColdScan, StoreError> {
+    scan_jsonl_observing(reader, expected_id, cancelled, validate_header, |_| Ok(()))
+}
+
+/// Run the ordinary strict cold scan while observing each admitted event.
+///
+/// Search uses this seam so retrieval never invents a second, weaker journal
+/// validator. The observer may collect bounded derived facts, but it cannot
+/// change the projection or retain filesystem authority.
+pub(super) fn scan_jsonl_observing(
     mut reader: impl Read,
     expected_id: &SessionId,
     cancelled: &AtomicBool,
     mut validate_header: impl FnMut(&SessionHeader, WorkspaceIdentity) -> Result<(), StoreError>,
+    mut observe_event: impl FnMut(&SessionEvent) -> Result<(), StoreError>,
 ) -> Result<ColdScan, StoreError> {
     let mut digest = Context::new(&SHA256);
     let mut projection =
@@ -905,6 +924,7 @@ pub(crate) fn scan_jsonl_validating_header(
                             },
                             &mut recovery_cursor,
                         )?;
+                        observe_event(&event)?;
                         logical_events = logical_events.checked_add(1).ok_or(StoreError::Limit)?;
                         next_seq = event
                             .seq()

@@ -11,7 +11,7 @@ use crate::{
     goal::{GoalBlockReason, GoalError, GoalRuntime, GoalUpdate, MAX_GOAL_OBJECTIVE_BYTES},
     model::{ContentBlock, JsonValue, ToolSchema},
     plan_mode::{MAX_PLAN_BYTES, PlanModeRuntime},
-    session::{TodoItem, TodoStatus},
+    session::{SessionSearchRuntime, TodoItem, TodoStatus},
     skills::{SKILL_TOOL_NAME, SkillLoadError, SkillRuntime},
     user_question::{
         MAX_QUESTION_HEADER_BYTES, MAX_QUESTION_ID_BYTES, MAX_QUESTION_OPTION_DESCRIPTION_BYTES,
@@ -29,6 +29,7 @@ use super::{
     MAX_TOOL_CONTENT_BYTES,
     arguments::{parse_glob, parse_grep, parse_list, parse_read},
     error::{ToolCallError, ToolCallResult, ToolRegistryBuildError},
+    session_search::{self, SESSION_SEARCH_TOOL_NAME},
     web_fetch::{self, WebFetchProvider},
     web_search::{self, WebSearchProvider},
     workspace::Workspace,
@@ -181,6 +182,22 @@ pub(crate) struct WebToolProviders {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct PluginLaunch {
+    config: PluginConfig,
+    cancellation: CancellationToken,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PluginLaunch {
+    pub(crate) fn new(config: PluginConfig, cancellation: CancellationToken) -> Self {
+        Self {
+            config,
+            cancellation,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl WebToolProviders {
     pub(crate) fn new(
         search: Option<Arc<dyn WebSearchProvider>>,
@@ -203,6 +220,7 @@ pub struct LocalToolRegistry {
     user_questions: Option<UserQuestionBroker>,
     web_search: Option<Arc<dyn WebSearchProvider>>,
     web_fetch: Option<Arc<dyn WebFetchProvider>>,
+    session_search: Option<SessionSearchRuntime>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -227,6 +245,7 @@ impl std::fmt::Debug for LocalToolRegistry {
             .field("user_questions_enabled", &self.user_questions.is_some())
             .field("web_search_enabled", &self.web_search.is_some())
             .field("web_fetch_enabled", &self.web_fetch.is_some())
+            .field("session_search_enabled", &self.session_search.is_some())
             .finish()
     }
 }
@@ -260,6 +279,7 @@ impl LocalToolRegistry {
             None,
             None,
             WebToolProviders::default(),
+            None,
         )
     }
 
@@ -269,6 +289,7 @@ impl LocalToolRegistry {
         plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
         web: WebToolProviders,
+        session_search: Option<SessionSearchRuntime>,
     ) -> Result<Self, ToolRegistryBuildError> {
         let skills = SkillRuntime::from_authority(&authority);
         let workspace = Arc::new(Workspace::from_authority(authority));
@@ -304,6 +325,14 @@ impl LocalToolRegistry {
                 }
             })?);
         }
+        if session_search.is_some() {
+            schemas.push(session_search::schema().map_err(|source| {
+                ToolRegistryBuildError::InvalidSchema {
+                    tool: SESSION_SEARCH_TOOL_NAME,
+                    source,
+                }
+            })?);
+        }
         Ok(Self {
             workspace,
             skills,
@@ -316,22 +345,29 @@ impl LocalToolRegistry {
             user_questions,
             web_search: web.search,
             web_fetch: web.fetch,
+            session_search,
         })
     }
 
     pub(crate) async fn from_authority_with_plugins(
         authority: WorkspaceAuthority,
-        config: PluginConfig,
-        cancellation: CancellationToken,
+        plugin: PluginLaunch,
         goal: Option<GoalRuntime>,
         plan_mode: Option<PlanModeRuntime>,
         user_questions: Option<UserQuestionBroker>,
         web: WebToolProviders,
+        session_search: Option<SessionSearchRuntime>,
     ) -> Result<Self, ToolRegistryBuildError> {
-        let mut registry =
-            Self::from_authority_with_interaction(authority, goal, plan_mode, user_questions, web)?;
+        let mut registry = Self::from_authority_with_interaction(
+            authority,
+            goal,
+            plan_mode,
+            user_questions,
+            web,
+            session_search,
+        )?;
         let plugins = Arc::new(
-            PluginHost::start(config, &registry.schemas, cancellation)
+            PluginHost::start(plugin.config, &registry.schemas, plugin.cancellation)
                 .await
                 .map_err(|error| match error {
                     super::plugin::PluginHostError::Startup { plugin_id } => {
@@ -445,6 +481,12 @@ impl ToolExecutor for LocalToolRegistry {
             let skills = self.skills.clone();
             return Box::pin(async move { dispatch_skill(skills, &request, cancellation).await });
         }
+        if request.name() == SESSION_SEARCH_TOOL_NAME {
+            let runtime = self.session_search.clone();
+            return Box::pin(async move {
+                session_search::execute(runtime, request.arguments().as_value(), cancellation).await
+            });
+        }
         if request.name() == "bash" {
             return Box::pin(async { shell::approval_required_result() });
         }
@@ -511,6 +553,7 @@ impl ToolExecutor for LocalToolRegistry {
         let web_search = self.web_search.clone();
         let web_fetch = self.web_fetch.clone();
         let skills = self.skills.clone();
+        let session_search = self.session_search.clone();
         Box::pin(async move {
             if is_goal_tool(request.name()) {
                 return prepare_goal(goal, &request);
@@ -535,6 +578,15 @@ impl ToolExecutor for LocalToolRegistry {
             }
             if request.name() == SKILL_TOOL_NAME {
                 let result = dispatch_skill(skills, &request, cancellation).await?;
+                return Ok(ToolPreparation::Complete(result));
+            }
+            if request.name() == SESSION_SEARCH_TOOL_NAME {
+                let result = session_search::execute(
+                    session_search,
+                    request.arguments().as_value(),
+                    cancellation,
+                )
+                .await?;
                 return Ok(ToolPreparation::Complete(result));
             }
             if request.name() == "apply_patch" {
@@ -2350,6 +2402,7 @@ mod tests {
                 Some(Arc::new(FakeWebSearch)),
                 Some(Arc::new(FakeWebFetch)),
             ),
+            None,
         )
         .unwrap();
         let schema = registry

@@ -14,6 +14,8 @@ mod process;
 mod read;
 mod registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod session_search;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod shell;
 #[cfg(unix)]
 mod str_replace_editor;
@@ -29,10 +31,10 @@ pub(crate) use plugin::{PluginConfig, PluginConfigError};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use registry::LocalToolRegistry;
 pub use registry::ReadOnlyToolRegistry;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use registry::WebToolProviders;
 #[cfg(unix)]
 pub use registry::WorkspaceToolRegistry;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use registry::{PluginLaunch, WebToolProviders};
 pub(crate) use web_fetch::{
     WEB_FETCH_MAX_URL_BYTES, WebFetchBodyKind, WebFetchFuture, WebFetchProvider,
     WebFetchProviderError, WebFetchResult,

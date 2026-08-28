@@ -1979,6 +1979,54 @@ omits ambient user/custom/bundled/remote providers and direct human `/name`
 injection. The source-attributed fixture therefore supports `partial`, not
 `compatible`.
 
+## Phase 36 persisted-session search inspection — 2026-08-29
+
+Pinned baseline: `47f943859bef60e4160492346772ded9b24f765a`.
+
+Inspected fixed sources and tests:
+
+- `packages/session-query/session-query/src/{extraction,filters,documents,types}.ts`
+  and `tests/{search-helpers,session-query}.spec.ts` for searchable semantic
+  event text, literal Unicode case-insensitive whitespace-flexible matching,
+  surface records and the logical query vocabulary;
+- `packages/session-query/session-query-sqlite/src/{index,query}.ts` and
+  `tests/{query,sqlite}.spec.ts` for 20-result provider pages, the 100-result
+  ceiling, 240-code-point match-centered snippets, phrase-as-data FTS quoting,
+  ranking and stable observation;
+- `packages/session-query/tool-session-query/src/{index,input,operations,presentation,workspace-access}.ts`
+  and its tool/SQLite integration tests for the closed model schemas,
+  caller-workspace authority, caller-session exclusion, internal cursor
+  consumption, cancellation, plain-text presentation and error sanitization.
+
+Observed fixed behavior:
+
+- `session_search` is one of five tools in an opt-in package and is not mounted
+  by shipped host compositions;
+- it searches prior sessions only, derives caller identity from the tool
+  execution context, requires exact target/caller `cwd` equality and never
+  exposes a model-controlled workspace, result limit, cursor or provider page;
+- query text is normalized and treated as a literal phrase rather than FTS
+  syntax, and one strongest event with a bounded plain-text snippet represents
+  each matching session;
+- results include title, lineage/availability facts and best-match metadata,
+  while authorization makes missing and cross-workspace guesses indistinguishable;
+- the search tool is exclusive because it consumes generation-bound provider
+  cursors; cancellation and provider failures cross a model-safe boundary.
+
+Latest reference: fetched `origin/master` at
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. It retains the same five tool names,
+workspace authorization and cursor-free model boundary. The package now has
+larger observation/export and documentation additions; those do not remove the
+fixed behavior but remain outside Phase 36.
+
+Rust Phase 36 implements only the useful `session_search { query }` slice over
+normally closed, current-version local JSONL journals. It uses exact workspace
+device/inode identity, excludes the caller and lock-busy journals, applies
+strict scan/time/result/snippet budgets, and never repairs history. It omits
+filters, titles, live corpus, SQLite, cursors, surface/lineage reads and the
+other four tools, and uses deterministic occurrence/recency ranking. The
+fixture therefore supports `partial`, not `compatible`.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:
