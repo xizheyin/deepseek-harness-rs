@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–40 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–41 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -48,6 +48,7 @@ for behavior that users can run today.
 | 38 | Durable opt-in per-step time context | `complete` | [`validation/phase-38.md`](validation/phase-38.md) |
 | 39 | Bounded exact navigation inside prior Session events | `complete` | [`validation/phase-39.md`](validation/phase-39.md) |
 | 40 | Bounded prior-Session lineage and event relationship traces | `complete` | [`validation/phase-40.md`](validation/phase-40.md) |
+| 41 | Bounded filters for prior-Session and event search | `complete` | [`validation/phase-41.md`](validation/phase-41.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -845,20 +846,46 @@ deadline, wait for their blocking scan to stop after cancellation, are Agent-
 serialized and produce no approval, file write, process or network side
 effect.
 
-Rust does not add live/current-Session reads, titles, filters, cursors, SQLite,
-an index or subagent creation. Acceptance is local-only: fixed-source fixture;
+At this checkpoint Rust did not add live/current-Session reads, titles, filters
+(added in Phase 41), cursors, SQLite, an index or subagent creation. Acceptance
+is local-only: fixed-source fixture;
 schema, lineage, ordering, cycle, replacement, source/derived, authorization,
 corrupt/oversized, cancellation and timeout tests; the real two-process CLI
 journey extended through both trace tools; and the normal local Rust gates. No
 real DeepSeek request, remote CI, public network or extra platform/stress
 matrix is required.
 
+## Phase 41 bounded Session search filter boundary (2026-08-29)
+
+Phase 41 adds the fixed upstream's public filter fields to `session_search` and
+`session_event_search`. The model can narrow old evidence by canonical Session
+id, Session creation time, authorized direct parent/root status, persisted
+availability, event sequence/time, event type and current/shadowed/log-only
+surface before the existing deterministic relevance rank.
+
+Filters are ANDed across fields and ORed within an array. Ranges are inclusive
+and timezone-qualified ISO 8601 bounds retain exact sub-millisecond ordering
+before being mapped onto Rust's integer-millisecond event clock. Empty,
+oversized, malformed, reversed or unknown filters fail before journal reads.
+
+The Phase 36 boundary remains unchanged: only normally closed, strict-valid
+journals from the retained workspace identity are visible. `live`-only
+availability is a valid empty query, guessed/hidden parent ids do not become
+authorized, and no filter grants current-Session, cross-workspace or write
+access. Per-journal, aggregate, result, deadline and cancellation limits remain.
+
+Rust adds explicit array/string caps and does not add the upstream `cwd` field
+because workspace identity is already mandatory. Cursors, titles,
+live-preferred SQLite, indexes and Session export stay deferred. Acceptance is
+local-only: source fixture, parser/filter/rank/authorization/cancellation tests,
+one real filtered two-process CLI journey and the normal local Rust gates.
+
 ## Still deferred
 
 - Web or desktop GUI
 - Cordis/npm plugin compatibility, arbitrary hooks, hot reload, and native dynamic libraries
 - MCP, Hooks, ambient/remote Skills, subagents, and background jobs
-- LSP diagnostics, rename/symbol/call-hierarchy operations, session-query filters/cursors and a persistent derived search index
+- LSP diagnostics, rename/symbol/call-hierarchy operations, session-query cursors and a persistent derived search index
 - Ambient/browser-derived time zones and configurable time-context refresh intervals
 - Multiple model providers
 - Untested operating systems or sandbox claims

@@ -28,6 +28,10 @@ pub(crate) const MAX_SESSION_SEARCH_QUERY_BYTES: usize = 1_024;
 pub(crate) const MAX_SESSION_SEARCH_RESULTS: usize = 20;
 pub(crate) const MAX_SESSION_SEARCH_SNIPPET_CHARS: usize = 240;
 pub(crate) const MAX_SESSION_EVENT_READ_WINDOW: u64 = 50;
+pub(crate) const MAX_SESSION_FILTER_IDS: usize = 128;
+pub(crate) const MAX_SESSION_FILTER_EVENT_TYPES: usize = 64;
+pub(crate) const MAX_SESSION_FILTER_EVENT_TYPE_BYTES: usize = 128;
+pub(crate) const MAX_SESSION_FILTER_TIMESTAMP_BYTES: usize = 64;
 pub(crate) const MAX_SESSION_SEARCH_SESSION_BYTES: u64 = 16 * 1_024 * 1_024;
 pub(crate) const MAX_SESSION_SEARCH_AGGREGATE_BYTES: u64 = 64 * 1_024 * 1_024;
 const SESSION_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -167,11 +171,119 @@ impl SessionSearchOutcome {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum SessionEventSurface {
     Current,
     Shadowed,
     LogOnly,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SessionEventFilters {
+    seq_from: Option<u64>,
+    seq_to: Option<u64>,
+    time_from: Option<i64>,
+    time_to: Option<i64>,
+    event_types: Option<BTreeSet<String>>,
+    surfaces: Option<BTreeSet<SessionEventSurface>>,
+}
+
+impl SessionEventFilters {
+    pub(crate) fn new(
+        seq_from: Option<u64>,
+        seq_to: Option<u64>,
+        time_from: Option<i64>,
+        time_to: Option<i64>,
+        event_types: Option<BTreeSet<String>>,
+        surfaces: Option<BTreeSet<SessionEventSurface>>,
+    ) -> Self {
+        Self {
+            seq_from,
+            seq_to,
+            time_from,
+            time_to,
+            event_types,
+            surfaces,
+        }
+    }
+
+    fn accepts_event(&self, event: &SessionEvent) -> bool {
+        let seq = event.seq().get();
+        let time = event.time().get();
+        self.seq_from.is_none_or(|from| seq >= from)
+            && self.seq_to.is_none_or(|to| seq <= to)
+            && self.time_from.is_none_or(|from| time >= from)
+            && self.time_to.is_none_or(|to| time <= to)
+            && self
+                .event_types
+                .as_ref()
+                .is_none_or(|types| types.contains(event.kind().event_type()))
+    }
+
+    fn accepts_surface(&self, surface: SessionEventSurface) -> bool {
+        self.surfaces
+            .as_ref()
+            .is_none_or(|surfaces| surfaces.contains(&surface))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionSearchFilters {
+    session_ids: Option<BTreeSet<SessionId>>,
+    created_from: Option<i64>,
+    created_to: Option<i64>,
+    parent_session_ids: Option<BTreeSet<SessionId>>,
+    include_root_sessions: bool,
+    include_persisted: bool,
+    event: SessionEventFilters,
+}
+
+impl Default for SessionSearchFilters {
+    fn default() -> Self {
+        Self {
+            session_ids: None,
+            created_from: None,
+            created_to: None,
+            parent_session_ids: None,
+            include_root_sessions: false,
+            include_persisted: true,
+            event: SessionEventFilters::default(),
+        }
+    }
+}
+
+impl SessionSearchFilters {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        session_ids: Option<BTreeSet<SessionId>>,
+        created_from: Option<i64>,
+        created_to: Option<i64>,
+        parent_session_ids: Option<BTreeSet<SessionId>>,
+        include_root_sessions: bool,
+        include_persisted: bool,
+        event: SessionEventFilters,
+    ) -> Self {
+        Self {
+            session_ids,
+            created_from,
+            created_to,
+            parent_session_ids,
+            include_root_sessions,
+            include_persisted,
+            event,
+        }
+    }
+
+    fn accepts_session_identity(&self, id: &SessionId, created_at: i64) -> bool {
+        self.include_persisted
+            && self.session_ids.as_ref().is_none_or(|ids| ids.contains(id))
+            && self.created_from.is_none_or(|from| created_at >= from)
+            && self.created_to.is_none_or(|to| created_at <= to)
+    }
+
+    fn has_parent_filter(&self) -> bool {
+        self.parent_session_ids.is_some() || self.include_root_sessions
+    }
 }
 
 impl std::fmt::Display for SessionEventSurface {
@@ -592,6 +704,7 @@ impl SessionSearchRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn search(
         &self,
         query: SessionSearchQuery,
@@ -606,6 +719,24 @@ impl SessionSearchRuntime {
         .await
     }
 
+    pub(crate) async fn search_filtered(
+        &self,
+        query: SessionSearchQuery,
+        filters: SessionSearchFilters,
+        cancellation: CancellationToken,
+    ) -> Result<SessionSearchOutcome, SessionSearchError> {
+        let store = self.store.clone();
+        let workspace = self.workspace;
+        let caller = self.caller.clone();
+        run_bounded_operation(cancellation, move |cancelled, deadline| {
+            search_filtered_sync(
+                &store, workspace, &caller, &query, &filters, cancelled, deadline,
+            )
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn search_events(
         &self,
         session_id: SessionId,
@@ -618,6 +749,24 @@ impl SessionSearchRuntime {
         run_bounded_operation(cancellation, move |cancelled, deadline| {
             event_search_sync(
                 &store, workspace, &caller, session_id, &query, cancelled, deadline,
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn search_events_filtered(
+        &self,
+        session_id: SessionId,
+        query: SessionSearchQuery,
+        filters: SessionEventFilters,
+        cancellation: CancellationToken,
+    ) -> Result<SessionEventSearchOutcome, SessionSearchError> {
+        let store = self.store.clone();
+        let workspace = self.workspace;
+        let caller = self.caller.clone();
+        run_bounded_operation(cancellation, move |cancelled, deadline| {
+            event_search_filtered_sync(
+                &store, workspace, &caller, session_id, &query, &filters, cancelled, deadline,
             )
         })
         .await
@@ -720,6 +869,7 @@ fn map_join_error(_error: JoinError) -> SessionSearchError {
     SessionSearchError::Unavailable
 }
 
+#[cfg(test)]
 fn search_sync(
     store: &SessionStore,
     workspace: WorkspaceIdentity,
@@ -728,13 +878,43 @@ fn search_sync(
     cancelled: &AtomicBool,
     deadline: Instant,
 ) -> Result<SessionSearchOutcome, SessionSearchError> {
+    search_filtered_sync(
+        store,
+        workspace,
+        caller,
+        query,
+        &SessionSearchFilters::default(),
+        cancelled,
+        deadline,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_filtered_sync(
+    store: &SessionStore,
+    workspace: WorkspaceIdentity,
+    caller: &SessionId,
+    query: &SessionSearchQuery,
+    filters: &SessionSearchFilters,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<SessionSearchOutcome, SessionSearchError> {
     check_stop(cancelled, deadline)?;
+    if !filters.include_persisted {
+        return Ok(SessionSearchOutcome {
+            hits: Vec::new(),
+            result_capped: false,
+            scan_capped: false,
+        });
+    }
     let candidates = store
         .search_candidates(workspace, caller)
         .map_err(map_store_error)?;
-    let mut hits = Vec::new();
-    hits.try_reserve_exact(candidates.len())
+    let mut provisional = Vec::new();
+    provisional
+        .try_reserve_exact(candidates.len())
         .map_err(|_| SessionSearchError::Unavailable)?;
+    let mut valid_session_ids = BTreeSet::new();
     let mut scanned_bytes = 0_u64;
     let mut scan_capped = false;
     for candidate in candidates {
@@ -755,7 +935,7 @@ fn search_sync(
         scanned_bytes = next_total;
         let metadata = candidate.metadata().clone();
         let mut file = candidate.into_file();
-        let mut best = None;
+        let mut candidate_hits = Vec::new();
         let scan = scan_jsonl_observing(
             &mut file,
             metadata.id(),
@@ -768,8 +948,8 @@ fn search_sync(
             },
             |event| {
                 check_stop_store(cancelled, deadline)?;
-                consider_event(&mut best, event, query);
-                Ok(())
+                consider_event_hit(&mut candidate_hits, event, query, &filters.event)
+                    .map_err(|_| StoreError::Limit)
             },
         );
         match scan {
@@ -778,16 +958,25 @@ fn search_sync(
                     && scan.valid_bytes() == length
                     && scan.is_quiescent_for_search() =>
             {
-                if let Some(best) = best {
-                    hits.push(SessionSearchHit {
-                        session_id: metadata.id().clone(),
-                        created_at: metadata.created_at().get(),
-                        event_seq: best.event_seq,
-                        event_type: best.event_type,
-                        event_time: best.event_time,
-                        snippet: best.snippet,
-                        score: best.score,
-                    });
+                valid_session_ids.insert(metadata.id().clone());
+                if !filters.accepts_session_identity(metadata.id(), metadata.created_at().get()) {
+                    continue;
+                }
+                classify_and_filter_hits(&mut candidate_hits, &scan, &filters.event);
+                candidate_hits.sort_by(compare_event_hits);
+                if let Some(best) = candidate_hits.into_iter().next() {
+                    provisional.push((
+                        SessionSearchHit {
+                            session_id: metadata.id().clone(),
+                            created_at: metadata.created_at().get(),
+                            event_seq: best.event_seq,
+                            event_type: best.event_type,
+                            event_time: best.event_time,
+                            snippet: best.snippet,
+                            score: best.score,
+                        },
+                        scan.header().parent_session().cloned(),
+                    ));
                 }
             }
             Ok(_) => {}
@@ -795,6 +984,31 @@ fn search_sync(
             Err(_) => {}
         }
     }
+    let authorized_parents = filters
+        .parent_session_ids
+        .as_ref()
+        .map(|requested| {
+            requested
+                .intersection(&valid_session_ids)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut hits = provisional
+        .into_iter()
+        .filter_map(|(hit, parent)| {
+            if !filters.has_parent_filter()
+                || match parent {
+                    Some(parent) => authorized_parents.contains(&parent),
+                    None => filters.include_root_sessions,
+                }
+            {
+                Some(hit)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
     hits.sort_by(|left, right| {
         right
             .score
@@ -812,6 +1026,7 @@ fn search_sync(
     })
 }
 
+#[cfg(test)]
 fn event_search_sync(
     store: &SessionStore,
     workspace: WorkspaceIdentity,
@@ -821,15 +1036,37 @@ fn event_search_sync(
     cancelled: &AtomicBool,
     deadline: Instant,
 ) -> Result<SessionEventSearchOutcome, SessionSearchError> {
+    event_search_filtered_sync(
+        store,
+        workspace,
+        caller,
+        session_id,
+        query,
+        &SessionEventFilters::default(),
+        cancelled,
+        deadline,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn event_search_filtered_sync(
+    store: &SessionStore,
+    workspace: WorkspaceIdentity,
+    caller: &SessionId,
+    session_id: SessionId,
+    query: &SessionSearchQuery,
+    filters: &SessionEventFilters,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<SessionEventSearchOutcome, SessionSearchError> {
     let candidate = find_target_candidate(store, workspace, caller, &session_id)?;
     check_target_length(&candidate)?;
     let metadata = candidate.metadata().clone();
     let length = candidate.file_length().map_err(map_store_error)?;
     let mut file = candidate.into_file();
     let mut hits = Vec::new();
-    hits.try_reserve_exact(MAX_SESSION_SEARCH_RESULTS + 1)
+    hits.try_reserve_exact(super::MAX_SESSION_EVENTS.min(256))
         .map_err(|_| SessionSearchError::Unavailable)?;
-    let mut match_count = 0_u64;
     let scan = scan_jsonl_observing(
         &mut file,
         &session_id,
@@ -842,8 +1079,7 @@ fn event_search_sync(
         },
         |event| {
             check_stop_store(cancelled, deadline)?;
-            consider_event_hit(&mut hits, &mut match_count, event, query)
-                .map_err(|_| StoreError::Limit)
+            consider_event_hit(&mut hits, event, query, filters).map_err(|_| StoreError::Limit)
         },
     )
     .map_err(|error| map_target_scan_error(error, deadline))?;
@@ -853,22 +1089,14 @@ fn event_search_sync(
     {
         return Err(SessionSearchError::Unavailable);
     }
-    for hit in &mut hits {
-        hit.surface = if !hit.surface_event {
-            SessionEventSurface::LogOnly
-        } else if EventSeq::new(hit.event_seq)
-            .ok()
-            .is_some_and(|seq| scan.current_surface_contains(seq))
-        {
-            SessionEventSurface::Current
-        } else {
-            SessionEventSurface::Shadowed
-        };
-    }
+    classify_and_filter_hits(&mut hits, &scan, filters);
+    hits.sort_by(compare_event_hits);
+    let result_capped = hits.len() > MAX_SESSION_SEARCH_RESULTS;
+    hits.truncate(MAX_SESSION_SEARCH_RESULTS);
     Ok(SessionEventSearchOutcome {
         session_id,
         hits,
-        result_capped: match_count > MAX_SESSION_SEARCH_RESULTS as u64,
+        result_capped,
     })
 }
 
@@ -1254,10 +1482,13 @@ fn map_target_scan_error(error: StoreError, deadline: Instant) -> SessionSearchE
 
 fn consider_event_hit(
     hits: &mut Vec<SessionEventSearchHit>,
-    match_count: &mut u64,
     event: &SessionEvent,
     query: &SessionSearchQuery,
+    filters: &SessionEventFilters,
 ) -> Result<(), ()> {
+    if !filters.accepts_event(event) {
+        return Ok(());
+    }
     let text = extract_event_text(event);
     if text.is_empty() {
         return Ok(());
@@ -1270,7 +1501,6 @@ fn consider_event_hit(
     for _ in matches {
         score = score.saturating_add(1);
     }
-    *match_count = match_count.saturating_add(1);
     hits.try_reserve(1).map_err(|_| ())?;
     hits.push(SessionEventSearchHit {
         event_seq: event.seq().get(),
@@ -1282,9 +1512,27 @@ fn consider_event_hit(
         document_chars: text.chars().count(),
         surface_event: event.surface_op().is_some(),
     });
-    hits.sort_by(compare_event_hits);
-    hits.truncate(MAX_SESSION_SEARCH_RESULTS);
     Ok(())
+}
+
+fn classify_and_filter_hits(
+    hits: &mut Vec<SessionEventSearchHit>,
+    scan: &super::recovery::ColdScan,
+    filters: &SessionEventFilters,
+) {
+    hits.retain_mut(|hit| {
+        hit.surface = if !hit.surface_event {
+            SessionEventSurface::LogOnly
+        } else if EventSeq::new(hit.event_seq)
+            .ok()
+            .is_some_and(|seq| scan.current_surface_contains(seq))
+        {
+            SessionEventSurface::Current
+        } else {
+            SessionEventSurface::Shadowed
+        };
+        filters.accepts_surface(hit.surface)
+    });
 }
 
 fn compare_event_hits(
@@ -1342,14 +1590,14 @@ fn map_store_error(error: StoreError) -> SessionSearchError {
     }
 }
 
+#[cfg(test)]
 struct BestMatch {
     event_seq: u64,
-    event_type: String,
-    event_time: i64,
     snippet: String,
     score: u32,
 }
 
+#[cfg(test)]
 fn consider_event(best: &mut Option<BestMatch>, event: &SessionEvent, query: &SessionSearchQuery) {
     let text = extract_event_text(event);
     if text.is_empty() {
@@ -1370,8 +1618,6 @@ fn consider_event(best: &mut Option<BestMatch>, event: &SessionEvent, query: &Se
     if replace {
         *best = Some(BestMatch {
             event_seq,
-            event_type: event.kind().event_type().to_owned(),
-            event_time: event.time().get(),
             snippet: make_snippet(&text, first.start(), MAX_SESSION_SEARCH_SNIPPET_CHARS),
             score,
         });
@@ -1726,6 +1972,17 @@ mod tests {
             tracing["rustIntentionalDifference"]["lineageCorpusBytes"],
             MAX_SESSION_SEARCH_AGGREGATE_BYTES
         );
+
+        let filters: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/tools/upstream_phase41_session_search_filters.json"
+        ))
+        .unwrap();
+        assert_eq!(filters["semantics"]["betweenFields"], "AND");
+        assert_eq!(filters["rustLimits"]["sessionIds"], MAX_SESSION_FILTER_IDS);
+        assert_eq!(
+            filters["rustLimits"]["eventTypes"],
+            MAX_SESSION_FILTER_EVENT_TYPES
+        );
     }
 
     #[tokio::test]
@@ -1859,6 +2116,230 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_filters_apply_before_ranking_and_authorize_parent_ids() {
+        let root = private_directory("filter-store");
+        let workspace = private_directory("filter-workspace");
+        let other_workspace = private_directory("filter-other-workspace");
+        let authority = WorkspaceAuthority::open(&workspace).unwrap();
+        let other = WorkspaceAuthority::open(&other_workspace).unwrap();
+        let root_id = SessionId::new("session-d15e8400-e29b-41d4-a716-446655440000");
+        let parent_id = SessionId::new("session-e15e8400-e29b-41d4-a716-446655440000");
+        let child_id = SessionId::new("session-f15e8400-e29b-41d4-a716-446655440000");
+        let hidden_parent = SessionId::new("session-025e8400-e29b-41d4-a716-446655440000");
+        let hidden_child = SessionId::new("session-125e8400-e29b-41d4-a716-446655440000");
+        write_filtered_history(
+            &root,
+            &authority,
+            &root_id,
+            1_000,
+            None,
+            "filter root",
+            None,
+        );
+        write_filtered_history(
+            &root,
+            &authority,
+            &parent_id,
+            2_000,
+            Some(&root_id),
+            "filter parent",
+            None,
+        );
+        let (original, current, log_only) = write_filtered_history(
+            &root,
+            &authority,
+            &child_id,
+            3_000,
+            Some(&parent_id),
+            "filter shadowed",
+            Some("filter current filter current"),
+        );
+        write_filtered_history(
+            &root,
+            &other,
+            &hidden_parent,
+            2_500,
+            None,
+            "filter hidden parent",
+            None,
+        );
+        write_filtered_history(
+            &root,
+            &authority,
+            &hidden_child,
+            3_500,
+            Some(&hidden_parent),
+            "filter hidden child",
+            None,
+        );
+        let runtime = SessionSearchRuntime::new(
+            SessionStore::open_existing(&root).unwrap(),
+            authority.identity(),
+            SessionId::new("session-225e8400-e29b-41d4-a716-446655440000"),
+        );
+        let current_only = BTreeSet::from([SessionEventSurface::Current]);
+        let filtered = runtime
+            .search_filtered(
+                SessionSearchQuery::new("filter").unwrap(),
+                SessionSearchFilters::new(
+                    Some(BTreeSet::from([child_id.clone()])),
+                    Some(2_500),
+                    Some(3_500),
+                    Some(BTreeSet::from([parent_id.clone()])),
+                    false,
+                    true,
+                    SessionEventFilters::new(
+                        Some(current),
+                        Some(current),
+                        None,
+                        None,
+                        Some(BTreeSet::from(["user/message".to_owned()])),
+                        Some(current_only.clone()),
+                    ),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filtered.hits().len(), 1);
+        assert_eq!(filtered.hits()[0].session_id(), &child_id);
+        assert_eq!(filtered.hits()[0].event_seq(), current);
+
+        let roots = runtime
+            .search_filtered(
+                SessionSearchQuery::new("filter").unwrap(),
+                SessionSearchFilters::new(
+                    Some(BTreeSet::from([root_id.clone(), child_id.clone()])),
+                    None,
+                    None,
+                    None,
+                    true,
+                    true,
+                    SessionEventFilters::default(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(roots.hits().len(), 1);
+        assert_eq!(roots.hits()[0].session_id(), &root_id);
+
+        let unauthorized_parent = runtime
+            .search_filtered(
+                SessionSearchQuery::new("filter hidden child").unwrap(),
+                SessionSearchFilters::new(
+                    None,
+                    None,
+                    None,
+                    Some(BTreeSet::from([hidden_parent])),
+                    false,
+                    true,
+                    SessionEventFilters::default(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(unauthorized_parent.hits().is_empty());
+
+        let live_only = runtime
+            .search_filtered(
+                SessionSearchQuery::new("filter").unwrap(),
+                SessionSearchFilters::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    SessionEventFilters::default(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(live_only.hits().is_empty());
+
+        let shadowed = runtime
+            .search_events_filtered(
+                child_id.clone(),
+                SessionSearchQuery::new("filter").unwrap(),
+                SessionEventFilters::new(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(BTreeSet::from(["user/message".to_owned()])),
+                    Some(BTreeSet::from([SessionEventSurface::Shadowed])),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shadowed.hits().len(), 1);
+        assert_eq!(shadowed.hits()[0].event_seq(), original);
+        assert_eq!(shadowed.hits()[0].surface(), SessionEventSurface::Shadowed);
+
+        let log = runtime
+            .search_events_filtered(
+                child_id,
+                SessionSearchQuery::new("filter").unwrap(),
+                SessionEventFilters::new(
+                    Some(log_only),
+                    Some(log_only),
+                    None,
+                    None,
+                    Some(BTreeSet::from(["todo/write".to_owned()])),
+                    Some(BTreeSet::from([SessionEventSurface::LogOnly])),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(log.hits().len(), 1);
+        assert_eq!(log.hits()[0].event_seq(), log_only);
+        let log_time = log.hits()[0].event_time();
+        let time_filtered = runtime
+            .search_events_filtered(
+                log.session_id().clone(),
+                SessionSearchQuery::new("filter").unwrap(),
+                SessionEventFilters::new(
+                    None,
+                    None,
+                    Some(log_time),
+                    Some(log_time),
+                    Some(BTreeSet::from(["todo/write".to_owned()])),
+                    Some(BTreeSet::from([SessionEventSurface::LogOnly])),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(time_filtered.hits().len(), 1);
+        let later_only = runtime
+            .search_events_filtered(
+                log.session_id().clone(),
+                SessionSearchQuery::new("filter").unwrap(),
+                SessionEventFilters::new(
+                    None,
+                    None,
+                    Some(log_time.saturating_add(1)),
+                    None,
+                    Some(BTreeSet::from(["todo/write".to_owned()])),
+                    Some(BTreeSet::from([SessionEventSurface::LogOnly])),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(later_only.hits().is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+        fs::remove_dir_all(other_workspace).unwrap();
     }
 
     #[tokio::test]
@@ -2416,6 +2897,83 @@ mod tests {
             final_event.seq().get(),
             log_only.seq().get(),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_filtered_history(
+        root: &std::path::Path,
+        authority: &WorkspaceAuthority,
+        id: &SessionId,
+        created_at: i64,
+        parent: Option<&SessionId>,
+        original_text: &str,
+        replacement_text: Option<&str>,
+    ) -> (u64, u64, u64) {
+        let base = SessionHeader::new_durable(
+            id.clone(),
+            UnixMillis::new(created_at).unwrap(),
+            authority.canonical_path().to_str().unwrap().to_owned(),
+            authority.identity(),
+        )
+        .unwrap();
+        let mut raw = base.raw().as_value().clone();
+        if let Some(parent) = parent {
+            raw.as_object_mut()
+                .unwrap()
+                .insert("parentSession".to_owned(), json!(parent));
+        }
+        let header = SessionHeader::from_value(raw).unwrap();
+        let mut session = Session::new(id.as_str()).unwrap();
+        let turn = TurnId::new(1).unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_start(turn)))
+            .unwrap();
+        let original = Message::user(
+            format!("{id}-original"),
+            vec![crate::model::ContentBlock::text(original_text).unwrap()],
+            MessageSource::user().unwrap(),
+        )
+        .unwrap();
+        let original = session
+            .append(NewEvent::surface(
+                EventKind::user_message(original),
+                SurfaceIntent::append(),
+            ))
+            .unwrap();
+        let current = if let Some(text) = replacement_text {
+            let replacement = Message::user(
+                format!("{id}-replacement"),
+                vec![crate::model::ContentBlock::text(text).unwrap()],
+                MessageSource::plugin("filter-test").unwrap(),
+            )
+            .unwrap();
+            session
+                .append(NewEvent::surface(
+                    EventKind::user_message(replacement),
+                    SurfaceIntent::replace(original.seq(), original.seq(), vec![original.seq()]),
+                ))
+                .unwrap()
+                .seq()
+                .get()
+        } else {
+            original.seq().get()
+        };
+        let log = session
+            .append(NewEvent::log(EventKind::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "filter log".to_owned(),
+                    status: TodoStatus::Pending,
+                }],
+            }))
+            .unwrap();
+        session
+            .append(NewEvent::log(EventKind::turn_end(
+                turn,
+                TurnEndReason::Completed,
+            )))
+            .unwrap();
+        write_session(root, &header, &session);
+        (original.seq().get(), current, log.seq().get())
     }
 
     fn write_session(

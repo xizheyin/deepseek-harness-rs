@@ -1892,14 +1892,27 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
         tool_round_sse(&[(
             "session-search-1",
             "session_search",
-            serde_json::json!({"query":"alpha beta release"}),
+            serde_json::json!({
+                "query":"alpha beta release",
+                "session_ids":[historical_id],
+                "include_root_sessions":true,
+                "availability":["persisted"],
+                "event_seq_from":historical_seq,
+                "event_seq_to":historical_seq,
+                "event_types":["user/message"],
+                "event_surfaces":["current"]
+            }),
         )]),
         tool_round_sse(&[(
             "session-event-search-1",
             "session_event_search",
             serde_json::json!({
                 "session_id": historical_id,
-                "query": "alpha beta release"
+                "query": "alpha beta release",
+                "seq_from": historical_seq,
+                "seq_to": historical_seq,
+                "event_types": ["user/message"],
+                "surfaces": ["current"]
             }),
         )]),
         tool_round_sse(&[(
@@ -1955,6 +1968,24 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
         schema["function"]["parameters"]["additionalProperties"],
         false
     );
+    for field in [
+        "session_ids",
+        "created_at_from",
+        "parent_session_ids",
+        "availability",
+        "event_seq_from",
+        "event_time_from",
+        "event_types",
+        "event_surfaces",
+    ] {
+        assert!(
+            schema["function"]["parameters"]["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key(field),
+            "missing session_search filter {field}"
+        );
+    }
     for (name, required) in [
         (
             "session_event_search",
@@ -1981,6 +2012,24 @@ fn real_script_searches_a_closed_same_workspace_session_and_continues() {
             schema["function"]["parameters"]["additionalProperties"],
             false
         );
+        if name == "session_event_search" {
+            for field in [
+                "seq_from",
+                "seq_to",
+                "time_from",
+                "time_to",
+                "event_types",
+                "surfaces",
+            ] {
+                assert!(
+                    schema["function"]["parameters"]["properties"]
+                        .as_object()
+                        .unwrap()
+                        .contains_key(field),
+                    "missing session_event_search filter {field}"
+                );
+            }
+        }
     }
     let after_session_search = request_json(&second_requests[1]).to_string();
     assert!(

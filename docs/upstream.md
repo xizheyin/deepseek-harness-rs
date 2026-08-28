@@ -2237,3 +2237,49 @@ workspace journals, render no title, and label availability only as persisted.
 Each visible journal must pass the ordinary strict replay scanner. An absent or
 unvalidated parent is exposed only as an outside-workspace boundary, and
 descendants outside the bounded validated corpus are omitted.
+
+## Phase 41 bounded Session search filters — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The following fixed-commit sources
+and tests were inspected before design or implementation:
+
+- `packages/session-query/tool-session-query/src/input.ts` for the complete
+  search argument fields, query normalization, sequence ranges,
+  timezone-qualified ISO timestamp grammar, exact fractional comparison,
+  parent materialization and non-empty arrays;
+- `packages/session-query/tool-session-query/src/operations.ts` for filter
+  assembly order, AND clauses, authorized-parent intersection, root OR,
+  mandatory caller workspace and current-step cutoff;
+- `packages/session-query/session-query/src/filters.ts` for provider-independent
+  session/event predicates, inclusive ranges, OR-within-array behavior and
+  surface/availability vocabularies;
+- `packages/session-query/session-query/src/types.ts` for public filter shapes;
+- `packages/session-query/session-query-sqlite/src/{index,query}.ts` and focused
+  SQLite tests for applying metadata before relevance ranking;
+- `packages/session-query/tool-session-query/tests/tool-session-query.spec.ts`
+  and `sqlite-integration.spec.ts` for invalid arrays/enums/ranges, leap dates,
+  offsets, exact sub-millisecond bounds, parent authorization and combined
+  filters.
+
+Fixed upstream requires a non-empty literal query. Different clauses are ANDed
+and values inside an id/type/surface/availability/parent clause are ORed.
+Sequence and time bounds are inclusive. Parent ids are first intersected with
+workspace-authorized Sessions, while root selection is independent. Event
+metadata is filtered before full-text ranking. Timestamps require `Z` or a
+numeric offset and preserve precision below one millisecond during range
+ordering.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. The filter input file has no direct
+fixed-to-master diff. Latest master centralizes prompt section ordering and adds
+separate Session archive/export infrastructure, neither of which changes these
+filter contracts.
+
+Rust Phase 41 keeps the official field names except `cwd`, which would be
+redundant and misleading because the retained workspace identity is already an
+unavoidable authorization predicate. It requires canonical UUIDv4 ids,
+explicit prior-Session event targets and normally closed persisted journals.
+It accepts live-only availability as an empty search and adds finite array and
+string caps. Exact timestamp ordering is retained, then projected onto the
+integer-millisecond Session clock without widening the selected interval.

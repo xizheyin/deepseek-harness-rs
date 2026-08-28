@@ -1,0 +1,65 @@
+{
+  "upstream": {
+    "repository": "https://github.com/deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "paths": [
+      "packages/session-query/tool-session-query/src/input.ts",
+      "packages/session-query/tool-session-query/src/operations.ts",
+      "packages/session-query/tool-session-query/tests/tool-session-query.spec.ts",
+      "packages/session-query/session-query/src/filters.ts",
+      "packages/session-query/session-query-sqlite/tests/sqlite.spec.ts"
+    ]
+  },
+  "sessionSearch": {
+    "required": ["query"],
+    "optional": [
+      "session_ids",
+      "created_at_from",
+      "created_at_to",
+      "parent_session_ids",
+      "include_root_sessions",
+      "availability",
+      "event_seq_from",
+      "event_seq_to",
+      "event_time_from",
+      "event_time_to",
+      "event_types",
+      "event_surfaces"
+    ]
+  },
+  "eventSearch": {
+    "officialRequired": ["query"],
+    "rustRequired": ["session_id", "query"],
+    "optional": [
+      "seq_from",
+      "seq_to",
+      "time_from",
+      "time_to",
+      "event_types",
+      "surfaces"
+    ]
+  },
+  "semantics": {
+    "betweenFields": "AND",
+    "withinArray": "OR",
+    "ranges": "inclusive",
+    "surfaces": ["current", "shadowed", "log-only"],
+    "availability": ["live", "persisted"],
+    "ranking": [
+      "occurrences-desc",
+      "document-chars-asc",
+      "event-time-desc",
+      "event-seq-desc"
+    ]
+  },
+  "rustLimits": {
+    "sessionIds": 128,
+    "parentSessionIds": 128,
+    "eventTypes": 64,
+    "eventTypeBytes": 128,
+    "timestampBytes": 64,
+    "results": 20,
+    "perSessionBytes": 16777216,
+    "aggregateBytes": 67108864
+  }
+}
