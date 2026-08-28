@@ -1670,6 +1670,32 @@ message; the remaining changes reorganize and expand documentation/tests.
 Rust Phase 25 records its exact-workspace-root and no-symlink privacy choices,
 plus the deferred tool-touch seam, in `docs/design/workspace-instructions.md`.
 
+## Phase 26 dynamic workspace-instruction inspection — 2026-08-29
+
+Fixed commit `47f943859bef60e4160492346772ded9b24f765a` was inspected at:
+
+- `packages/context/agent-instructions/src/index.ts` for the `read`/`write`/
+  `edit` success-only touch filter, nested-execution bubbling, open-step
+  staging, `step/end` release, asynchronous projection queue, and pre-step
+  projection join;
+- `packages/context/agent-instructions/src/{files,state,render}.ts` for touched
+  ancestor discovery, visible-state reconciliation, candidate ordering,
+  duplicate collapse, and bounded rendering;
+- the `dynamic nested workspace context injection` cases in
+  `packages/context/agent-instructions/tests/agent-instructions.spec.ts` for
+  successful and failed reads, aborted signals, sibling cancellation,
+  step-commit deferral, multiple touches, changed/removed files, resume,
+  compaction rearming, and nested composite execution;
+- `packages/context/agent-instructions/tests/agent-instructions.e2e.ts` for the
+  real read-then-nested-instruction journey.
+
+Latest inspected master `cd5ef8148158c3a752a658978873241fdf8e2bbc`
+retains this behavior. Rust Phase 26 maps official `write`/`edit` to its single
+approval-gated `apply_patch` tool and strengthens provenance by carrying a
+crate-private built-in result fact instead of recognizing a tool by its public
+name alone. The intentional exact-workspace and no-instruction-symlink privacy
+differences from Phase 25 remain unchanged.
+
 ## Local research copy
 
 Developers may create a clone outside this repository and detach it at the baseline:

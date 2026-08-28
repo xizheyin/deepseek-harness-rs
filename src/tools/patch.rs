@@ -147,41 +147,49 @@ pub(crate) async fn prepare(
     // Every post-publication result is fully built before the commit
     // capability exists. After link/rename succeeds, no fallible JSON/model
     // construction remains that could erase the truthful committed fact.
-    let committed_success = ToolCommitOutcome::committed(success_result(
-        &commit_path,
-        commit_operation,
-        &commit_diff,
-    )?)?;
-    let committed_durability = ToolCommitOutcome::committed(failure_result(
-        &commit_path,
-        commit_operation,
-        &commit_diff,
-        true,
-        "FsError",
-        "FILE_COMMITTED_DURABILITY_UNCERTAIN",
-        "the file changed, but directory synchronization was uncertain",
-        false,
-    )?)?;
-    let committed_durability_and_cleanup = ToolCommitOutcome::committed(failure_result(
-        &commit_path,
-        commit_operation,
-        &commit_diff,
-        true,
-        "FsError",
-        "FILE_COMMITTED_DURABILITY_UNCERTAIN",
-        "the file changed, but directory synchronization and staging cleanup were uncertain",
-        true,
-    )?)?;
-    let committed_cleanup_warning = ToolCommitOutcome::committed(failure_result(
-        &commit_path,
-        commit_operation,
-        &commit_diff,
-        true,
-        "FsError",
-        "FILE_COMMITTED_CLEANUP_WARNING",
-        "the file changed and was synchronized, but private staging cleanup failed",
-        true,
-    )?)?;
+    let committed_success = ToolCommitOutcome::committed(
+        success_result(&commit_path, commit_operation, &commit_diff)?
+            .with_workspace_touch(commit_path.clone()),
+    )?;
+    let committed_durability = ToolCommitOutcome::committed(
+        failure_result(
+            &commit_path,
+            commit_operation,
+            &commit_diff,
+            true,
+            "FsError",
+            "FILE_COMMITTED_DURABILITY_UNCERTAIN",
+            "the file changed, but directory synchronization was uncertain",
+            false,
+        )?
+        .with_workspace_touch(commit_path.clone()),
+    )?;
+    let committed_durability_and_cleanup = ToolCommitOutcome::committed(
+        failure_result(
+            &commit_path,
+            commit_operation,
+            &commit_diff,
+            true,
+            "FsError",
+            "FILE_COMMITTED_DURABILITY_UNCERTAIN",
+            "the file changed, but directory synchronization and staging cleanup were uncertain",
+            true,
+        )?
+        .with_workspace_touch(commit_path.clone()),
+    )?;
+    let committed_cleanup_warning = ToolCommitOutcome::committed(
+        failure_result(
+            &commit_path,
+            commit_operation,
+            &commit_diff,
+            true,
+            "FsError",
+            "FILE_COMMITTED_CLEANUP_WARNING",
+            "the file changed and was synchronized, but private staging cleanup failed",
+            true,
+        )?
+        .with_workspace_touch(commit_path.clone()),
+    )?;
     let not_committed_path = commit_path.clone();
     let not_committed_diff = commit_diff.clone();
     let mutation = PreparedToolMutation::new(
@@ -1131,7 +1139,8 @@ fn approval_reason(operation: WorkspaceMutationOperation, path: &str) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::ApprovalDiffRowKind;
+    use crate::agent::{ApprovalDiffRowKind, MutationDeclineReason, ToolPreparation};
+    use crate::tools::workspace::Workspace;
 
     use serde_json::json;
 
@@ -1139,7 +1148,7 @@ mod tests {
         MAX_CANONICAL_DIFF_JSON_BYTES, MAX_DIRECTORY_DEPTH, MAX_MUTATION_FILE_LINE_BYTES,
         MAX_MUTATION_FILE_LINES, MAX_PATCH_BYTES, MAX_PATCH_HUNKS, MAX_PATCH_LINE_BYTES,
         MAX_PATCH_LINES, WorkspaceMutationOperation, apply_strict, approval_reason, canonical_diff,
-        mutation_meta, parse_arguments, parse_patch, push_diff_output, validate_file_text,
+        mutation_meta, parse_arguments, parse_patch, prepare, push_diff_output, validate_file_text,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -1150,6 +1159,46 @@ mod tests {
         assert!(apply_strict("first\nsecond\n", &parsed.patch, &CancellationToken::new()).is_err());
 
         assert!(parse_patch(&format!("{patch}trailing garbage\n")).is_err());
+    }
+
+    #[tokio::test]
+    async fn only_a_definitely_committed_patch_publishes_a_workspace_touch() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-patch-workspace-touch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        let workspace = Workspace::open(&root).unwrap();
+        let arguments = json!({
+            "patch": "--- /dev/null\n+++ b/pkg/AGENTS.md\n@@ -0,0 +1 @@\n+nested rule\n"
+        });
+
+        let ToolPreparation::Mutation(declined) =
+            prepare(&workspace, &arguments, &CancellationToken::new())
+                .await
+                .unwrap()
+        else {
+            panic!("valid patch must prepare a mutation")
+        };
+        let declined = declined
+            .decline(MutationDeclineReason::ApprovalRejected)
+            .unwrap();
+        assert!(declined.workspace_touch().is_none());
+
+        let ToolPreparation::Mutation(committed) =
+            prepare(&workspace, &arguments, &CancellationToken::new())
+                .await
+                .unwrap()
+        else {
+            panic!("valid patch must prepare a mutation")
+        };
+        let committed = committed.commit(CancellationToken::new()).unwrap();
+        assert_eq!(committed.result().workspace_touch(), Some("pkg/AGENTS.md"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("pkg/AGENTS.md")).unwrap(),
+            "nested rule\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

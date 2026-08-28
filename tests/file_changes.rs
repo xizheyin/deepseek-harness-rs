@@ -474,7 +474,7 @@ fn rust_first_mutation_step_types(session: &Session) -> Vec<String> {
 }
 
 #[test]
-fn workspace_registry_exposes_four_read_tools_then_one_closed_apply_patch_schema() {
+fn workspace_registry_keeps_the_closed_apply_patch_schema_before_todo_write() {
     let workspace = TempWorkspace::new("schema");
     let registry = WorkspaceToolRegistry::open(workspace.path()).unwrap();
     assert_eq!(
@@ -483,7 +483,7 @@ fn workspace_registry_exposes_four_read_tools_then_one_closed_apply_patch_schema
             .iter()
             .map(|schema| schema.name())
             .collect::<Vec<_>>(),
-        ["list", "glob", "grep", "read", "apply_patch"]
+        ["list", "glob", "grep", "read", "apply_patch", "todo_write"]
     );
     let parameters = registry.schemas()[4].parameters().as_value();
     assert_eq!(parameters["required"], json!(["patch"]));

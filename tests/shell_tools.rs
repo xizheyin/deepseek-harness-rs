@@ -418,7 +418,15 @@ fn local_registry_exposes_a_closed_foreground_bash_schema() {
             .iter()
             .map(|schema| schema.name())
             .collect::<Vec<_>>(),
-        ["list", "glob", "grep", "read", "apply_patch", "bash"]
+        [
+            "list",
+            "glob",
+            "grep",
+            "read",
+            "apply_patch",
+            "todo_write",
+            "bash"
+        ]
     );
     let parameters = registry.schemas().last().unwrap().parameters().as_value();
     assert_eq!(parameters["type"], "object");

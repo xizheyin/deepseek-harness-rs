@@ -49,9 +49,8 @@ were not repeated under the requested fast local gate.
 
 - Only the user-global file and exact opened workspace root are discovered.
 - Instruction-file symlinks are unavailable rather than followed.
-- Successful file-tool touches do not yet discover nested scopes during the
-  same process, and a baseline compacted after assembly is not freshly read
-  until the next resume.
+- Phase 26 subsequently closed successful built-in file-touch discovery and
+  same-process post-compaction rearming; see `phase-26.md`.
 - Candidate names and budgets are fixed in this first production slice.
-- The row remains `partial` without the dynamic seam or a generated
-  cross-language oracle.
+- The row remains `partial` without a generated cross-language oracle and the
+  broader discovery/configuration behaviors listed in Phase 26.

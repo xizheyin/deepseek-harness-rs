@@ -44,6 +44,7 @@ use crate::{
         TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause, TurnEndCancelCause,
         TurnEndReason, TurnId,
     },
+    workspace_instructions::{WorkspaceInstructionError, WorkspaceInstructionRuntime},
 };
 
 pub(crate) use approval::{
@@ -758,6 +759,8 @@ pub struct AgentLoop {
     request_header_logged: bool,
     exact_shell_grants: approval::ExactShellGrantStore,
     pending_workspace_context: Option<Message>,
+    workspace_instructions: Option<WorkspaceInstructionRuntime>,
+    pending_workspace_touches: Vec<String>,
     poisoned: bool,
 }
 
@@ -835,6 +838,8 @@ impl AgentLoop {
             request_header_logged: false,
             exact_shell_grants: approval::ExactShellGrantStore::new(),
             pending_workspace_context: None,
+            workspace_instructions: None,
+            pending_workspace_touches: Vec::new(),
             poisoned: false,
         })
     }
@@ -852,6 +857,15 @@ impl AgentLoop {
                 .is_none_or(|message| message.validate_user_event().is_ok())
         );
         self.pending_workspace_context = context;
+    }
+
+    /// Install the same opened workspace capability used during assembly so
+    /// successful built-in file results can refresh guidance between steps.
+    pub(crate) fn install_workspace_instruction_runtime(
+        &mut self,
+        runtime: WorkspaceInstructionRuntime,
+    ) {
+        self.workspace_instructions = Some(runtime);
     }
 
     /// Commit a local Goal command through the same durable Session owner.
@@ -973,6 +987,8 @@ impl AgentLoop {
             &config,
             &mut self.request_header_logged,
             &mut self.exact_shell_grants,
+            self.workspace_instructions.as_ref(),
+            &mut self.pending_workspace_touches,
             proposal,
             cancellation,
         )
@@ -1201,6 +1217,8 @@ struct Driver<'a> {
     durable_limit: Option<AppendError>,
     deadline: Instant,
     goal_tool_caller: GoalToolCaller,
+    workspace_instructions: Option<&'a WorkspaceInstructionRuntime>,
+    pending_workspace_touches: &'a mut Vec<String>,
 }
 
 impl Driver<'_> {
@@ -1245,6 +1263,8 @@ async fn run_turn_inner(
     config: &AgentLoopConfig,
     request_header_logged: &mut bool,
     exact_shell_grants: &mut approval::ExactShellGrantStore,
+    workspace_instructions: Option<&WorkspaceInstructionRuntime>,
+    pending_workspace_touches: &mut Vec<String>,
     proposal: TurnProposal,
     cancellation: CancellationToken,
 ) -> Result<TurnOutcome, AgentLoopError> {
@@ -1292,6 +1312,8 @@ async fn run_turn_inner(
         durable_limit: None,
         deadline: Instant::now() + config.limits.turn_duration,
         goal_tool_caller,
+        workspace_instructions,
+        pending_workspace_touches,
     };
 
     let mut reason = if cancellation.is_cancelled() {
@@ -1419,6 +1441,12 @@ async fn run_entered_turn(
     budget_failure: &LlmFailure,
 ) -> Result<TurnEndReason, AgentLoopError> {
     let mut summary_attempted = false;
+    if let Some(reason) =
+        refresh_workspace_context(reservation.session(), driver, &mut messages, cancellation)
+            .await?
+    {
+        return Ok(reason);
+    }
     loop {
         if cancellation.is_cancelled() {
             return Ok(TurnEndReason::Aborted {
@@ -1622,6 +1650,22 @@ async fn run_entered_turn(
             }
             Some(preparation)
         };
+        // Compaction may have replaced the visible surface after this step's
+        // claims were sized. Reconcile once more; if guidance was re-armed,
+        // release the untouched claims and reserve the same step again with
+        // that message included.
+        let input_count_before_rearm = messages.len();
+        if let Some(reason) =
+            refresh_workspace_context(reservation.session(), driver, &mut messages, cancellation)
+                .await?
+        {
+            unstarted.release(reservation)?;
+            return Ok(reason);
+        }
+        if messages.len() != input_count_before_rearm {
+            unstarted.release(reservation)?;
+            continue;
+        }
         let mut step_end = unstarted.enter(reservation).await?;
         messages.clear();
         driver.counters.steps += 1;
@@ -1728,7 +1772,18 @@ async fn run_entered_turn(
             }
         }
         match resolution.outcome {
-            StepOutcome::Continue => {}
+            StepOutcome::Continue => {
+                if let Some(reason) = refresh_workspace_context(
+                    reservation.session(),
+                    driver,
+                    &mut messages,
+                    cancellation,
+                )
+                .await?
+                {
+                    return Ok(reason);
+                }
+            }
             StepOutcome::Completed => return Ok(TurnEndReason::Completed),
             StepOutcome::MaxTokens => return Ok(TurnEndReason::MaxTokens),
             StepOutcome::Cancelled => {
@@ -1739,6 +1794,46 @@ async fn run_entered_turn(
             StepOutcome::Error(error) => return Ok(TurnEndReason::Error { error }),
         }
     }
+}
+
+async fn refresh_workspace_context(
+    session: &Session,
+    driver: &mut Driver<'_>,
+    messages: &mut Vec<Message>,
+    cancellation: &CancellationToken,
+) -> Result<Option<TurnEndReason>, AgentLoopError> {
+    if messages.iter().any(is_workspace_context_message) {
+        return Ok(None);
+    }
+    let Some(runtime) = driver.workspace_instructions else {
+        driver.pending_workspace_touches.clear();
+        return Ok(None);
+    };
+    match runtime
+        .prepare(session, driver.pending_workspace_touches, cancellation)
+        .await
+    {
+        Ok(context) => {
+            driver.pending_workspace_touches.clear();
+            if let Some(context) = context {
+                messages.push(context);
+            }
+            Ok(None)
+        }
+        Err(WorkspaceInstructionError::Cancelled) => Ok(Some(TurnEndReason::Aborted {
+            reason: TurnEndCancelCause::User,
+        })),
+        Err(_) => Ok(Some(TurnEndReason::Error {
+            error: failure_reason(
+                "AGENT_WORKSPACE_INSTRUCTIONS",
+                "workspace instructions could not be refreshed safely",
+            )?,
+        })),
+    }
+}
+
+fn is_workspace_context_message(message: &Message) -> bool {
+    message.source().raw().as_value()["kind"].as_str() == Some("agent-instructions")
 }
 
 async fn flush_pending_plan_mode(
@@ -4512,6 +4607,7 @@ async fn settle_tool_result(
     result: ToolExecutionResult,
     settlement: ResultSettlement,
 ) -> Result<bool, AgentLoopError> {
+    let workspace_touch = result.workspace_touch().map(str::to_owned);
     let (content, is_error, error, meta, _concludes_turn) = result.into_parts();
     let component_bytes = content
         .iter()
@@ -4595,6 +4691,7 @@ async fn settle_tool_result(
             Err(error) => return Err(error.into()),
         }
         driver.counters.tool_result_bytes = driver.counters.tool_result_bytes.saturating_add(size);
+        retain_workspace_touch(driver, workspace_touch);
         return Ok(true);
     }
     let inside_limits = size <= driver.config.limits.max_tool_result_bytes
@@ -4615,8 +4712,23 @@ async fn settle_tool_result(
     let preferred = matches!(settlement, ClaimedAppend::Preferred(_));
     if preferred {
         driver.counters.tool_result_bytes += size;
+        retain_workspace_touch(driver, workspace_touch);
     }
     Ok(preferred)
+}
+
+fn retain_workspace_touch(driver: &mut Driver<'_>, touch: Option<String>) {
+    let Some(touch) = touch else {
+        return;
+    };
+    if driver.pending_workspace_touches.len() < MAX_AGENT_TOOL_CALLS_PER_TURN
+        && !driver
+            .pending_workspace_touches
+            .iter()
+            .any(|known| known == &touch)
+    {
+        driver.pending_workspace_touches.push(touch);
+    }
 }
 
 fn release_uncommitted_tool_round(

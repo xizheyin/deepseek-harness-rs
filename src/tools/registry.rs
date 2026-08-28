@@ -98,7 +98,7 @@ impl ToolExecutor for ReadOnlyToolRegistry {
             )
             .await;
             match outcome {
-                Ok(text) => normalize_success(text),
+                Ok(success) => normalize_dispatch_success(success),
                 Err(error) => error.into_execution_result(),
             }
         })
@@ -370,7 +370,7 @@ impl ToolExecutor for LocalToolRegistry {
             )
             .await;
             match outcome {
-                Ok(text) => normalize_success(text),
+                Ok(success) => normalize_dispatch_success(success),
                 Err(error) => error.into_execution_result(),
             }
         })
@@ -430,7 +430,7 @@ impl ToolExecutor for LocalToolRegistry {
             )
             .await;
             let result = match outcome {
-                Ok(text) => normalize_success(text),
+                Ok(success) => normalize_dispatch_success(success),
                 Err(error) => error.into_execution_result(),
             }?;
             Ok(ToolPreparation::Complete(result))
@@ -478,7 +478,7 @@ impl ToolExecutor for WorkspaceToolRegistry {
             )
             .await;
             match outcome {
-                Ok(text) => normalize_success(text),
+                Ok(success) => normalize_dispatch_success(success),
                 Err(error) => error.into_execution_result(),
             }
         })
@@ -503,7 +503,7 @@ impl ToolExecutor for WorkspaceToolRegistry {
             )
             .await;
             let result = match outcome {
-                Ok(text) => normalize_success(text),
+                Ok(success) => normalize_dispatch_success(success),
                 Err(error) => error.into_execution_result(),
             }?;
             Ok(ToolPreparation::Complete(result))
@@ -516,17 +516,56 @@ async fn dispatch(
     name: &str,
     arguments: &serde_json::Value,
     cancellation: &CancellationToken,
-) -> ToolCallResult<String> {
+) -> ToolCallResult<DispatchSuccess> {
     if cancellation.is_cancelled() {
         return Err(ToolCallError::aborted());
     }
     match name {
-        "list" => list::execute(workspace, parse_list(arguments)?, cancellation).await,
-        "glob" => glob::execute(workspace, parse_glob(arguments)?, cancellation).await,
-        "grep" => grep::execute(workspace, parse_grep(arguments)?, cancellation).await,
-        "read" => read::execute(workspace, parse_read(arguments)?, cancellation).await,
+        "list" => list::execute(workspace, parse_list(arguments)?, cancellation)
+            .await
+            .map(DispatchSuccess::plain),
+        "glob" => glob::execute(workspace, parse_glob(arguments)?, cancellation)
+            .await
+            .map(DispatchSuccess::plain),
+        "grep" => grep::execute(workspace, parse_grep(arguments)?, cancellation)
+            .await
+            .map(DispatchSuccess::plain),
+        "read" => {
+            let arguments = parse_read(arguments)?;
+            let touch = arguments.file_path.clone();
+            read::execute(workspace, arguments, cancellation)
+                .await
+                .map(|text| DispatchSuccess {
+                    text,
+                    workspace_touch: Some(touch),
+                })
+        }
         _ => Err(ToolCallError::unknown_tool()),
     }
+}
+
+struct DispatchSuccess {
+    text: String,
+    workspace_touch: Option<String>,
+}
+
+impl DispatchSuccess {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            workspace_touch: None,
+        }
+    }
+}
+
+fn normalize_dispatch_success(
+    success: DispatchSuccess,
+) -> Result<ToolExecutionResult, ToolExecutorError> {
+    let result = normalize_success(success.text)?;
+    Ok(match success.workspace_touch {
+        Some(path) => result.with_workspace_touch(path),
+        None => result,
+    })
 }
 
 fn normalize_success(text: String) -> Result<ToolExecutionResult, ToolExecutorError> {
@@ -1685,16 +1724,20 @@ fn schema(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use futures_util::poll;
     use tokio_util::sync::CancellationToken;
 
     use super::{
         MAX_TODO_CONTENT_BYTES, MAX_TODO_ITEMS, MAX_TOOL_CONTENT_BYTES,
         build_exit_plan_mode_schema, build_goal_schemas, build_todo_write_schema,
-        build_user_question_schema, dispatch_goal, normalize_success,
-        parse_exit_plan_mode_arguments, parse_todo_write_arguments, parse_user_question_arguments,
-        prepare_exit_plan_mode, prepare_goal, prepare_todo_write, prepare_user_question,
+        build_user_question_schema, dispatch, dispatch_goal, normalize_dispatch_success,
+        normalize_success, parse_exit_plan_mode_arguments, parse_todo_write_arguments,
+        parse_user_question_arguments, prepare_exit_plan_mode, prepare_goal, prepare_todo_write,
+        prepare_user_question,
     };
+    use crate::tools::workspace::Workspace;
     use crate::{
         agent::{GoalToolCaller, ToolDispatchBinding, ToolExecutionRequest, ToolPreparation},
         goal::GoalRuntime,
@@ -1707,6 +1750,58 @@ mod tests {
 
     fn goal_request(name: &str, arguments: serde_json::Value) -> ToolExecutionRequest {
         goal_request_as(name, arguments, GoalToolCaller::Untrusted)
+    }
+
+    #[tokio::test]
+    async fn only_a_successful_builtin_read_publishes_a_workspace_touch() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-registry-workspace-touch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        fs::write(root.join("pkg/file.txt"), "hello\n").unwrap();
+        let workspace = Workspace::open(&root).unwrap();
+        let cancellation = CancellationToken::new();
+
+        let read = dispatch(
+            &workspace,
+            "read",
+            &serde_json::json!({ "file_path": "pkg/file.txt" }),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        let read = normalize_dispatch_success(read).unwrap();
+        assert_eq!(read.workspace_touch(), Some("pkg/file.txt"));
+
+        let list = dispatch(
+            &workspace,
+            "list",
+            &serde_json::json!({ "path": "pkg" }),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert!(
+            normalize_dispatch_success(list)
+                .unwrap()
+                .workspace_touch()
+                .is_none()
+        );
+        assert!(
+            dispatch(
+                &workspace,
+                "read",
+                &serde_json::json!({ "file_path": "pkg/missing.txt" }),
+                &cancellation,
+            )
+            .await
+            .is_err()
+        );
+
+        let public_result = crate::agent::ToolExecutionResult::success(vec![]).unwrap();
+        assert!(public_result.workspace_touch().is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

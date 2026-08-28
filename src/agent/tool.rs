@@ -958,6 +958,9 @@ pub struct ToolExecutionResult {
     error: Option<ToolFailure>,
     meta: Option<JsonValue>,
     concludes_turn: bool,
+    // This fact is deliberately not part of public construction or durable
+    // result metadata. Only trusted built-in filesystem tools may publish it.
+    workspace_touch: Option<String>,
 }
 
 impl std::fmt::Debug for ToolExecutionResult {
@@ -969,6 +972,7 @@ impl std::fmt::Debug for ToolExecutionResult {
             .field("error_present", &self.error.is_some())
             .field("meta_present", &self.meta.is_some())
             .field("concludes_turn", &self.concludes_turn)
+            .field("workspace_touch_present", &self.workspace_touch.is_some())
             .finish()
     }
 }
@@ -1044,6 +1048,7 @@ impl ToolExecutionResult {
             error,
             meta,
             concludes_turn,
+            workspace_touch: None,
         })
     }
 
@@ -1070,6 +1075,17 @@ impl ToolExecutionResult {
     #[must_use]
     pub fn concludes_turn(&self) -> bool {
         self.concludes_turn
+    }
+
+    /// Attach a capability-confined path after a trusted built-in operation
+    /// has actually succeeded or definitely committed.
+    pub(crate) fn with_workspace_touch(mut self, path: String) -> Self {
+        self.workspace_touch = Some(path);
+        self
+    }
+
+    pub(crate) fn workspace_touch(&self) -> Option<&str> {
+        self.workspace_touch.as_deref()
     }
 
     pub(crate) fn into_parts(

@@ -3,8 +3,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Read},
-    path::{Path, PathBuf},
-    sync::Arc,
+    path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use aws_lc_rs::digest::{SHA1_FOR_LEGACY_USE_ONLY, digest};
@@ -22,6 +22,7 @@ use crate::{
 
 pub(crate) const MAX_WORKSPACE_INSTRUCTION_BYTES: usize = 65_536;
 const MAX_WORKSPACE_INSTRUCTION_SOURCE_BYTES: usize = 1_048_576;
+const MAX_DYNAMIC_INSTRUCTION_DIRECTORIES: usize = 256;
 const PROJECT_CANDIDATES: [&str; 4] = [
     "AGENTS.md",
     "CLAUDE.md",
@@ -44,6 +45,91 @@ pub(crate) enum WorkspaceInstructionError {
     Message,
     #[error("workspace instruction message identity is unavailable")]
     Identity,
+    #[error("workspace instruction runtime state is unavailable")]
+    State,
+}
+
+/// Cloneable read-only capability used both at assembly and between Agent
+/// steps. Known nested directories are an in-process rearm hint; all effective
+/// instruction content and digests still come from the Session surface.
+#[derive(Clone)]
+pub(crate) struct WorkspaceInstructionRuntime {
+    authority: WorkspaceAuthority,
+    dsh_home: Option<(PathBuf, &'static str)>,
+    known_directories: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl WorkspaceInstructionRuntime {
+    pub(crate) fn from_authority(authority: &WorkspaceAuthority) -> Self {
+        Self {
+            authority: authority.clone(),
+            dsh_home: resolve_dsh_home(),
+            known_directories: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_authority_without_home(authority: &WorkspaceAuthority) -> Self {
+        Self {
+            authority: authority.clone(),
+            dsh_home: None,
+            known_directories: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    /// Reconcile visible facts plus any newly trusted file touches into one
+    /// message for the next model step.
+    pub(crate) async fn prepare(
+        &self,
+        session: &Session,
+        touched_paths: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Message>, WorkspaceInstructionError> {
+        if cancellation.is_cancelled() {
+            return Err(WorkspaceInstructionError::Cancelled);
+        }
+        let visible = visible_instruction_state(session);
+        let mut directories = self
+            .known_directories
+            .lock()
+            .map_err(|_| WorkspaceInstructionError::State)?
+            .clone();
+        directories.extend(visible_nested_directories(&visible));
+        for path in touched_paths {
+            directories.extend(touched_directories(path, &self.authority));
+        }
+        let mut directories = directories.into_iter().collect::<Vec<_>>();
+        directories.sort_by(|left, right| {
+            directory_depth(left)
+                .cmp(&directory_depth(right))
+                .then_with(|| left.cmp(right))
+        });
+        directories.truncate(MAX_DYNAMIC_INSTRUCTION_DIRECTORIES);
+
+        let root = Arc::clone(self.authority.root());
+        let workspace = self.authority.canonical_path().to_owned();
+        let dsh_home = self.dsh_home.clone();
+        let loaded_directories = directories.clone();
+        let token = cancellation.clone();
+        let loaded = task::spawn_blocking(move || {
+            load_workspace(root, workspace, dsh_home, loaded_directories, &token)
+        })
+        .await
+        .map_err(|_| WorkspaceInstructionError::Task)??;
+        if cancellation.is_cancelled() {
+            return Err(WorkspaceInstructionError::Cancelled);
+        }
+        self.known_directories
+            .lock()
+            .map_err(|_| WorkspaceInstructionError::State)?
+            .extend(directories);
+
+        let message = reconcile(session, loaded, visible)?;
+        if cancellation.is_cancelled() {
+            return Err(WorkspaceInstructionError::Cancelled);
+        }
+        Ok(message)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -124,32 +210,87 @@ struct VisibleInstructionState {
     changes: BTreeMap<String, InstructionChange>,
 }
 
-/// Compose the one context message that should enter the next non-empty turn.
-pub(crate) async fn prepare_workspace_instructions(
-    session: &Session,
-    authority: &WorkspaceAuthority,
-    cancellation: &CancellationToken,
-) -> Result<Option<Message>, WorkspaceInstructionError> {
-    if cancellation.is_cancelled() {
-        return Err(WorkspaceInstructionError::Cancelled);
-    }
-    let root = Arc::clone(authority.root());
-    let workspace = authority.canonical_path().to_owned();
-    let dsh_home = resolve_dsh_home();
-    let token = cancellation.clone();
-    let loaded = task::spawn_blocking(move || load_workspace(root, workspace, dsh_home, &token))
-        .await
-        .map_err(|_| WorkspaceInstructionError::Task)??;
-    if cancellation.is_cancelled() {
-        return Err(WorkspaceInstructionError::Cancelled);
-    }
+fn visible_nested_directories(visible: &VisibleInstructionState) -> BTreeSet<String> {
+    visible
+        .changes
+        .values()
+        .filter(|change| change.action != ChangeAction::Remove)
+        .filter_map(|change| {
+            change
+                .scope
+                .split_once('\0')
+                .map(|(directory, _)| directory)
+        })
+        .filter(|directory| *directory != "." && *directory != "user-global")
+        .filter_map(normalize_relative_directory)
+        .collect()
+}
 
-    let visible = visible_instruction_state(session);
-    let message = reconcile(session, loaded, visible)?;
-    if cancellation.is_cancelled() {
-        return Err(WorkspaceInstructionError::Cancelled);
+fn touched_directories(path: &str, authority: &WorkspaceAuthority) -> Vec<String> {
+    let supplied = Path::new(path);
+    let relative = if supplied.is_absolute() {
+        supplied
+            .strip_prefix(authority.canonical_path())
+            .or_else(|_| supplied.strip_prefix(authority.startup_path()))
+            .ok()
+    } else {
+        Some(supplied)
+    };
+    let Some(relative) = relative else {
+        return Vec::new();
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part),
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return Vec::new();
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => return Vec::new(),
+        }
     }
-    Ok(message)
+    if parts.len() <= 1 {
+        return Vec::new();
+    }
+    parts.pop();
+    let mut prefix = PathBuf::new();
+    let mut directories = Vec::with_capacity(parts.len());
+    for part in parts {
+        prefix.push(part);
+        let Some(display) = prefix.to_str() else {
+            return Vec::new();
+        };
+        directories.push(display.to_owned());
+    }
+    directories
+}
+
+fn normalize_relative_directory(directory: &str) -> Option<String> {
+    let path = Path::new(directory);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    (!normalized.as_os_str().is_empty())
+        .then(|| normalized.to_str().map(str::to_owned))
+        .flatten()
+}
+
+fn directory_depth(directory: &str) -> usize {
+    Path::new(directory)
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count()
 }
 
 fn resolve_dsh_home() -> Option<(PathBuf, &'static str)> {
@@ -166,6 +307,7 @@ fn load_workspace(
     root: Arc<Dir>,
     workspace: PathBuf,
     dsh_home: Option<(PathBuf, &'static str)>,
+    dynamic_directories: Vec<String>,
     cancellation: &CancellationToken,
 ) -> Result<LoadedWorkspaceInstructions, WorkspaceInstructionError> {
     let baseline_identity = serde_json::to_string(&json!({
@@ -177,7 +319,8 @@ fn load_workspace(
         "localInstructionFileCandidates": ["AGENTS.local.md", "CLAUDE.local.md"]
     }))
     .map_err(|_| WorkspaceInstructionError::Message)?;
-    let mut observations = Vec::with_capacity(1 + PROJECT_CANDIDATES.len());
+    let mut observations =
+        Vec::with_capacity(1 + PROJECT_CANDIDATES.len() * (1 + dynamic_directories.len()));
     let mut global_path = None;
     if let Some((home, display)) = dsh_home {
         cancellation_check(cancellation)?;
@@ -194,25 +337,38 @@ fn load_workspace(
         });
     }
 
-    for candidate in PROJECT_CANDIDATES {
-        cancellation_check(cancellation)?;
-        let project_path = workspace.join(candidate);
-        let state = if global_path.as_ref() == Some(&project_path)
-            && observations
-                .first()
-                .is_some_and(|observation| matches!(observation.state, CandidateState::Present(_)))
-        {
-            CandidateState::Absent
-        } else {
-            observe_workspace(&root, candidate, cancellation)
-        };
-        observations.push(CandidateObservation {
-            scope: scope_key(".", candidate),
-            state,
-        });
+    for directory in std::iter::once(String::from(".")).chain(dynamic_directories) {
+        for candidate in PROJECT_CANDIDATES {
+            cancellation_check(cancellation)?;
+            let relative = if directory == "." {
+                PathBuf::from(candidate)
+            } else {
+                Path::new(&directory).join(candidate)
+            };
+            let display = relative.to_string_lossy().into_owned();
+            let project_path = workspace.join(&relative);
+            let state = if global_path.as_ref() == Some(&project_path)
+                && observations.first().is_some_and(|observation| {
+                    matches!(observation.state, CandidateState::Present(_))
+                }) {
+                CandidateState::Absent
+            } else {
+                observe_workspace(
+                    &root,
+                    &relative,
+                    &display,
+                    scope_key(&directory, candidate),
+                    cancellation,
+                )
+            };
+            observations.push(CandidateObservation {
+                scope: scope_key(&directory, candidate),
+                state,
+            });
+        }
     }
 
-    let mut seen_project_content = BTreeSet::new();
+    let mut seen_project_content = BTreeMap::<String, BTreeSet<String>>::new();
     let mut entries = Vec::with_capacity(observations.len());
     for (index, observation) in observations.iter_mut().enumerate() {
         let CandidateState::Present(instruction) = &observation.state else {
@@ -220,7 +376,12 @@ fn load_workspace(
         };
         if index != 0 {
             let trimmed = sha1_hex(instruction.content.trim().as_bytes());
-            if !seen_project_content.insert(trimmed) {
+            let directory = scope_directory(&instruction.scope).to_owned();
+            if !seen_project_content
+                .entry(directory)
+                .or_default()
+                .insert(trimmed)
+            {
                 observation.state = CandidateState::Absent;
                 continue;
             }
@@ -240,28 +401,44 @@ fn load_workspace(
 
 fn observe_workspace(
     root: &Dir,
-    candidate: &str,
+    relative: &Path,
+    display: &str,
+    scope: String,
     cancellation: &CancellationToken,
 ) -> CandidateState {
-    let metadata = match root.symlink_metadata(candidate) {
-        Ok(metadata) => metadata,
-        Err(error) if is_absent(&error) => return CandidateState::Absent,
-        Err(_) => return CandidateState::Unavailable,
+    let mut prefix = PathBuf::new();
+    let mut components = relative.components().peekable();
+    let metadata = loop {
+        let Some(Component::Normal(part)) = components.next() else {
+            return CandidateState::Unavailable;
+        };
+        prefix.push(part);
+        let metadata = match root.symlink_metadata(&prefix) {
+            Ok(metadata) => metadata,
+            Err(error) if is_absent(&error) => return CandidateState::Absent,
+            Err(_) => return CandidateState::Unavailable,
+        };
+        if metadata.file_type().is_symlink() {
+            return CandidateState::Unavailable;
+        }
+        if components.peek().is_none() {
+            break metadata;
+        }
+        if !metadata.is_dir() {
+            return CandidateState::Absent;
+        }
     };
-    if metadata.file_type().is_symlink() {
-        return CandidateState::Unavailable;
-    }
     if !metadata.is_file() {
         return CandidateState::Absent;
     }
     if metadata.len() > MAX_WORKSPACE_INSTRUCTION_SOURCE_BYTES as u64 {
         return CandidateState::Unavailable;
     }
-    let file = match root.open(candidate) {
+    let file = match root.open(relative) {
         Ok(file) => file,
         Err(_) => return CandidateState::Unavailable,
     };
-    read_instruction(file, candidate, scope_key(".", candidate), cancellation)
+    read_instruction(file, display, scope, cancellation)
 }
 
 fn observe_ambient(path: &Path, display: &str, cancellation: &CancellationToken) -> CandidateState {
@@ -931,6 +1108,7 @@ mod tests {
             Arc::clone(authority.root()),
             authority.canonical_path().to_owned(),
             Some((home.0.join(".dsh"), "~/.dsh/AGENTS.md")),
+            Vec::new(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -994,6 +1172,7 @@ mod tests {
             Arc::clone(authority.root()),
             authority.canonical_path().to_owned(),
             None,
+            Vec::new(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1006,6 +1185,7 @@ mod tests {
             Arc::clone(authority.root()),
             authority.canonical_path().to_owned(),
             None,
+            Vec::new(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1021,6 +1201,7 @@ mod tests {
             Arc::clone(authority.root()),
             authority.canonical_path().to_owned(),
             None,
+            Vec::new(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1044,6 +1225,7 @@ mod tests {
             Arc::clone(authority.root()),
             authority.canonical_path().to_owned(),
             None,
+            Vec::new(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1068,6 +1250,7 @@ mod tests {
             Arc::clone(authority.root()),
             authority.canonical_path().to_owned(),
             None,
+            Vec::new(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1089,6 +1272,7 @@ mod tests {
             Arc::clone(authority.root()),
             authority.canonical_path().to_owned(),
             None,
+            Vec::new(),
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1117,8 +1301,90 @@ mod tests {
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         assert!(matches!(
-            prepare_workspace_instructions(&session, &authority, &cancellation).await,
+            WorkspaceInstructionRuntime::from_authority(&authority)
+                .prepare(&session, &[], &cancellation)
+                .await,
             Err(WorkspaceInstructionError::Cancelled)
         ));
+    }
+
+    #[tokio::test]
+    async fn trusted_touch_discovers_reconciles_and_rearms_nested_instructions() {
+        let root = TempRoot::new("workspace-instructions-dynamic");
+        fs::create_dir_all(root.0.join("pkg/deep")).unwrap();
+        fs::write(root.0.join("AGENTS.md"), "root rule").unwrap();
+        fs::write(root.0.join("pkg/AGENTS.md"), "nested rule").unwrap();
+        fs::write(root.0.join("pkg/AGENTS.local.md"), "nested local rule").unwrap();
+        fs::write(root.0.join("pkg/deep/file.txt"), "hello").unwrap();
+        let authority = WorkspaceAuthority::open(&root.0).unwrap();
+        let runtime = WorkspaceInstructionRuntime::from_authority_without_home(&authority);
+        let cancellation = CancellationToken::new();
+        let mut session = Session::new("workspace-instructions-dynamic").unwrap();
+
+        let baseline = runtime
+            .prepare(&session, &[], &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(text(&baseline).contains("Instructions from: AGENTS.md"));
+        append_context(&mut session, baseline);
+
+        let nested = runtime
+            .prepare(&session, &["pkg/deep/file.txt".to_owned()], &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        let nested_text = text(&nested);
+        assert!(nested_text.contains("Additional instructions from: pkg/AGENTS.md"));
+        assert!(nested_text.contains("Additional instructions from: pkg/AGENTS.local.md"));
+        assert!(nested_text.find("pkg/AGENTS.md") < nested_text.find("pkg/AGENTS.local.md"));
+        append_context(&mut session, nested);
+
+        fs::write(root.0.join("pkg/AGENTS.md"), "updated nested rule").unwrap();
+        let changed = runtime
+            .prepare(&session, &[], &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(text(&changed).contains("Updated instructions from: pkg/AGENTS.md"));
+        assert!(text(&changed).contains("updated nested rule"));
+        append_context(&mut session, changed);
+
+        fs::remove_file(root.0.join("pkg/AGENTS.md")).unwrap();
+        let removed = runtime
+            .prepare(&session, &[], &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(text(&removed).contains("Instructions removed: pkg/AGENTS.md"));
+
+        // A compacted surface has no visible instruction message. The
+        // process-local directory hint is enough to rebuild the full baseline.
+        let compacted = Session::new("workspace-instructions-rearm").unwrap();
+        let rearmed = runtime
+            .prepare(&compacted, &[], &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(text(&rearmed).contains("Instructions from: pkg/AGENTS.local.md"));
+    }
+
+    #[test]
+    fn touch_paths_are_confined_and_expand_shallow_to_deep() {
+        let root = TempRoot::new("workspace-instructions-touch-paths");
+        let authority = WorkspaceAuthority::open(&root.0).unwrap();
+        assert_eq!(
+            touched_directories("pkg/deep/file.rs", &authority),
+            ["pkg", "pkg/deep"]
+        );
+        assert_eq!(
+            touched_directories(
+                root.0.join("pkg/deep/file.rs").to_str().unwrap(),
+                &authority
+            ),
+            ["pkg", "pkg/deep"]
+        );
+        assert!(touched_directories("../outside", &authority).is_empty());
+        assert!(touched_directories("root.txt", &authority).is_empty());
     }
 }

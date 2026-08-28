@@ -44,7 +44,9 @@ use crate::{
         RequestHeaderReason, Session, SessionId, SessionStore, StepId, SurfaceIntent, ToolFailure,
         TurnEndReason, TurnId, UnixMillis,
     },
+    tools::WorkspaceToolRegistry,
     workspace_authority::WorkspaceAuthority,
+    workspace_instructions::WorkspaceInstructionRuntime,
 };
 
 const NORMAL_RESULT_BOUND: usize = 128 * 1024;
@@ -1281,6 +1283,221 @@ async fn cancellation_before_step_entry_does_not_consume_workspace_context() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn successful_builtin_read_refreshes_nested_instructions_after_step_end() {
+    let root = std::env::temp_dir().join(format!(
+        "dsh-agent-workspace-refresh-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(root.join("pkg/deep")).unwrap();
+    std::fs::write(root.join("AGENTS.md"), "root rule").unwrap();
+    std::fs::write(root.join("pkg/AGENTS.md"), "nested package rule").unwrap();
+    std::fs::write(root.join("pkg/deep/file.txt"), "hello\n").unwrap();
+
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
+            StreamChunk::block_end(
+                0,
+                ContentBlock::tool_call(
+                    "read-nested",
+                    "read",
+                    r#"{"file_path":"pkg/deep/file.txt"}"#,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+        ],
+        text_response(),
+    ]));
+    let registry = Arc::new(WorkspaceToolRegistry::open(&root).unwrap());
+    let authority = WorkspaceAuthority::open(&root).unwrap();
+    let runtime = WorkspaceInstructionRuntime::from_authority_without_home(&authority);
+    let session = Session::with_clock(
+        "workspace-refresh-read",
+        IncrementingClock(Mutex::new(1_000)),
+    )
+    .unwrap();
+    let baseline = runtime
+        .prepare(&session, &[], &CancellationToken::new())
+        .await
+        .unwrap();
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(registry.schemas().to_vec())
+        .unwrap();
+    let tools: Arc<dyn ToolExecutor> = registry;
+    let mut agent = AgentLoop::with_runtime(
+        session,
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+    agent.install_workspace_context(baseline);
+    agent.install_workspace_instruction_runtime(runtime);
+
+    agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].iter().any(|message| {
+        message.content().iter().any(|block| {
+            matches!(block.kind(), ContentBlockKind::Text { text } if text.contains("root rule"))
+        })
+    }));
+    assert!(requests[1].iter().any(|message| {
+        message.content().iter().any(|block| {
+            matches!(block.kind(), ContentBlockKind::Text { text } if text.contains("Additional instructions from: pkg/AGENTS.md") && text.contains("nested package rule"))
+        })
+    }));
+
+    let events = agent.session().events();
+    let first_step_end = events
+        .iter()
+        .position(|event| matches!(event.kind(), EventKind::StepEnd { .. }))
+        .unwrap();
+    let nested_context = events
+        .iter()
+        .position(|event| match event.kind() {
+            EventKind::UserMessage { message }
+                if message.source().raw().as_value()["kind"] == "agent-instructions" =>
+            {
+                message.content().iter().any(|block| {
+                    matches!(block.kind(), ContentBlockKind::Text { text } if text.contains("pkg/AGENTS.md"))
+                })
+            }
+            _ => false,
+        })
+        .unwrap();
+    assert!(first_step_end < nested_context);
+    assert!(
+        events[first_step_end + 1..nested_context]
+            .iter()
+            .any(|event| matches!(event.kind(), EventKind::StepStart { .. }))
+    );
+
+    agent.shutdown().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+struct TouchThenCancelTools {
+    turn_cancellation: CancellationToken,
+}
+
+impl ToolExecutor for TouchThenCancelTools {
+    fn execute(
+        &self,
+        request: ToolExecutionRequest,
+        _cancellation: CancellationToken,
+    ) -> ToolExecutionFuture<'_> {
+        let turn_cancellation = self.turn_cancellation.clone();
+        Box::pin(async move {
+            if request.name() == "read" {
+                return ToolExecutionResult::success(vec![ContentBlock::text("hello").unwrap()])
+                    .map(|result| result.with_workspace_touch("pkg/deep/file.txt".to_owned()))
+                    .map_err(|error| ToolExecutorError::new(error.to_string()));
+            }
+            turn_cancellation.cancel();
+            ToolExecutionResult::success(vec![ContentBlock::text("cancelled").unwrap()])
+                .map_err(|error| ToolExecutorError::new(error.to_string()))
+        })
+    }
+}
+
+#[tokio::test]
+async fn committed_touch_survives_a_later_sibling_cancellation_until_the_next_turn() {
+    let root = std::env::temp_dir().join(format!(
+        "dsh-agent-workspace-refresh-cancel-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(root.join("pkg/deep")).unwrap();
+    std::fs::write(root.join("pkg/AGENTS.md"), "nested after cancellation").unwrap();
+    let authority = WorkspaceAuthority::open(&root).unwrap();
+    let runtime = WorkspaceInstructionRuntime::from_authority_without_home(&authority);
+    let turn_cancellation = CancellationToken::new();
+    let tools = Arc::new(TouchThenCancelTools {
+        turn_cancellation: turn_cancellation.clone(),
+    });
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            StreamChunk::block_start(0, ContentBlockType::ToolCall).unwrap(),
+            StreamChunk::block_end(
+                0,
+                ContentBlock::tool_call(
+                    "read-before-cancel",
+                    "read",
+                    r#"{"file_path":"pkg/deep/file.txt"}"#,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            StreamChunk::block_start(1, ContentBlockType::ToolCall).unwrap(),
+            StreamChunk::block_end(
+                1,
+                ContentBlock::tool_call("cancel-after-read", "abort_step", "{}").unwrap(),
+            )
+            .unwrap(),
+            StreamChunk::finish(FinishReason::tool_calls().unwrap(), None).unwrap(),
+        ],
+        text_response(),
+    ]));
+    let schemas = ["read", "abort_step"]
+        .into_iter()
+        .map(|name| {
+            ToolSchema::new(
+                name,
+                "test tool",
+                JsonValue::new(json!({
+                    "type": "object",
+                    "additionalProperties": true
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let config = AgentLoopConfig::new(LlmCallConfig::new("mock", "model").unwrap())
+        .with_tools(schemas)
+        .unwrap();
+    let mut agent = AgentLoop::with_runtime(
+        Session::with_clock(
+            "workspace-refresh-cancel",
+            IncrementingClock(Mutex::new(1_000)),
+        )
+        .unwrap(),
+        provider.clone(),
+        tools,
+        Arc::new(FixedRuntime::default()),
+        config,
+    )
+    .unwrap();
+    agent.install_workspace_instruction_runtime(runtime);
+
+    let cancelled = agent
+        .run_turn(TurnProposal::Enter(vec![user()]), turn_cancellation)
+        .await
+        .unwrap();
+    assert!(matches!(cancelled.reason(), TurnEndReason::Aborted { .. }));
+    assert_eq!(provider.requests().len(), 1);
+
+    agent
+        .run_turn(TurnProposal::Enter(vec![user()]), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(provider.requests()[1].iter().any(|message| {
+        message.content().iter().any(|block| {
+            matches!(block.kind(), ContentBlockKind::Text { text } if text.contains("nested after cancellation"))
+        })
+    }));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn tool_response() -> Vec<StreamChunk> {
     tool_response_with_id("call-1")
 }
@@ -2398,6 +2615,13 @@ async fn hard_wire_limit_prunes_a_durable_tool_result_before_entering_the_step()
 async fn pressure_summary_compacts_once_and_continues_the_same_input() {
     let (session, journal, root, workspace) =
         durable_session_with_event_room("agent-pressure-summary", 1_024).await;
+    std::fs::write(workspace.join("AGENTS.md"), "rearm after compaction").unwrap();
+    let authority = WorkspaceAuthority::open(&workspace).unwrap();
+    let workspace_runtime = WorkspaceInstructionRuntime::from_authority_without_home(&authority);
+    let workspace_context = workspace_runtime
+        .prepare(&session, &[], &CancellationToken::new())
+        .await
+        .unwrap();
     let provider = Arc::new(ScriptedProvider::new(vec![
         text_response_with("a".repeat(10_000)),
         text_response_with("the old request asked for a long fixture"),
@@ -2415,6 +2639,8 @@ async fn pressure_summary_compacts_once_and_continues_the_same_input() {
         config,
     )
     .unwrap();
+    agent.install_workspace_context(workspace_context);
+    agent.install_workspace_instruction_runtime(workspace_runtime);
 
     let first = agent
         .run_turn(
@@ -2483,6 +2709,12 @@ async fn pressure_summary_compacts_once_and_continues_the_same_input() {
             crate::model::MessageSourceKind::Plugin { plugin, .. }
                 if plugin == "compact"
         )
+    }));
+    assert!(requests[2].iter().any(|message| {
+        message.source().raw().as_value()["kind"] == "agent-instructions"
+            && message.content().iter().any(|block| {
+                matches!(block.kind(), ContentBlockKind::Text { text } if text.contains("rearm after compaction"))
+            })
     }));
     assert!(
         requests[2]
@@ -4412,6 +4644,7 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         .with_shell_policy(ShellPolicy::Allow);
     let mut request_header_logged = true;
     let mut exact_shell_grants = super::approval::ExactShellGrantStore::new();
+    let mut pending_workspace_touches = Vec::new();
     let mut driver = super::Driver {
         provider: &provider,
         tools: tools.as_ref(),
@@ -4431,6 +4664,8 @@ async fn shell_prestart_claim_growth_failure_releases_the_whole_round_atomically
         durable_limit: None,
         deadline: tokio::time::Instant::now() + Duration::from_secs(30),
         goal_tool_caller: super::GoalToolCaller::Untrusted,
+        workspace_instructions: None,
+        pending_workspace_touches: &mut pending_workspace_touches,
     };
     let budget_failure = super::failure_reason(
         "AGENT_EVENT_BUDGET",

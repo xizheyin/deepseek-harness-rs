@@ -19,7 +19,7 @@ use crate::{
     tools::{LocalToolRegistry, PluginConfig, WorkspaceFileCatalogue},
     user_question::{UserQuestionBroker, UserQuestionReceiver},
     workspace_authority::WorkspaceAuthority,
-    workspace_instructions::prepare_workspace_instructions,
+    workspace_instructions::WorkspaceInstructionRuntime,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -172,11 +172,14 @@ pub(super) async fn assemble_session(
         interactive.then(|| WorkspaceFileCatalogue::from_authority(authority.clone()));
     let goal = interactive.then(|| GoalRuntime::from_replay(session.state().goal_replay()));
     let plan_mode = PlanModeRuntime::new(session.state().plan_mode_active());
-    let workspace_context =
-        match prepare_workspace_instructions(&session, &authority, &cancellation).await {
-            Ok(context) => context,
-            Err(_) => return Err(AssemblyFailure::new(AssemblyError::Agent, session)),
-        };
+    let workspace_instruction_runtime = WorkspaceInstructionRuntime::from_authority(&authority);
+    let workspace_context = match workspace_instruction_runtime
+        .prepare(&session, &[], &cancellation)
+        .await
+    {
+        Ok(context) => context,
+        Err(_) => return Err(AssemblyFailure::new(AssemblyError::Agent, session)),
+    };
     let (user_questions, question_receiver) = if interactive {
         let (broker, receiver) = UserQuestionBroker::new();
         (Some(broker), Some(receiver))
@@ -267,6 +270,7 @@ pub(super) async fn assemble_session(
             }
         };
         agent.install_workspace_context(workspace_context);
+        agent.install_workspace_instruction_runtime(workspace_instruction_runtime);
         Ok(AgentAssembly::Interactive(InteractiveAssembly {
             agent,
             events,
@@ -288,6 +292,7 @@ pub(super) async fn assemble_session(
         match AgentLoop::new_preserving_session(session, provider, tools, config) {
             Ok(mut agent) => {
                 agent.install_workspace_context(workspace_context);
+                agent.install_workspace_instruction_runtime(workspace_instruction_runtime);
                 Ok(AgentAssembly::Script(agent))
             }
             Err((_error, session)) => {

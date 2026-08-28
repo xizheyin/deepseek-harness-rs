@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–25 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–26 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -33,6 +33,7 @@ for behavior that users can run today.
 | 23 | Durable terminal Plan Mode and reviewed exit | `complete` | [`validation/phase-23.md`](validation/phase-23.md) |
 | 24 | Durable model Todo list and terminal standing plan | `complete` | [`validation/phase-24.md`](validation/phase-24.md) |
 | 25 | Durable startup/resume workspace instructions | `complete` | [`validation/phase-25.md`](validation/phase-25.md) |
+| 26 | Tool-driven nested workspace-instruction refresh | `complete` | [`validation/phase-26.md`](validation/phase-26.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -382,6 +383,26 @@ instructions after a successful `read`/`apply_patch`, and same-process rearming
 after compaction, require the tool-result boundary and remain the next explicit
 gap rather than being approximated by shell parsing or a file watcher. Local,
 focused acceptance remains in force.
+
+## Phase 26 dynamic workspace-instruction boundary (2026-08-29)
+
+Phase 26 closes the deferred active-turn half of Phase 25. A successful
+built-in `read` result or a definitely committed built-in `apply_patch`
+publishes one private, capability-relative file-touch fact. After the enclosing
+`step/end`, the Agent batches those facts, checks root plus applicable nested
+instruction scopes, and places at most one bounded instruction message into
+the next model step. A failed read, rejected or uncommitted patch, cancelled
+tool, Shell command, search tool, or subprocess plugin cannot create this fact.
+
+The touch is private process state, not model-visible result metadata and not
+reconstructed from a model argument inside the Agent. This keeps a plugin
+named `read` from impersonating a built-in file tool. Loaded nested scopes are
+reconciled from the visible append-only Session facts, so change, removal,
+resume, and post-compaction rearming use the same state rather than a hidden
+second database. Discovery stays within the exact opened workspace, retains
+the Phase 25 no-symlink policy, batches at most the existing per-step tool-call
+limit, and retains the existing 1 MiB per-source and 65,536-byte rendered
+limits. Acceptance is local-only and focused as requested.
 
 ## Still deferred
 

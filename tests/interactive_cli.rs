@@ -1843,7 +1843,11 @@ fn goal_command_runs_sequential_rounds_until_the_model_completes_it() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert!(names.ends_with(&["get_goal", "create_goal", "update_goal"]));
+    assert!(
+        names
+            .windows(3)
+            .any(|window| window == ["get_goal", "create_goal", "update_goal"])
+    );
 }
 
 #[test]
@@ -3100,6 +3104,94 @@ fn workspace_instructions_persist_reconcile_and_do_not_duplicate_on_resume() {
     assert_eq!(
         user_rows[3]["data"]["source"]["changes"][0]["action"],
         "replace"
+    );
+}
+
+#[test]
+fn successful_read_injects_nested_workspace_instructions_into_the_next_real_request() {
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-read-nested-instructions",
+            "read",
+            serde_json::json!({ "file_path": "pkg/deep/file.txt" }),
+        ),
+        text_sse("Nested guidance applied."),
+    ]);
+    let workspace = TestWorkspace::new();
+    std::fs::create_dir_all(workspace.0.join("pkg/deep")).unwrap();
+    std::fs::write(
+        workspace.0.join("AGENTS.md"),
+        "Use the root dynamic instruction fixture.",
+    )
+    .unwrap();
+    std::fs::write(
+        workspace.0.join("pkg/AGENTS.md"),
+        "Use the nested dynamic instruction fixture.",
+    )
+    .unwrap();
+    std::fs::write(workspace.0.join("pkg/deep/file.txt"), "hello\n").unwrap();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"read the nested fixture and continue\r");
+    dsh.expect(b"Nested guidance applied.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(requests.len(), 2);
+    assert!(
+        tool_message_content(&requests[1], "call-read-nested-instructions")
+            .contains("pkg/deep/file.txt")
+    );
+    assert!(user_contents(&requests[1]).iter().any(|content| {
+        content.contains("Additional instructions from: pkg/AGENTS.md")
+            && content.contains("Use the nested dynamic instruction fixture.")
+    }));
+
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let rows = std::fs::read_to_string(entry.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let result_index = rows
+        .iter()
+        .position(|row| row["type"] == "tool/result")
+        .unwrap();
+    let first_step_end = rows
+        .iter()
+        .position(|row| row["type"] == "step/end")
+        .unwrap();
+    let nested_context = rows
+        .iter()
+        .position(|row| {
+            row["type"] == "user/message"
+                && row["data"]["source"]["kind"] == "agent-instructions"
+                && row["data"]["source"]["changes"]
+                    .as_array()
+                    .is_some_and(|changes| {
+                        changes
+                            .iter()
+                            .any(|change| change["path"] == "pkg/AGENTS.md")
+                    })
+        })
+        .unwrap();
+    assert!(result_index < first_step_end && first_step_end < nested_context);
+    assert!(
+        rows[first_step_end + 1..nested_context]
+            .iter()
+            .any(|row| row["type"] == "step/start")
     );
 }
 

@@ -101,7 +101,8 @@ instruction event/request order and cancellation before entry. A real offline
 CLI journey proves a workspace `AGENTS.md` reaches the first DeepSeek-shaped
 request and durable JSONL exactly once.
 
-The compatibility row remains `partial`: nested tool-touch discovery,
-same-process compaction rearming, parent `.git` traversal, configurable names,
-and upstream symlink following are absent or intentionally different, and no
-generated cross-language oracle exists yet.
+Phase 26 adds trusted built-in tool-touch discovery and same-process compaction
+rearming; see `workspace-instruction-refresh.md`. The compatibility row remains
+`partial`: parent `.git` traversal and upstream symlink following are
+intentional privacy differences, configurable names and nested composite-tool
+bubbling remain absent, and no generated cross-language oracle exists yet.
