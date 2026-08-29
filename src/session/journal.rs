@@ -62,6 +62,19 @@ enum Command {
         cancellation: CancellationToken,
         ack: oneshot::Sender<Result<u64, JournalExportError>>,
     },
+    InspectFork {
+        anchor: Option<u64>,
+        cancellation: CancellationToken,
+        ack: oneshot::Sender<Result<ForkFlightResult, JournalForkError>>,
+    },
+    CopyFork {
+        boundary: JournalForkBoundary,
+        destination: File,
+        header_line: Vec<u8>,
+        suffix: Vec<u8>,
+        cancellation: CancellationToken,
+        ack: oneshot::Sender<Result<ForkFlightResult, JournalForkError>>,
+    },
     Finish {
         ack: oneshot::Sender<Result<JournalCursor, JournalError>>,
     },
@@ -105,6 +118,16 @@ struct ExportFlight {
     ack: oneshot::Receiver<Result<u64, JournalExportError>>,
 }
 
+enum ForkFlightResult {
+    Boundary(JournalForkBoundary),
+    Copied(u64),
+}
+
+struct ForkFlight {
+    cancellation: CancellationToken,
+    ack: oneshot::Receiver<Result<ForkFlightResult, JournalForkError>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadCommandError {
     Cancelled,
@@ -117,6 +140,44 @@ pub(crate) enum JournalExportError {
     Cancelled,
     #[error("the session journal export destination failed")]
     Destination,
+    #[error(transparent)]
+    Writer(#[from] JournalError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JournalForkBoundary {
+    header_end: u64,
+    seed_end: u64,
+    seed_events: u64,
+    seed_ends_with_end_seed: bool,
+    source_events: u64,
+    source_durable_offset: u64,
+}
+
+impl JournalForkBoundary {
+    pub(crate) fn seed_events(self) -> u64 {
+        self.seed_events
+    }
+
+    pub(crate) fn source_events(self) -> u64 {
+        self.source_events
+    }
+
+    pub(crate) fn seed_ends_with_end_seed(self) -> bool {
+        self.seed_ends_with_end_seed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum JournalForkError {
+    #[error("the Session has no completed turn available for this fork anchor")]
+    Unavailable,
+    #[error("the Session fork was cancelled")]
+    Cancelled,
+    #[error("the Session fork destination failed")]
+    Destination,
+    #[error("the inspected Session fork source changed")]
+    Changed,
     #[error(transparent)]
     Writer(#[from] JournalError),
 }
@@ -240,6 +301,7 @@ pub(crate) struct JournalWriter {
     flight: Option<Flight>,
     read_flight: Option<ReadFlight>,
     export_flight: Option<ExportFlight>,
+    fork_flight: Option<ForkFlight>,
     join: Option<thread::JoinHandle<()>>,
     cursor: JournalCursor,
     poisoned: bool,
@@ -256,6 +318,8 @@ impl std::fmt::Debug for JournalWriter {
             .field("pending", &self.pending.as_ref().map(PendingWrite::len))
             .field("flight", &self.flight.is_some())
             .field("read_flight", &self.read_flight.is_some())
+            .field("export_flight", &self.export_flight.is_some())
+            .field("fork_flight", &self.fork_flight.is_some())
             .field("cursor", &self.cursor)
             .field("poisoned", &self.poisoned)
             .field("finished", &self.finished)
@@ -311,6 +375,7 @@ impl JournalWriter {
             flight: None,
             read_flight: None,
             export_flight: None,
+            fork_flight: None,
             join: Some(join),
             cursor,
             poisoned: false,
@@ -378,7 +443,7 @@ impl JournalWriter {
 
     pub(crate) fn ensure_stageable(&self) -> Result<(), JournalError> {
         self.ensure_usable()?;
-        if self.flight.is_some() || self.export_flight.is_some() {
+        if self.flight.is_some() || self.export_flight.is_some() || self.fork_flight.is_some() {
             return Err(JournalError::FlightInProgress);
         }
         if self.read_flight.is_some() {
@@ -441,6 +506,7 @@ impl JournalWriter {
     pub(crate) async fn settle_before_stage(&mut self) -> Result<JournalCursor, JournalError> {
         self.ensure_usable()?;
         self.settle_export_before_other_command().await?;
+        self.settle_fork_before_other_command().await?;
         if self.read_flight.is_some() {
             self.settle_read_before_other_command().await?;
         }
@@ -454,6 +520,7 @@ impl JournalWriter {
     pub(crate) async fn barrier(&mut self) -> Result<JournalCursor, JournalError> {
         self.ensure_usable()?;
         self.settle_export_before_other_command().await?;
+        self.settle_fork_before_other_command().await?;
         if self.read_flight.is_some() {
             self.settle_read_before_other_command().await?;
         }
@@ -479,8 +546,15 @@ impl JournalWriter {
             return self.finish_error.map_or(Ok(self.cursor), Err);
         }
         let settle_export = self.settle_export_before_other_command().await;
+        let settle_fork = if settle_export.is_ok() {
+            self.settle_fork_before_other_command().await
+        } else {
+            Ok(())
+        };
         let settle = if settle_export.is_err() {
             settle_export.map(|()| self.cursor)
+        } else if settle_fork.is_err() {
+            settle_fork.map(|()| self.cursor)
         } else if self.read_flight.is_some() {
             self.settle_read_before_other_command()
                 .await
@@ -519,6 +593,9 @@ impl JournalWriter {
     ) -> Result<Vec<u8>, JournalReadError> {
         self.ensure_usable().map_err(JournalReadError::Writer)?;
         self.settle_export_before_other_command()
+            .await
+            .map_err(JournalReadError::Writer)?;
+        self.settle_fork_before_other_command()
             .await
             .map_err(JournalReadError::Writer)?;
         if let Some(active) = self.read_flight.as_ref() {
@@ -592,6 +669,9 @@ impl JournalWriter {
         cancellation: CancellationToken,
     ) -> Result<u64, JournalExportError> {
         self.ensure_usable().map_err(JournalExportError::Writer)?;
+        self.settle_fork_before_other_command()
+            .await
+            .map_err(JournalExportError::Writer)?;
         self.settle_export_before_other_command()
             .await
             .map_err(JournalExportError::Writer)?;
@@ -640,6 +720,120 @@ impl JournalWriter {
             ack: receiver,
         });
         self.settle_export_flight().await
+    }
+
+    pub(crate) async fn inspect_fork(
+        &mut self,
+        anchor: Option<u64>,
+        cancellation: CancellationToken,
+    ) -> Result<JournalForkBoundary, JournalForkError> {
+        self.prepare_fork_command(&cancellation).await?;
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(JournalForkError::Writer(JournalError::WriterStopped))?;
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| JournalForkError::Writer(JournalError::WriterStopped))?;
+        let (ack, receiver) = oneshot::channel();
+        let owned_cancellation = cancellation.child_token();
+        permit.send(Command::InspectFork {
+            anchor,
+            cancellation: owned_cancellation.clone(),
+            ack,
+        });
+        self.fork_flight = Some(ForkFlight {
+            cancellation: owned_cancellation,
+            ack: receiver,
+        });
+        match self.settle_fork_flight().await? {
+            ForkFlightResult::Boundary(boundary) => Ok(boundary),
+            ForkFlightResult::Copied(_) => {
+                Err(JournalForkError::Writer(JournalError::FlightInProgress))
+            }
+        }
+    }
+
+    pub(crate) async fn copy_fork_to(
+        &mut self,
+        boundary: JournalForkBoundary,
+        destination: File,
+        header_line: Vec<u8>,
+        suffix: Vec<u8>,
+        cancellation: CancellationToken,
+    ) -> Result<u64, JournalForkError> {
+        self.prepare_fork_command(&cancellation).await?;
+        if self.cursor.durable_offset != boundary.source_durable_offset {
+            return Err(JournalForkError::Changed);
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(JournalForkError::Writer(JournalError::WriterStopped))?;
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| JournalForkError::Writer(JournalError::WriterStopped))?;
+        let (ack, receiver) = oneshot::channel();
+        let owned_cancellation = cancellation.child_token();
+        permit.send(Command::CopyFork {
+            boundary,
+            destination,
+            header_line,
+            suffix,
+            cancellation: owned_cancellation.clone(),
+            ack,
+        });
+        self.fork_flight = Some(ForkFlight {
+            cancellation: owned_cancellation,
+            ack: receiver,
+        });
+        match self.settle_fork_flight().await? {
+            ForkFlightResult::Copied(bytes) => Ok(bytes),
+            ForkFlightResult::Boundary(_) => {
+                Err(JournalForkError::Writer(JournalError::FlightInProgress))
+            }
+        }
+    }
+
+    async fn prepare_fork_command(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), JournalForkError> {
+        self.ensure_usable().map_err(JournalForkError::Writer)?;
+        self.settle_export_before_other_command()
+            .await
+            .map_err(JournalForkError::Writer)?;
+        self.settle_fork_before_other_command()
+            .await
+            .map_err(JournalForkError::Writer)?;
+        if self.read_flight.is_some() {
+            self.settle_read_before_other_command()
+                .await
+                .map_err(JournalForkError::Writer)?;
+        }
+        if self.pending.is_some() {
+            self.flush_staged()
+                .await
+                .map_err(JournalForkError::Writer)?;
+        } else if self.flight.is_some() {
+            self.settle_flight()
+                .await
+                .map_err(JournalForkError::Writer)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(JournalForkError::Cancelled);
+        }
+        if self.cursor.physical_offset != self.cursor.durable_offset {
+            self.send_control(FlightKind::Barrier)
+                .await
+                .map_err(JournalForkError::Writer)?;
+        }
+        cancellation
+            .is_cancelled()
+            .then_some(())
+            .map_or(Ok(()), |_| Err(JournalForkError::Cancelled))
     }
 
     async fn send_control(&mut self, kind: FlightKind) -> Result<JournalCursor, JournalError> {
@@ -784,6 +978,50 @@ impl JournalWriter {
         }
     }
 
+    async fn settle_fork_flight(&mut self) -> Result<ForkFlightResult, JournalForkError> {
+        let Some(flight) = self.fork_flight.as_mut() else {
+            return Err(JournalForkError::Writer(JournalError::FlightInProgress));
+        };
+        let result = (&mut flight.ack).await;
+        self.fork_flight = None;
+        match result {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(
+                error @ (JournalForkError::Unavailable
+                | JournalForkError::Cancelled
+                | JournalForkError::Destination
+                | JournalForkError::Changed),
+            )) => Err(error),
+            Ok(Err(JournalForkError::Writer(error))) => {
+                self.poisoned = true;
+                Err(JournalForkError::Writer(error))
+            }
+            Err(_) => {
+                self.poisoned = true;
+                self.sender.take();
+                let _ = self.join_worker();
+                Err(JournalForkError::Writer(JournalError::WriterStopped))
+            }
+        }
+    }
+
+    async fn settle_fork_before_other_command(&mut self) -> Result<(), JournalError> {
+        let Some(flight) = &self.fork_flight else {
+            return Ok(());
+        };
+        flight.cancellation.cancel();
+        match self.settle_fork_flight().await {
+            Ok(_)
+            | Err(
+                JournalForkError::Unavailable
+                | JournalForkError::Cancelled
+                | JournalForkError::Destination
+                | JournalForkError::Changed,
+            ) => Ok(()),
+            Err(JournalForkError::Writer(error)) => Err(error),
+        }
+    }
+
     fn join_worker(&mut self) -> Result<(), JournalError> {
         if self.join.take().is_some_and(|join| join.join().is_err()) {
             self.poisoned = true;
@@ -822,6 +1060,9 @@ impl Drop for JournalWriter {
             flight.cancellation.cancel();
         }
         if let Some(flight) = &self.export_flight {
+            flight.cancellation.cancel();
+        }
+        if let Some(flight) = &self.fork_flight {
             flight.cancellation.cancel();
         }
         self.sender.take();
@@ -896,6 +1137,49 @@ fn writer_main(mut file: File, initial_offset: u64, mut receiver: mpsc::Receiver
                 } else {
                     export_raw(&file, cursor, destination, &cancellation).inspect_err(|error| {
                         poisoned |= matches!(error, JournalExportError::Writer(_));
+                    })
+                };
+                let _ = ack.send(result);
+            }
+            Command::InspectFork {
+                anchor,
+                cancellation,
+                ack,
+            } => {
+                let result = if poisoned {
+                    Err(JournalForkError::Writer(JournalError::Poisoned))
+                } else {
+                    inspect_fork(&file, cursor, anchor, &cancellation)
+                        .map(ForkFlightResult::Boundary)
+                        .inspect_err(|error| {
+                            poisoned |= matches!(error, JournalForkError::Writer(_));
+                        })
+                };
+                let _ = ack.send(result);
+            }
+            Command::CopyFork {
+                boundary,
+                destination,
+                header_line,
+                suffix,
+                cancellation,
+                ack,
+            } => {
+                let result = if poisoned {
+                    Err(JournalForkError::Writer(JournalError::Poisoned))
+                } else {
+                    copy_fork(
+                        &file,
+                        cursor,
+                        boundary,
+                        destination,
+                        &header_line,
+                        &suffix,
+                        &cancellation,
+                    )
+                    .map(ForkFlightResult::Copied)
+                    .inspect_err(|error| {
+                        poisoned |= matches!(error, JournalForkError::Writer(_));
                     })
                 };
                 let _ = ack.send(result);
@@ -1067,6 +1351,273 @@ fn export_raw_with_chunk_observer(
     Ok(offset)
 }
 
+#[derive(Clone, Copy)]
+struct ForkCut {
+    seed_end: u64,
+    seed_events: u64,
+    ends_with_end_seed: bool,
+}
+
+fn inspect_fork(
+    source: &File,
+    cursor: JournalCursor,
+    anchor: Option<u64>,
+    cancellation: &CancellationToken,
+) -> Result<JournalForkBoundary, JournalForkError> {
+    if cancellation.is_cancelled() {
+        return Err(JournalForkError::Cancelled);
+    }
+    if cursor.physical_offset != cursor.durable_offset {
+        return Err(JournalForkError::Writer(JournalError::Poisoned));
+    }
+    let (_, header_end) = read_bounded_line_at(
+        source,
+        0,
+        cursor.durable_offset,
+        super::jsonl::MAX_JOURNAL_HEADER_LINE_BYTES,
+        cancellation,
+    )?;
+    let mut offset = header_end;
+    let mut source_events = 0_u64;
+    let mut last_seq = None;
+    let mut last_completed = None;
+    let mut last_completed_active = false;
+    let mut anchored = None;
+    let mut anchored_active = false;
+
+    while offset < cursor.durable_offset {
+        let (line, next) = read_bounded_line_at(
+            source,
+            offset,
+            cursor.durable_offset,
+            super::jsonl::MAX_JOURNAL_EVENT_LINE_BYTES,
+            cancellation,
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&line)
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        let fields = value
+            .as_object()
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        let seq = fields
+            .get("seq")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        if seq != source_events {
+            return Err(JournalForkError::Writer(JournalError::Poisoned));
+        }
+        let event_type = fields
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        let ends_with_end_seed = event_type == "session/end-seed";
+        let current = ForkCut {
+            seed_end: next,
+            seed_events: seq
+                .checked_add(1)
+                .ok_or(JournalForkError::Writer(JournalError::Poisoned))?,
+            ends_with_end_seed,
+        };
+
+        if event_type == "turn/start" {
+            last_completed_active = false;
+            anchored_active = false;
+        } else {
+            if last_completed_active {
+                last_completed = Some(current);
+            }
+            if anchored_active {
+                anchored = Some(current);
+            }
+        }
+        if event_type == "turn/end" {
+            last_completed = Some(current);
+            last_completed_active = true;
+            if anchored.is_none() && anchor.is_some_and(|anchor| seq >= anchor) {
+                anchored = Some(current);
+                anchored_active = true;
+            }
+        }
+
+        source_events = source_events
+            .checked_add(1)
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        last_seq = Some(seq);
+        offset = next;
+    }
+    if offset != cursor.durable_offset {
+        return Err(JournalForkError::Writer(JournalError::Poisoned));
+    }
+    let selected = match anchor {
+        Some(_) if anchored.is_some() => anchored,
+        Some(anchor) if last_seq.is_none_or(|last| anchor > last) => last_completed,
+        Some(_) => None,
+        None => last_completed,
+    }
+    .ok_or(JournalForkError::Unavailable)?;
+    Ok(JournalForkBoundary {
+        header_end,
+        seed_end: selected.seed_end,
+        seed_events: selected.seed_events,
+        seed_ends_with_end_seed: selected.ends_with_end_seed,
+        source_events,
+        source_durable_offset: cursor.durable_offset,
+    })
+}
+
+fn read_bounded_line_at(
+    source: &File,
+    start: u64,
+    durable_end: u64,
+    maximum: usize,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<u8>, u64), JournalForkError> {
+    if start >= durable_end || maximum == 0 {
+        return Err(JournalForkError::Writer(JournalError::Poisoned));
+    }
+    let mut line = Vec::new();
+    line.try_reserve(EXPORT_CHUNK_BYTES.min(maximum))
+        .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+    let mut buffer = [0_u8; EXPORT_CHUNK_BYTES];
+    let mut offset = start;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(JournalForkError::Cancelled);
+        }
+        let remaining = durable_end
+            .checked_sub(offset)
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        if remaining == 0 || line.len() >= maximum {
+            return Err(JournalForkError::Writer(JournalError::Poisoned));
+        }
+        let available = maximum - line.len();
+        let length = usize::try_from(
+            remaining
+                .min(EXPORT_CHUNK_BYTES as u64)
+                .min(u64::try_from(available).unwrap_or(u64::MAX)),
+        )
+        .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        source
+            .read_exact_at(&mut buffer[..length], offset)
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        if let Some(relative) = buffer[..length].iter().position(|byte| *byte == b'\n') {
+            let consumed = relative + 1;
+            line.try_reserve_exact(consumed)
+                .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+            line.extend_from_slice(&buffer[..consumed]);
+            let next = offset
+                .checked_add(
+                    u64::try_from(consumed)
+                        .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?,
+                )
+                .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+            return Ok((line, next));
+        }
+        line.try_reserve_exact(length)
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        line.extend_from_slice(&buffer[..length]);
+        offset = offset
+            .checked_add(
+                u64::try_from(length)
+                    .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?,
+            )
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+    }
+}
+
+fn copy_fork(
+    source: &File,
+    cursor: JournalCursor,
+    boundary: JournalForkBoundary,
+    destination: File,
+    header_line: &[u8],
+    suffix: &[u8],
+    cancellation: &CancellationToken,
+) -> Result<u64, JournalForkError> {
+    copy_fork_with_chunk_observer(
+        source,
+        cursor,
+        boundary,
+        destination,
+        header_line,
+        suffix,
+        cancellation,
+        |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_fork_with_chunk_observer(
+    source: &File,
+    cursor: JournalCursor,
+    boundary: JournalForkBoundary,
+    mut destination: File,
+    header_line: &[u8],
+    suffix: &[u8],
+    cancellation: &CancellationToken,
+    mut chunk_observer: impl FnMut(u64),
+) -> Result<u64, JournalForkError> {
+    if cancellation.is_cancelled() {
+        return Err(JournalForkError::Cancelled);
+    }
+    if cursor.physical_offset != cursor.durable_offset
+        || cursor.durable_offset != boundary.source_durable_offset
+        || boundary.header_end > boundary.seed_end
+        || boundary.seed_end > cursor.durable_offset
+        || header_line.is_empty()
+        || header_line.last() != Some(&b'\n')
+        || (!suffix.is_empty() && suffix.last() != Some(&b'\n'))
+    {
+        return Err(JournalForkError::Changed);
+    }
+    destination
+        .write_all(header_line)
+        .map_err(|_| JournalForkError::Destination)?;
+    let mut buffer = [0_u8; EXPORT_CHUNK_BYTES];
+    let mut offset = boundary.header_end;
+    while offset < boundary.seed_end {
+        if cancellation.is_cancelled() {
+            return Err(JournalForkError::Cancelled);
+        }
+        let remaining = boundary.seed_end - offset;
+        let length = usize::try_from(remaining.min(EXPORT_CHUNK_BYTES as u64))
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        source
+            .read_exact_at(&mut buffer[..length], offset)
+            .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?;
+        destination
+            .write_all(&buffer[..length])
+            .map_err(|_| JournalForkError::Destination)?;
+        offset = offset
+            .checked_add(
+                u64::try_from(length)
+                    .map_err(|_| JournalForkError::Writer(JournalError::Poisoned))?,
+            )
+            .ok_or(JournalForkError::Writer(JournalError::Poisoned))?;
+        chunk_observer(offset);
+    }
+    if cancellation.is_cancelled() {
+        return Err(JournalForkError::Cancelled);
+    }
+    destination
+        .write_all(suffix)
+        .map_err(|_| JournalForkError::Destination)?;
+    destination
+        .sync_all()
+        .map_err(|_| JournalForkError::Destination)?;
+    if cancellation.is_cancelled() {
+        return Err(JournalForkError::Cancelled);
+    }
+    u64::try_from(header_line.len())
+        .ok()
+        .and_then(|header| header.checked_add(boundary.seed_end - boundary.header_end))
+        .and_then(|bytes| {
+            u64::try_from(suffix.len())
+                .ok()
+                .and_then(|suffix| bytes.checked_add(suffix))
+        })
+        .ok_or(JournalForkError::Destination)
+}
+
 /// Commit a pre-encoded recovery suffix before this same thread becomes the
 /// ordinary journal writer.
 ///
@@ -1191,10 +1742,11 @@ mod tests {
     };
 
     use super::{
-        COMMAND_CAPACITY, Command, EXPORT_CHUNK_BYTES, FlightKind, JournalCursor, JournalError,
-        JournalExportError, JournalReadError, JournalWriter, ReadCommandError, append_bytes,
-        barrier_file, export_raw, export_raw_with_chunk_observer, read_row,
-        read_row_with_chunk_observer, valid_prune_prefix,
+        COMMAND_CAPACITY, Command, EXPORT_CHUNK_BYTES, FlightKind, ForkFlightResult, JournalCursor,
+        JournalError, JournalExportError, JournalForkBoundary, JournalForkError, JournalReadError,
+        JournalWriter, ReadCommandError, append_bytes, barrier_file, copy_fork,
+        copy_fork_with_chunk_observer, export_raw, export_raw_with_chunk_observer, inspect_fork,
+        read_row, read_row_with_chunk_observer, valid_prune_prefix,
     };
 
     #[tokio::test]
@@ -1333,6 +1885,146 @@ mod tests {
         );
         std::fs::remove_file(source_path).unwrap();
         std::fs::remove_file(destination_path).unwrap();
+    }
+
+    #[test]
+    fn fork_inspection_uses_completed_turn_anchors_and_trailing_facts() {
+        let (source_path, mut source) = test_file("journal-fork-inspect");
+        let bytes = fork_test_journal(true);
+        source.write_all(&bytes).unwrap();
+        source.sync_all().unwrap();
+        let cursor = JournalCursor {
+            physical_offset: bytes.len() as u64,
+            durable_offset: bytes.len() as u64,
+        };
+
+        let anchored = inspect_fork(&source, cursor, Some(1), &CancellationToken::new()).unwrap();
+        assert_eq!(anchored.seed_events(), 4);
+        assert_eq!(anchored.source_events(), 7);
+        assert!(!anchored.seed_ends_with_end_seed());
+        assert_eq!(
+            inspect_fork(&source, cursor, None, &CancellationToken::new())
+                .unwrap()
+                .seed_events(),
+            7
+        );
+        assert_eq!(
+            inspect_fork(&source, cursor, Some(999), &CancellationToken::new())
+                .unwrap()
+                .seed_events(),
+            7
+        );
+
+        std::fs::remove_file(source_path).unwrap();
+    }
+
+    #[test]
+    fn fork_copy_preserves_selected_event_rows_and_rejects_open_anchor() {
+        let (source_path, mut source) = test_file("journal-fork-copy-source");
+        let bytes = fork_test_journal(false);
+        source.write_all(&bytes).unwrap();
+        source.sync_all().unwrap();
+        let cursor = JournalCursor {
+            physical_offset: bytes.len() as u64,
+            durable_offset: bytes.len() as u64,
+        };
+        assert_eq!(
+            inspect_fork(&source, cursor, Some(4), &CancellationToken::new()).unwrap_err(),
+            super::JournalForkError::Unavailable
+        );
+        let boundary = inspect_fork(&source, cursor, Some(1), &CancellationToken::new()).unwrap();
+        let (destination_path, destination) = test_file("journal-fork-copy-destination");
+        let child_header = b"child-header\n";
+        let suffix = b"end-seed\n";
+        let written = copy_fork(
+            &source,
+            cursor,
+            boundary,
+            destination,
+            child_header,
+            suffix,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let source_header_end = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let selected_rows = bytes[source_header_end..]
+            .split_inclusive(|byte| *byte == b'\n')
+            .take(4)
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let expected = [
+            child_header.as_slice(),
+            selected_rows.as_slice(),
+            suffix.as_slice(),
+        ]
+        .concat();
+        assert_eq!(std::fs::read(&destination_path).unwrap(), expected);
+        assert_eq!(written, expected.len() as u64);
+
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
+    }
+
+    #[test]
+    fn fork_copy_observes_cancellation_between_bounded_chunks() {
+        let (source_path, mut source) = test_file("journal-fork-cancel-source");
+        let bytes = vec![b'x'; EXPORT_CHUNK_BYTES * 2 + 1];
+        source.write_all(&bytes).unwrap();
+        source.sync_all().unwrap();
+        let cursor = JournalCursor {
+            physical_offset: bytes.len() as u64,
+            durable_offset: bytes.len() as u64,
+        };
+        let boundary = JournalForkBoundary {
+            header_end: 0,
+            seed_end: bytes.len() as u64,
+            seed_events: 1,
+            seed_ends_with_end_seed: false,
+            source_events: 1,
+            source_durable_offset: bytes.len() as u64,
+        };
+        let (destination_path, destination) = test_file("journal-fork-cancel-destination");
+        let cancellation = CancellationToken::new();
+        let control = cancellation.clone();
+        let error = copy_fork_with_chunk_observer(
+            &source,
+            cursor,
+            boundary,
+            destination,
+            b"child\n",
+            b"suffix\n",
+            &cancellation,
+            move |offset| {
+                if offset == EXPORT_CHUNK_BYTES as u64 {
+                    control.cancel();
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, JournalForkError::Cancelled);
+        assert_eq!(
+            std::fs::metadata(&destination_path).unwrap().len(),
+            (b"child\n".len() + EXPORT_CHUNK_BYTES) as u64
+        );
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
+    }
+
+    fn fork_test_journal(close_second_turn: bool) -> Vec<u8> {
+        let mut rows = vec![
+            "{\"type\":\"session\",\"version\":0,\"id\":\"session-550e8400-e29b-41d4-a716-446655440000\",\"createdAt\":1}",
+            "{\"type\":\"turn/start\",\"seq\":0,\"time\":1,\"data\":{}}",
+            "{\"type\":\"user/message\",\"seq\":1,\"time\":2,\"data\":{}}",
+            "{\"type\":\"turn/end\",\"seq\":2,\"time\":3,\"data\":{}}",
+            "{\"type\":\"session/title\",\"seq\":3,\"time\":4,\"data\":{}}",
+            "{\"type\":\"turn/start\",\"seq\":4,\"time\":5,\"data\":{}}",
+            "{\"type\":\"user/message\",\"seq\":5,\"time\":6,\"data\":{}}",
+        ];
+        if close_second_turn {
+            rows.push("{\"type\":\"turn/end\",\"seq\":6,\"time\":7,\"data\":{}}");
+        }
+        format!("{}\n", rows.join("\n")).into_bytes()
     }
 
     #[test]
@@ -2094,6 +2786,37 @@ mod tests {
                     } => {
                         let _ = ack.send(export_raw(&file, cursor, destination, &cancellation));
                     }
+                    Command::InspectFork {
+                        anchor,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            inspect_fork(&file, cursor, anchor, &cancellation)
+                                .map(ForkFlightResult::Boundary),
+                        );
+                    }
+                    Command::CopyFork {
+                        boundary,
+                        destination,
+                        header_line,
+                        suffix,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            copy_fork(
+                                &file,
+                                cursor,
+                                boundary,
+                                destination,
+                                &header_line,
+                                &suffix,
+                                &cancellation,
+                            )
+                            .map(ForkFlightResult::Copied),
+                        );
+                    }
                 }
             }
         });
@@ -2186,6 +2909,37 @@ mod tests {
                         ack,
                     } => {
                         let _ = ack.send(export_raw(&file, cursor, destination, &cancellation));
+                    }
+                    Command::InspectFork {
+                        anchor,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            inspect_fork(&file, cursor, anchor, &cancellation)
+                                .map(ForkFlightResult::Boundary),
+                        );
+                    }
+                    Command::CopyFork {
+                        boundary,
+                        destination,
+                        header_line,
+                        suffix,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            copy_fork(
+                                &file,
+                                cursor,
+                                boundary,
+                                destination,
+                                &header_line,
+                                &suffix,
+                                &cancellation,
+                            )
+                            .map(ForkFlightResult::Copied),
+                        );
                     }
                 }
             }
@@ -6195,6 +6949,39 @@ mod tests {
                         ack,
                     } => {
                         let _ = ack.send(export_raw(&file, cursor, destination, &cancellation));
+                        continue;
+                    }
+                    Command::InspectFork {
+                        anchor,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            inspect_fork(&file, cursor, anchor, &cancellation)
+                                .map(ForkFlightResult::Boundary),
+                        );
+                        continue;
+                    }
+                    Command::CopyFork {
+                        boundary,
+                        destination,
+                        header_line,
+                        suffix,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(
+                            copy_fork(
+                                &file,
+                                cursor,
+                                boundary,
+                                destination,
+                                &header_line,
+                                &suffix,
+                                &cancellation,
+                            )
+                            .map(ForkFlightResult::Copied),
+                        );
                         continue;
                     }
                     Command::Finish { ack } => CompletedCommand {

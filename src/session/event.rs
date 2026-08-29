@@ -330,6 +330,33 @@ impl SessionHeader {
         }))
     }
 
+    /// Build one ordinary fork child header from a completed source prefix.
+    pub(crate) fn new_durable_fork(
+        id: impl Into<SessionId>,
+        created_at: UnixMillis,
+        cwd: String,
+        workspace: WorkspaceIdentity,
+        parent_session: SessionId,
+        seed_length: u64,
+    ) -> Result<Self, HeaderError> {
+        if !Path::new(&cwd).is_absolute() {
+            return Err(HeaderError::RelativeWorkingDirectory(cwd));
+        }
+        Self::from_value(json!({
+            "version": SESSION_FORMAT_VERSION,
+            "id": id.into(),
+            "createdAt": created_at,
+            "cwd": cwd,
+            "parentSession": parent_session,
+            "seedLength": seed_length,
+            "delegationDepth": 0,
+            "rustWorkspaceIdentity": {
+                "device": format!("{:x}", workspace.device()),
+                "inode": format!("{:x}", workspace.inode()),
+            },
+        }))
+    }
+
     /// Parse a header while retaining fields added by plugins or newer Harness versions.
     pub fn from_value(value: Value) -> Result<Self, HeaderError> {
         let raw = JsonValue::new(value).map_err(HeaderError::Json)?;
@@ -394,6 +421,12 @@ impl SessionHeader {
     #[must_use]
     pub fn parent_session(&self) -> Option<&SessionId> {
         self.parent_session.as_ref()
+    }
+
+    /// Number of source events inherited by a fork or replay seed.
+    #[must_use]
+    pub fn seed_length(&self) -> Option<u64> {
+        self.seed_length.map(NonNegativeSafeInteger::get)
     }
 
     /// Complete validated header JSON, including fields unknown to this build.

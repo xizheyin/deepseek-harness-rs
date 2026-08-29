@@ -17,8 +17,8 @@ use crate::{
         web_fetch::HttpWebFetchProvider,
     },
     session::{
-        CommittedUiReceiver, Session, SessionLogExporter, SessionSearchRuntime, SessionStore,
-        StoreError, SystemClock,
+        CommittedUiReceiver, Session, SessionForker, SessionLogExporter, SessionSearchRuntime,
+        SessionStore, StoreError, SystemClock,
     },
     time_context::TimeContextRuntime,
     tools::{
@@ -56,6 +56,7 @@ pub(super) struct InteractiveAssembly {
     pub(super) resumed: bool,
     pub(super) file_suggestions: WorkspaceFileCatalogue,
     pub(super) session_log_exporter: SessionLogExporter,
+    pub(super) session_forker: SessionForker,
     pub(super) goal: GoalRuntime,
     pub(super) plan_mode: PlanModeRuntime,
 }
@@ -234,6 +235,16 @@ pub(super) async fn assemble_session(
         Ok(store) => store,
         Err(error) => return Err(AssemblyFailure::new(AssemblyError::Store(error), session)),
     };
+    let session_forker = if interactive {
+        match SessionForker::new(&search_store, &authority) {
+            Ok(forker) => Some(forker),
+            Err(error) => {
+                return Err(AssemblyFailure::new(AssemblyError::Store(error), session));
+            }
+        }
+    } else {
+        None
+    };
     let session_search = SessionSearchRuntime::new(
         search_store,
         authority.identity(),
@@ -316,6 +327,9 @@ pub(super) async fn assemble_session(
         let Some(session_log_exporter) = session_log_exporter else {
             return Err(AssemblyFailure::new(AssemblyError::Agent, session));
         };
+        let Some(session_forker) = session_forker else {
+            return Err(AssemblyFailure::new(AssemblyError::Agent, session));
+        };
         let Some(goal) = goal else {
             return Err(AssemblyFailure::new(AssemblyError::Agent, session));
         };
@@ -353,6 +367,7 @@ pub(super) async fn assemble_session(
             resumed,
             file_suggestions,
             session_log_exporter,
+            session_forker,
             goal,
             plan_mode,
         }))

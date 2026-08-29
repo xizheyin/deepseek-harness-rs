@@ -256,7 +256,7 @@ impl LiveFrame {
 
     pub(super) fn help() -> Result<Self, LiveRenderError> {
         Self::trusted(
-            "[commands]\n/compact  summarize older history while idle\n/rename TITLE  set the current Session title while idle\n/refresh-title  retry or unpin the first-prompt Session title\n/export  copy the current raw Session log into this workspace\n/goal  show/create/edit/pause/resume/clear the process-local Goal\n/plan [message]  enter Plan Mode and optionally send a planning prompt\n/plan off  leave Plan Mode while idle\n/inspect  show committed turn facts\n/review  show the last joined turn summary\n/focus  return to Focus\n/theme  show/select the enhanced palette; linear stays plain\n/motion  show/select enhanced motion; linear has no animation\n/help  show this help\n/exit  exit dsh\n/quit  exit dsh\n",
+            "[commands]\n/compact  summarize older history while idle\n/rename TITLE  set the current Session title while idle\n/refresh-title  retry or unpin the first-prompt Session title\n/export  copy the current raw Session log into this workspace\n/fork [EVENT_SEQ]  create a resumable child at a completed turn\n/goal  show/create/edit/pause/resume/clear the process-local Goal\n/plan [message]  enter Plan Mode and optionally send a planning prompt\n/plan off  leave Plan Mode while idle\n/inspect  show committed turn facts\n/review  show the last joined turn summary\n/focus  return to Focus\n/theme  show/select the enhanced palette; linear stays plain\n/motion  show/select enhanced motion; linear has no animation\n/help  show this help\n/exit  exit dsh\n/quit  exit dsh\n",
         )
     }
 

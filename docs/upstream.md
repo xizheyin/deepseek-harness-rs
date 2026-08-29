@@ -2575,3 +2575,46 @@ JSONL file in the retained workspace. It keeps bounded copying, cancellation,
 no overwrite and fail-loud semantics. ZIP packaging, attachments, descendants,
 HTTP/HEAD, browser download state and generic command lifecycle facts remain
 outside the one-Agent terminal boundary.
+
+## Phase 51 completed-turn Session fork — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The focused fixed-commit evidence
+is:
+
+- `packages/core/session/src/index.ts` and `tests/fork.spec.ts` for detached
+  seed copies, contiguous event sequences, `parentSession`, `seedLength`,
+  `session/end-seed`, log-only facts, valid turn-end reasons and invalid/open
+  boundary rejection;
+- `packages/host/apiproxy/src/api-proxy.ts` and
+  `tests/api-proxy-fork.spec.ts` for the user-facing event anchor: the first
+  `turn/end` at or after an in-log anchor, last-completed fallback for omitted
+  or past-end anchors, trailing out-of-band facts through the next
+  `turn/start`, cold observation, workspace lineage and inherited model route;
+- `packages/client/runtime/src/client/sessions/{manager,service}.ts` and their
+  focused tests for immediate child addressability and optional fork-title
+  increment using ` (1)`, `(N+1)` or `（N+1）`.
+
+The core store API can fork an empty live Session or an exact already-balanced
+boundary. The shipped Host API is narrower and more useful to a human: it
+requires at least one completed turn and treats `atSeq` as an anchor inside a
+turn, never clipping an unfinished in-log anchor backward. An omitted or
+past-end anchor selects the latest completed turn. The cut then includes
+standalone title/injection facts until the next turn starts. The child has a
+fresh id and ordinary-fork lineage; it does not inherit `origin: subagent`.
+
+Fresh `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Commit `d26acfa2e` moves the Host
+operations into `packages/api/session-controller/src/commands.ts`; current
+`tests/session-fork.host.spec.ts` retains the anchored-cut, cold-source,
+lineage and inherited-route behavior. The client service still performs the
+optional title increment after creation. The core fork diff is only a renamed
+tool-call id type and comments, not a semantic change.
+
+Rust Phase 51 maps the Host behavior to idle `/fork [EVENT_SEQ]` on the current
+terminal Session. It copies the selected raw event rows into a separately
+locked private journal, writes the same lineage and seed marker, and increments
+an existing title. The current parent stays open and the terminal prints a
+resume command. Direct cold-source RPC, Web selection, subagent workspace
+attachment, attachments and automatic current-session switching remain out of
+scope.

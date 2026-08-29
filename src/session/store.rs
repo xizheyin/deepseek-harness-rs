@@ -183,6 +183,10 @@ impl std::fmt::Debug for SessionStore {
 }
 
 impl SessionStore {
+    pub(super) fn root_plan(&self) -> RootPlan {
+        self.root.clone()
+    }
+
     /// Internal test seam for an already-opened exact-mode root.
     ///
     /// Production callers use `open_default`, whose component-by-component
@@ -474,7 +478,7 @@ const STORE_LOCK_DEADLINE: Duration = Duration::from_millis(250);
 const STORE_LOCK_RETRY: Duration = Duration::from_millis(5);
 
 #[cfg(unix)]
-fn lock_store_root(root: &File) -> Result<(), StoreError> {
+pub(super) fn lock_store_root(root: &File) -> Result<(), StoreError> {
     let deadline = Instant::now() + STORE_LOCK_DEADLINE;
     loop {
         match rustix::fs::flock(root, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
@@ -492,7 +496,7 @@ fn lock_store_root(root: &File) -> Result<(), StoreError> {
     }
 }
 
-fn check_creation_capacity(root: &Dir) -> Result<(), StoreError> {
+pub(super) fn check_creation_capacity(root: &Dir) -> Result<(), StoreError> {
     let entries = root.entries().map_err(|_| StoreError::Io)?;
     let mut total = 0_usize;
     let mut canonical = 0_usize;
@@ -898,12 +902,12 @@ fn sync_file(file: &File) -> Result<(), StoreError> {
 }
 
 #[cfg(target_os = "macos")]
-fn sync_directory(directory: &File) -> Result<(), StoreError> {
+pub(super) fn sync_directory(directory: &File) -> Result<(), StoreError> {
     rustix::fs::fcntl_fullfsync(directory).map_err(|_| StoreError::Io)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn sync_directory(directory: &File) -> Result<(), StoreError> {
+pub(super) fn sync_directory(directory: &File) -> Result<(), StoreError> {
     rustix::fs::fsync(directory).map_err(|_| StoreError::Io)
 }
 

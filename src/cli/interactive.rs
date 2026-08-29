@@ -8,13 +8,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{
-        AgentLoop, ManualCompactionOutcome, ManualSessionExportOutcome, ManualTitleRefreshOutcome,
+        AgentLoop, ManualCompactionOutcome, ManualSessionExportOutcome, ManualSessionForkOutcome,
+        ManualTitleRefreshOutcome,
     },
+    entropy::EntropySource,
     goal::{GoalCommand, GoalError, GoalRound, GoalRuntime},
     plan_mode::{PlanModeCommand, PlanModeError, PlanModeRuntime},
     session::{
-        ApprovalOutcome, CommittedUiKind, CommittedUiReceiver, EventSeq, SessionLogExporter,
-        StoreError, TurnEndReason, TurnId, UiUserSource,
+        ApprovalOutcome, CommittedUiKind, CommittedUiReceiver, EventSeq, SessionForker,
+        SessionLogExporter, StoreError, TurnEndReason, TurnId, UiUserSource,
     },
     tui::{
         command_palette::{
@@ -53,10 +55,11 @@ use super::{
         FileSuggestionController, FileSuggestionEnter, FileSuggestionMove, JobSettlement,
         StagedFileSuggestionPresentation,
     },
-    identity::{prepare_goal_turn, prepare_injected_turn, prepare_user_turn},
+    identity::{new_session_id, prepare_goal_turn, prepare_injected_turn, prepare_user_turn},
     input::{
-        CanonicalRecordParser, IdleInput, InputRecordEvent, MAX_APPROVAL_RECORD_BYTES,
-        MAX_INTERACTIVE_PROMPT_BYTES, RenameCommand, classify_idle_record, parse_rename_command,
+        CanonicalRecordParser, ForkCommand, IdleInput, InputRecordEvent, MAX_APPROVAL_RECORD_BYTES,
+        MAX_INTERACTIVE_PROMPT_BYTES, RenameCommand, classify_idle_record, parse_fork_command,
+        parse_rename_command,
     },
     live::{
         EnhancedPresenter, InteractivePresenter, LiveFrame, LiveLifecycle, LiveRenderer,
@@ -302,6 +305,7 @@ async fn run_enhanced(
         resumed,
         file_suggestions,
         session_log_exporter,
+        session_forker,
         goal,
         plan_mode,
     } = assembly;
@@ -592,6 +596,7 @@ async fn run_enhanced(
                                 | EnhancedSubmission::CompactUsage
                                 | EnhancedSubmission::RefreshTitleUsage
                                 | EnhancedSubmission::ExportUsage
+                                | EnhancedSubmission::Fork(_)
                         );
                     let (mut draft, mut cursor) = if job_wake {
                         (String::new(), 0)
@@ -652,7 +657,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/compact | /rename TITLE | /refresh-title | /export | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/compact | /rename TITLE | /refresh-title | /export | /fork [event-seq] | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -727,6 +732,19 @@ async fn run_enhanced(
                                     pending_signal = signal;
                                 }
                             }
+                            CommandId::Fork => {
+                                let (message, signal) = run_session_fork(
+                                    &mut agent,
+                                    &session_forker,
+                                    ForkCommand::Latest,
+                                    signals,
+                                )
+                                .await?;
+                                notice = Some(message);
+                                if !matches!(signal, None | Some(UiSignal::Interrupt)) {
+                                    pending_signal = signal;
+                                }
+                            }
                             CommandId::Exit | CommandId::Quit => {
                                 break Ok(InteractiveExit::Ordinary(0));
                             }
@@ -752,6 +770,19 @@ async fn run_enhanced(
                         }
                         EnhancedSubmission::ExportUsage => {
                             notice = Some("Usage: /export (no arguments)".to_owned());
+                        }
+                        EnhancedSubmission::Fork(command) => {
+                            let (message, signal) = run_session_fork(
+                                &mut agent,
+                                &session_forker,
+                                command,
+                                signals,
+                            )
+                            .await?;
+                            notice = Some(message);
+                            if !matches!(signal, None | Some(UiSignal::Interrupt)) {
+                                pending_signal = signal;
+                            }
                         }
                         EnhancedSubmission::Prompt => {
                             let prompt = copy_enhanced_prompt(&draft)?;
@@ -1241,6 +1272,7 @@ enum EnhancedSubmission {
     CompactUsage,
     RefreshTitleUsage,
     ExportUsage,
+    Fork(ForkCommand),
     Prompt,
 }
 
@@ -1252,6 +1284,8 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         EnhancedSubmission::Command(command)
     } else if let Some(rename) = parse_rename_command(command) {
         EnhancedSubmission::Rename(rename)
+    } else if let Some(fork) = parse_fork_command(command) {
+        EnhancedSubmission::Fork(fork)
     } else if let Some(goal) = GoalCommand::parse(command) {
         EnhancedSubmission::Goal(goal)
     } else if let Some(plan) = PlanModeCommand::parse(command) {
@@ -1410,6 +1444,48 @@ async fn run_session_export(
         },
         ManualSessionExportOutcome::Cancelled => "Session log export cancelled.".to_owned(),
         ManualSessionExportOutcome::Failed => "Session log export failed.".to_owned(),
+    };
+    Ok((notice, stopped.observed()))
+}
+
+async fn run_session_fork(
+    agent: &mut AgentLoop,
+    forker: &SessionForker,
+    command: ForkCommand,
+    signals: &mut SignalStreams,
+) -> Result<(String, Option<UiSignal>), InteractiveError> {
+    let anchor = match command {
+        ForkCommand::Latest => None,
+        ForkCommand::At(anchor) => Some(anchor),
+        ForkCommand::Usage => return Ok(("Usage: /fork [EVENT_SEQ]".to_owned(), None)),
+    };
+    let child = new_session_id(EntropySource::system()).map_err(|_| InteractiveError::Agent)?;
+    let cancellation = CancellationToken::new();
+    let future = agent.fork_session(forker, child, anchor, cancellation.clone());
+    tokio::pin!(future);
+    let mut stopped = SignalLatch::default();
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut future => break result,
+            signal = signals.next() => {
+                stopped.observe(DriverMode::Interactive, signal);
+                cancellation.cancel();
+            }
+        }
+    };
+    signals.drain_ready(DriverMode::Interactive, &mut stopped);
+    let notice = match result.map_err(|_| InteractiveError::Agent)? {
+        ManualSessionForkOutcome::Forked {
+            child,
+            seed_events,
+            bytes: _,
+        } => format!("Forked {seed_events} events · dsh --resume {child}"),
+        ManualSessionForkOutcome::Unavailable => {
+            "Session fork unavailable: no completed turn at that anchor.".to_owned()
+        }
+        ManualSessionForkOutcome::Cancelled => "Session fork cancelled.".to_owned(),
+        ManualSessionForkOutcome::Failed => "Session fork failed.".to_owned(),
     };
     Ok((notice, stopped.observed()))
 }
@@ -1970,7 +2046,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/compact · /rename TITLE · /refresh-title · /export · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
+                "/compact · /rename TITLE · /refresh-title · /export · /fork [event-seq] · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -2721,6 +2797,7 @@ async fn run_linear(
         resumed,
         file_suggestions: _file_suggestions,
         session_log_exporter,
+        session_forker,
         goal,
         plan_mode,
     } = assembly;
@@ -3077,6 +3154,29 @@ async fn run_linear(
                     IdleInput::Export => {
                         let (notice, signal) =
                             run_session_export(&mut agent, &session_log_exporter, signals).await?;
+                        let message = format!("[{notice}]\n");
+                        if let Some(write_signal) =
+                            write_dynamic_notice(message, &mut presenter, &terminal, signals)
+                                .await?
+                        {
+                            if let Some(write_signal) =
+                                handle_idle_signal(write_signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(write_signal));
+                            }
+                        }
+                        if let Some(signal) = signal.filter(|signal| *signal != UiSignal::Interrupt)
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::Fork(command) => {
+                        let (notice, signal) =
+                            run_session_fork(&mut agent, &session_forker, command, signals).await?;
                         let message = format!("[{notice}]\n");
                         if let Some(write_signal) =
                             write_dynamic_notice(message, &mut presenter, &terminal, signals)
@@ -6221,7 +6321,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /export waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /export waits for this turn | /fork waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -6279,6 +6379,13 @@ fn handle_active_input(
                                     .to_owned(),
                             );
                         }
+                        CommandId::Fork => {
+                            let _ = input.take_draft_for_turn()?;
+                            *notice = Some(
+                                "Session fork busy · wait for the current turn or press Ctrl+C"
+                                    .to_owned(),
+                            );
+                        }
                     }
                     return Ok(ActiveInputOutcome::Redraw);
                 }
@@ -6324,6 +6431,13 @@ fn handle_active_input(
                 EnhancedSubmission::ExportUsage => {
                     let _ = input.take_draft_for_turn()?;
                     *notice = Some("Usage: /export (no arguments)".to_owned());
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::Fork(_) => {
+                    let _ = input.take_draft_for_turn()?;
+                    *notice = Some(
+                        "Session fork busy · wait for the current turn or press Ctrl+C".to_owned(),
+                    );
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Empty => {
@@ -7614,7 +7728,7 @@ mod tests {
         cli::{
             approval::{ApprovalChallengePool, ApprovalEnvelope},
             approval_join::ApprovalJoin,
-            input::{CanonicalRecordParser, RenameCommand},
+            input::{CanonicalRecordParser, ForkCommand, RenameCommand},
             signal::{SignalLatch, UiSignal},
             terminal::{AsyncTerminal, TerminalSize},
         },
@@ -8816,6 +8930,22 @@ mod tests {
         );
         assert_eq!(
             classify_enhanced_submission("/exports"),
+            EnhancedSubmission::Prompt
+        );
+        assert_eq!(
+            classify_enhanced_submission(" /fork "),
+            EnhancedSubmission::Command(CommandId::Fork)
+        );
+        assert_eq!(
+            classify_enhanced_submission("/fork 42"),
+            EnhancedSubmission::Fork(ForkCommand::At(crate::session::EventSeq::new(42).unwrap()))
+        );
+        assert_eq!(
+            classify_enhanced_submission("/fork bad"),
+            EnhancedSubmission::Fork(ForkCommand::Usage)
+        );
+        assert_eq!(
+            classify_enhanced_submission("/forks"),
             EnhancedSubmission::Prompt
         );
     }

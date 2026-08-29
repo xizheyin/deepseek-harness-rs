@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "coreImplementation": "packages/core/session/src/index.ts",
+    "coreTests": "packages/core/session/tests/fork.spec.ts",
+    "hostImplementation": "packages/host/apiproxy/src/api-proxy.ts",
+    "hostTests": "packages/host/apiproxy/tests/api-proxy-fork.spec.ts"
+  },
+  "contract": {
+    "input": "session id plus optional non-negative event-sequence anchor",
+    "anchor": "first turn/end at or after an in-log anchor",
+    "fallback": "last turn/end when anchor is omitted or past the log end",
+    "trailingFacts": "include rows after the selected turn/end until the next turn/start",
+    "childHeader": ["cwd", "parentSession", "seedLength"],
+    "childSuffix": "session/end-seed",
+    "modelEffect": "none until the child is later continued"
+  },
+  "cases": [
+    {
+      "name": "anchored_completed_turn",
+      "eventTypes": ["turn/start", "user/message", "turn/end", "turn/start", "user/message", "turn/end"],
+      "anchor": 1,
+      "copiedThroughSeq": 2,
+      "seedLength": 3
+    },
+    {
+      "name": "trailing_log_fact",
+      "eventTypes": ["turn/start", "user/message", "turn/end", "session/title", "turn/start"],
+      "anchor": 1,
+      "copiedThroughSeq": 3,
+      "seedLength": 4
+    },
+    {
+      "name": "omitted_or_past_end",
+      "eventTypes": ["turn/start", "user/message", "turn/end", "turn/start", "user/message"],
+      "anchors": [null, 999],
+      "copiedThroughSeq": 2,
+      "seedLength": 3
+    },
+    {
+      "name": "anchor_in_open_turn",
+      "eventTypes": ["turn/start", "user/message", "turn/end", "turn/start", "user/message"],
+      "anchor": 4,
+      "error": "fork-unavailable"
+    },
+    {
+      "name": "no_completed_turn",
+      "eventTypes": [],
+      "anchor": null,
+      "error": "fork-unavailable"
+    }
+  ],
+  "latestMaster": {
+    "commit": "cd5ef8148158c3a752a658978873241fdf8e2bbc",
+    "implementation": "packages/api/session-controller/src/commands.ts",
+    "tests": "packages/api/session-controller/tests/session-fork.host.spec.ts",
+    "semanticChange": "none for completed-turn anchor, lineage, cold observation, or inherited route"
+  }
+}

@@ -3422,6 +3422,156 @@ fn linear_export_of_a_new_session_is_local_exact_and_zero_ansi() {
     );
 }
 
+#[test]
+fn enhanced_fork_creates_an_exact_resumable_child_and_keeps_parent_active() {
+    let first_server = SequenceSseServer::start(vec![
+        text_sse("Parent first response."),
+        text_sse("Parent still active."),
+    ]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut parent = PtyHarness::spawn_color_with_session_root_cargo(
+        &first_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    parent.expect("❯".as_bytes());
+    parent.write(b"fork this completed turn\r");
+    parent.expect(b"Parent first response.");
+    parent.expect(b"Turn complete");
+    parent.write(b"/fork nope\r");
+    parent.expect(b"Usage: /fork [EVENT_SEQ]");
+    assert_eq!(session_journals(session_root.path()).len(), 1);
+
+    parent.write(b"/fork\r");
+    parent.expect(b"Forked");
+    parent.expect(b"dsh --resume session-");
+    let (parent_id, child_id, parent_path, child_path) = fork_pair(session_root.path());
+    assert_eq!(
+        std::fs::metadata(&child_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    parent.write(b"continue only in the parent\r");
+    parent.expect(b"Parent still active.");
+    parent.expect_occurrences(b"Turn complete", 2);
+    let (status, _) = parent.exit_cleanly();
+    assert!(status.success());
+    assert_eq!(first_server.finish().len(), 2);
+
+    let parent_rows = journal_rows(&parent_path);
+    let child_rows = journal_rows(&child_path);
+    let seed_length = child_rows[0]["seedLength"].as_u64().unwrap() as usize;
+    assert_eq!(child_rows[0]["parentSession"], parent_id);
+    assert_eq!(child_rows[1..=seed_length], parent_rows[1..=seed_length]);
+    assert_eq!(child_rows[seed_length + 1]["type"], "session/end-seed");
+    assert!(
+        child_rows
+            .iter()
+            .filter(|row| row["type"] == "session/title")
+            .next_back()
+            .and_then(|row| row["data"]["title"].as_str())
+            .is_some_and(|title| title.ends_with(" (1)"))
+    );
+
+    let child_server = SequenceSseServer::start(vec![text_sse("Child continued.")]);
+    let mut child = PtyHarness::spawn_resume_color_cargo(
+        &child_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+        &child_id,
+    );
+    child.expect("❯".as_bytes());
+    child.write(b"continue only in the child\r");
+    child.expect(b"Child continued.");
+    child.expect(b"Turn complete");
+    let (status, _) = child.exit_cleanly();
+    assert!(status.success());
+    let requests = child_server.finish();
+    assert_eq!(requests.len(), 1);
+    let users = user_contents(&requests[0]);
+    assert!(users.iter().any(|text| text == "fork this completed turn"));
+    assert!(
+        users
+            .iter()
+            .any(|text| text == "continue only in the child")
+    );
+    assert!(
+        !users
+            .iter()
+            .any(|text| text == "continue only in the parent")
+    );
+}
+
+#[test]
+fn linear_past_end_fork_is_local_and_zero_ansi() {
+    let server = SequenceSseServer::start(vec![text_sse("Linear fork source.")]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"create a linear fork source\r");
+    dsh.expect(b"Linear fork source.");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    dsh.write(b"/fork 999999\r");
+    dsh.expect(b"[Forked");
+    dsh.expect(b"dsh --resume session-");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    let (_, _, _, child_path) = fork_pair(session_root.path());
+    assert!(child_path.exists());
+
+    let (status, transcript) = dsh.exit_cleanly();
+    assert!(status.success());
+    assert_eq!(server.finish().len(), 1);
+    assert!(!transcript.contains(&0x1b));
+}
+
+fn session_journals(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn journal_rows(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn fork_pair(root: &std::path::Path) -> (String, String, std::path::PathBuf, std::path::PathBuf) {
+    let paths = session_journals(root);
+    assert_eq!(paths.len(), 2);
+    let mut parent = None;
+    let mut child = None;
+    for path in paths {
+        let header = journal_rows(&path).remove(0);
+        let id = header["id"].as_str().unwrap().to_owned();
+        if let Some(parent_id) = header["parentSession"].as_str() {
+            child = Some((parent_id.to_owned(), id, path));
+        } else {
+            parent = Some((id, path));
+        }
+    }
+    let (parent_id, parent_path) = parent.unwrap();
+    let (recorded_parent, child_id, child_path) = child.unwrap();
+    assert_eq!(recorded_parent, parent_id);
+    (parent_id, child_id, parent_path, child_path)
+}
+
 fn exported_logs(workspace: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut paths = std::fs::read_dir(workspace)
         .unwrap()

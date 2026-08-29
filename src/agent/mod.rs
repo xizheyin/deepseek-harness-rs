@@ -13,6 +13,8 @@ mod repeat_tool_reminder;
 mod retry;
 #[cfg(test)]
 mod session_export_tests;
+#[cfg(test)]
+mod session_fork_tests;
 mod session_title;
 mod tool;
 
@@ -46,10 +48,10 @@ use crate::{
         ApprovalRequestId, AttemptDisposition, AttemptResidentGuard, AttemptToken, BarrierError,
         ClaimedAppend, EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent,
         LlmRetryStartedEvent, NewEvent, PROVIDER_TITLE_MAX_BYTES, PreparedAttempt, RequestContext,
-        RequestHeaderReason, RetryId, RetryNumber, Session, SessionRawExportError,
-        SessionReadError, SessionReservation, StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN,
-        ToolFailure, ToolResultPrunePassCause, TurnEndCancelCause, TurnEndReason, TurnId,
-        normalize_title,
+        RequestHeaderReason, RetryId, RetryNumber, Session, SessionForkError, SessionForker,
+        SessionId, SessionRawExportError, SessionReadError, SessionReservation, StepId,
+        SurfaceIntent, TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause,
+        TurnEndCancelCause, TurnEndReason, TurnId, normalize_title,
     },
     skills::{SkillRuntime, SkillRuntimeError},
     time_context::TimeContextRuntime,
@@ -816,6 +818,18 @@ pub(crate) enum ManualSessionExportOutcome {
     Failed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualSessionForkOutcome {
+    Forked {
+        child: SessionId,
+        seed_events: u64,
+        bytes: u64,
+    },
+    Unavailable,
+    Cancelled,
+    Failed,
+}
+
 /// Stateful owner of one session and its request-header lifecycle.
 pub struct AgentLoop {
     session: Session,
@@ -1105,6 +1119,101 @@ impl AgentLoop {
                 Ok(ManualSessionExportOutcome::Failed)
             }
             Err(SessionRawExportError::Barrier(error)) => Err(error.into()),
+        }
+    }
+
+    /// Create one separately resumable child from a completed current-Session turn.
+    pub(crate) async fn fork_session(
+        &mut self,
+        forker: &SessionForker,
+        child: SessionId,
+        anchor: Option<EventSeq>,
+        cancellation: CancellationToken,
+    ) -> Result<ManualSessionForkOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if cancellation.is_cancelled() {
+            return Ok(ManualSessionForkOutcome::Cancelled);
+        }
+        self.session.materialize_if_needed().await?;
+        self.session_titles.collect_ready(&mut self.session).await;
+        let source_title = self
+            .session
+            .state()
+            .session_title()
+            .map(|title| title.title().to_owned());
+        let prepared = match self
+            .session
+            .prepare_fork(anchor, cancellation.clone())
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(SessionForkError::Unavailable) => {
+                return Ok(ManualSessionForkOutcome::Unavailable);
+            }
+            Err(SessionForkError::Cancelled) => return Ok(ManualSessionForkOutcome::Cancelled),
+            Err(SessionForkError::Destination | SessionForkError::Changed) => {
+                return Ok(ManualSessionForkOutcome::Failed);
+            }
+            Err(SessionForkError::Barrier(error)) => return Err(error.into()),
+        };
+        if cancellation.is_cancelled() {
+            return Ok(ManualSessionForkOutcome::Cancelled);
+        }
+        let seed_events = prepared.seed_events();
+        let parent = self.session.id().clone();
+        let mut target = match forker
+            .reserve(
+                parent,
+                child,
+                seed_events,
+                prepared.seed_ends_with_end_seed(),
+                source_title,
+            )
+            .await
+        {
+            Ok(target) => target,
+            Err(_) => return Ok(ManualSessionForkOutcome::Failed),
+        };
+        if cancellation.is_cancelled() {
+            return Ok(ManualSessionForkOutcome::Cancelled);
+        }
+        let plan = match target.take_write_plan() {
+            Ok(plan) => plan,
+            Err(_) => return Ok(ManualSessionForkOutcome::Failed),
+        };
+        let bytes = match self
+            .session
+            .write_fork(
+                prepared,
+                plan.destination,
+                plan.header_line,
+                plan.suffix,
+                cancellation,
+            )
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(SessionForkError::Unavailable) => {
+                return Ok(ManualSessionForkOutcome::Unavailable);
+            }
+            Err(SessionForkError::Cancelled) => return Ok(ManualSessionForkOutcome::Cancelled),
+            Err(SessionForkError::Destination | SessionForkError::Changed) => {
+                return Ok(ManualSessionForkOutcome::Failed);
+            }
+            Err(SessionForkError::Barrier(error)) => return Err(error.into()),
+        };
+        match target.commit(bytes, seed_events).await {
+            Ok(artifact) => Ok(ManualSessionForkOutcome::Forked {
+                child: artifact.child().clone(),
+                seed_events: artifact.seed_events(),
+                bytes: artifact.bytes(),
+            }),
+            Err(_) => Ok(ManualSessionForkOutcome::Failed),
         }
     }
 

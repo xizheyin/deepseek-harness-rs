@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–50 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–51 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -58,6 +58,7 @@ for behavior that users can run today.
 | 48 | Durable manual Session title rename | `complete` | [`validation/phase-48.md`](validation/phase-48.md) |
 | 49 | Explicit cancellable Session title refresh | `complete` | [`validation/phase-49.md`](validation/phase-49.md) |
 | 50 | Safe current-Session raw log export | `complete` | [`validation/phase-50.md`](validation/phase-50.md) |
+| 51 | Completed-turn current-Session fork | `complete` | [`validation/phase-51.md`](validation/phase-51.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -141,6 +142,30 @@ re-encoded or mutated. Rust exports one raw `.jsonl` because this product has
 one current Agent and no image-attachment store; it does not claim the official
 multi-Session ZIP, descendant or media behavior. The copy is an external
 artifact, not a registered resumable Session or a substitute for a backup.
+
+## Phase 51 boundary (2026-08-29)
+
+Phase 51 adds idle `/fork [EVENT_SEQ]` for creating a separate resumable child
+from the current Session. With no argument, the cut uses the latest completed
+turn. An optional non-negative event sequence anchors the containing completed
+turn: the first `turn/end` at or after the anchor is selected, and stable
+out-of-band facts immediately after it are included until the next
+`turn/start`. A past-end anchor falls back to the latest completed turn; an
+anchor inside a still-open turn fails rather than silently clipping backward.
+
+The child receives a new random Session id, the same workspace identity,
+`parentSession`, `seedLength`, the exact selected source event bytes and one
+new `session/end-seed` marker. If the source has a title, the child gets a
+bounded user title with a trailing fork counter such as `(1)` or `(2)`. The
+child file is owner-only, collision-safe and published only after a bounded,
+cancellable copy succeeds. The parent remains the active terminal Session;
+success prints a copyable `dsh --resume <child-id>` command, matching the
+official service contract where callers choose whether to open the child.
+
+Phase 51 does not add product subagents, fork a different cold Session directly,
+copy external attachments, create a shared live Agent, or allow a model tool to
+fork. Resume validates the child through the existing strict recovery path;
+forking creates no parent conversation event, model request, tool or approval.
 
 ## Phase 8 revised boundary (2026-08-18)
 
@@ -232,7 +257,7 @@ tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
 The current green checkpoints implement bounded assistant-message markup,
 source-preserving 2–8-column pipe tables, six closed process-local semantic
-themes with transactional redraw, a closed thirteen-command completion palette, a
+themes with transactional redraw, a closed fourteen-command completion palette, a
 generator-provenanced semantic card for the real single-file `apply_patch`
 approval preview, bounded workspace-file suggestions, and bounded primary-screen Inspect/Review panels. Inspect
 shows only current-turn committed metadata and retained reasoning; Review keeps

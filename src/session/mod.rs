@@ -8,6 +8,7 @@ mod context_budget;
 mod error;
 mod event;
 mod export;
+mod fork;
 mod journal;
 mod journal_row;
 mod jsonl;
@@ -60,6 +61,7 @@ pub use event::{
     TurnEndReason, TurnId, UnixMillis,
 };
 pub(crate) use export::SessionLogExporter;
+pub(crate) use fork::SessionForker;
 pub(crate) use projection::CompactionCandidate;
 pub use projection::SessionState;
 pub(crate) use store::SessionMetadata;
@@ -110,7 +112,10 @@ use crate::{
 
 use self::{
     codec::decode_snapshot,
-    journal::{JournalError, JournalExportError, JournalReadError, MAX_PRUNE_PREFIX_BYTES},
+    journal::{
+        JournalError, JournalExportError, JournalForkBoundary, JournalForkError, JournalReadError,
+        MAX_PRUNE_PREFIX_BYTES,
+    },
     journal_row::JournalRowLocator,
     jsonl::{
         ChargedEventLineError, ChargedEventLineTemplate, DurableTimestamp,
@@ -391,6 +396,35 @@ pub(crate) enum SessionRawExportError {
     Destination,
     #[error(transparent)]
     Barrier(#[from] BarrierError),
+}
+
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
+pub(crate) enum SessionForkError {
+    #[error("the current Session has no completed turn available for this fork anchor")]
+    Unavailable,
+    #[error("the Session fork was cancelled")]
+    Cancelled,
+    #[error("the Session fork destination failed")]
+    Destination,
+    #[error("the Session changed after its fork boundary was inspected")]
+    Changed,
+    #[error(transparent)]
+    Barrier(#[from] BarrierError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedSessionFork {
+    boundary: JournalForkBoundary,
+}
+
+impl PreparedSessionFork {
+    pub(crate) fn seed_events(self) -> u64 {
+        self.boundary.seed_events()
+    }
+
+    pub(crate) fn seed_ends_with_end_seed(self) -> bool {
+        self.boundary.seed_ends_with_end_seed()
+    }
 }
 
 /// A private prune pair can fail before its marker or after that marker became
@@ -2445,6 +2479,107 @@ impl Session {
             Err(JournalExportError::Writer(error)) => {
                 self.fail_durable_writer(error);
                 Err(SessionRawExportError::Barrier(BarrierError::Storage(
+                    StoreError::from(error),
+                )))
+            }
+        }
+    }
+
+    pub(crate) async fn prepare_fork(
+        &mut self,
+        anchor: Option<EventSeq>,
+        cancellation: CancellationToken,
+    ) -> Result<PreparedSessionFork, SessionForkError> {
+        if cancellation.is_cancelled() {
+            return Err(SessionForkError::Cancelled);
+        }
+        self.flush_barrier().await?;
+        if cancellation.is_cancelled() {
+            return Err(SessionForkError::Cancelled);
+        }
+        let expected_events = self
+            .next_seq
+            .ok_or(SessionForkError::Barrier(BarrierError::Storage(
+                StoreError::Limit,
+            )))?
+            .get();
+        let result = match &mut self.mode {
+            SessionMode::Memory { .. } => return Err(SessionForkError::Unavailable),
+            SessionMode::Durable { storage, .. } => match storage {
+                SessionStorage::Active(writer) => {
+                    writer
+                        .inspect_fork(anchor.map(EventSeq::get), cancellation)
+                        .await
+                }
+                SessionStorage::Deferred(_)
+                | SessionStorage::Finishing(_)
+                | SessionStorage::Failed(_)
+                | SessionStorage::Closed => return Err(SessionForkError::Unavailable),
+            },
+        };
+        match result {
+            Ok(boundary) if boundary.source_events() == expected_events => {
+                Ok(PreparedSessionFork { boundary })
+            }
+            Ok(_) => {
+                self.fail_durable_writer(JournalError::Poisoned);
+                Err(SessionForkError::Barrier(BarrierError::Storage(
+                    StoreError::Poisoned,
+                )))
+            }
+            Err(JournalForkError::Unavailable) => Err(SessionForkError::Unavailable),
+            Err(JournalForkError::Cancelled) => Err(SessionForkError::Cancelled),
+            Err(JournalForkError::Destination) => Err(SessionForkError::Destination),
+            Err(JournalForkError::Changed) => Err(SessionForkError::Changed),
+            Err(JournalForkError::Writer(error)) => {
+                self.fail_durable_writer(error);
+                Err(SessionForkError::Barrier(BarrierError::Storage(
+                    StoreError::from(error),
+                )))
+            }
+        }
+    }
+
+    pub(crate) async fn write_fork(
+        &mut self,
+        prepared: PreparedSessionFork,
+        destination: File,
+        header_line: Vec<u8>,
+        suffix: Vec<u8>,
+        cancellation: CancellationToken,
+    ) -> Result<u64, SessionForkError> {
+        if cancellation.is_cancelled() {
+            return Err(SessionForkError::Cancelled);
+        }
+        let result = match &mut self.mode {
+            SessionMode::Memory { .. } => return Err(SessionForkError::Unavailable),
+            SessionMode::Durable { storage, .. } => match storage {
+                SessionStorage::Active(writer) => {
+                    writer
+                        .copy_fork_to(
+                            prepared.boundary,
+                            destination,
+                            header_line,
+                            suffix,
+                            cancellation,
+                        )
+                        .await
+                }
+                SessionStorage::Deferred(_)
+                | SessionStorage::Finishing(_)
+                | SessionStorage::Failed(_)
+                | SessionStorage::Closed => return Err(SessionForkError::Unavailable),
+            },
+        };
+        match result {
+            Ok(bytes) => Ok(bytes),
+            Err(JournalForkError::Unavailable) => Err(SessionForkError::Unavailable),
+            Err(JournalForkError::Cancelled) => Err(SessionForkError::Cancelled),
+            Err(JournalForkError::Destination) => Err(SessionForkError::Destination),
+            Err(JournalForkError::Changed) => Err(SessionForkError::Changed),
+            Err(JournalForkError::Writer(error)) => {
+                self.fail_durable_writer(error);
+                Err(SessionForkError::Barrier(BarrierError::Storage(
                     StoreError::from(error),
                 )))
             }

@@ -1,6 +1,7 @@
 use crate::{
     goal::{GoalCommand, GoalError},
     plan_mode::{PlanModeCommand, PlanModeError},
+    session::EventSeq,
     tui::{motion::MotionCommand, theme::ThemeCommand},
 };
 
@@ -11,6 +12,31 @@ pub(super) const MAX_APPROVAL_RECORD_BYTES: usize = 64;
 pub(super) enum RenameCommand {
     Show,
     Set(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ForkCommand {
+    Latest,
+    At(EventSeq),
+    Usage,
+}
+
+pub(super) fn parse_fork_command(command: &str) -> Option<ForkCommand> {
+    if command == "/fork" {
+        return Some(ForkCommand::Latest);
+    }
+    let suffix = command.strip_prefix("/fork")?;
+    if !suffix.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let value = suffix.trim_matches(|character: char| character.is_ascii_whitespace());
+    let parsed = value.parse::<u64>().ok();
+    match parsed {
+        Some(parsed) if parsed.to_string() == value => {
+            Some(EventSeq::new(parsed).map_or(ForkCommand::Usage, ForkCommand::At))
+        }
+        _ => Some(ForkCommand::Usage),
+    }
 }
 
 pub(super) fn parse_rename_command(command: &str) -> Option<RenameCommand> {
@@ -125,6 +151,7 @@ pub(super) enum IdleInput {
     RefreshTitleUsage,
     Export,
     ExportUsage,
+    Fork(ForkCommand),
     Compact,
     CompactUsage,
     Exit,
@@ -147,6 +174,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     }
     if let Some(rename) = parse_rename_command(command) {
         return IdleInput::Rename(rename);
+    }
+    if let Some(fork) = parse_fork_command(command) {
+        return IdleInput::Fork(fork);
     }
     if command
         .strip_prefix("/compact")
@@ -182,7 +212,8 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalRecordParser, IdleInput, InputRecordEvent, RenameCommand, classify_idle_record,
+        CanonicalRecordParser, ForkCommand, IdleInput, InputRecordEvent, RenameCommand,
+        classify_idle_record,
     };
     use crate::tui::{
         motion::{MotionCommand, MotionPreference},
@@ -324,6 +355,20 @@ mod tests {
             IdleInput::RefreshTitle
         );
         assert_eq!(classify_idle_record(" /export ", true), IdleInput::Export);
+        assert_eq!(
+            classify_idle_record(" /fork ", true),
+            IdleInput::Fork(ForkCommand::Latest)
+        );
+        assert_eq!(
+            classify_idle_record(" /fork 42 ", true),
+            IdleInput::Fork(ForkCommand::At(crate::session::EventSeq::new(42).unwrap()))
+        );
+        for invalid in ["/fork -1", "/fork 1.5", "/fork 01", "/fork nope"] {
+            assert_eq!(
+                classify_idle_record(invalid, true),
+                IdleInput::Fork(ForkCommand::Usage)
+            );
+        }
         assert_eq!(
             classify_idle_record("/refresh-title now", true),
             IdleInput::RefreshTitleUsage
