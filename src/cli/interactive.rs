@@ -1345,7 +1345,7 @@ fn apply_model_command(agent: &mut AgentLoop, command: ModelCommand) -> String {
     match command {
         ModelCommand::Show => match agent.current_model_selection() {
             Some(selection) => format!(
-                "Current model · {} · effort {} · suggested deepseek-v4-flash, deepseek-v4-pro · efforts off/high/max",
+                "Current model · {} · effort {} · suggested deepseek-v4-flash, deepseek-v4-pro, deepseek-v4-flash-vision-exp · efforts off/high/max",
                 selection.model,
                 selection
                     .reasoning_effort

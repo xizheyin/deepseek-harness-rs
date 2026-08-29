@@ -7,6 +7,7 @@ use crate::{
         AgentLoop, AgentLoopConfig, FileChangePolicy, NoApprovalProvider, PluginPolicy,
         ShellPolicy, ToolExecutor,
     },
+    attachment::AttachmentRuntime,
     entropy::EntropySource,
     goal::GoalRuntime,
     model::LlmCallConfig,
@@ -216,7 +217,25 @@ pub(super) async fn assemble_session(
         Ok(config) => config,
         Err(_) => return Err(AssemblyFailure::new(AssemblyError::Provider, session)),
     };
-    let provider = match DeepSeekProvider::from_environment(provider_config) {
+    let attachment_store = match SessionStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return Err(AssemblyFailure::new(AssemblyError::Store(error), session)),
+    };
+    let attachment_messages = session.messages();
+    let attachments = match AttachmentRuntime::open(
+        attachment_store,
+        &attachment_messages,
+        &cancellation,
+    )
+    .await
+    {
+        Ok(attachments) => attachments,
+        Err(error) => return Err(AssemblyFailure::new(AssemblyError::Store(error), session)),
+    };
+    let provider = match DeepSeekProvider::from_environment_with_attachments(
+        provider_config,
+        attachments.clone(),
+    ) {
         Ok(provider) => Arc::new(provider),
         Err(_) => return Err(AssemblyFailure::new(AssemblyError::Provider, session)),
     };
@@ -269,7 +288,8 @@ pub(super) async fn assemble_session(
         session.header().id().clone(),
     );
     let lsp_enabled = lsp_config.is_some();
-    let tool_options = ToolAssemblyOptions::new(web.clone(), Some(session_search), lsp_config);
+    let tool_options = ToolAssemblyOptions::new(web.clone(), Some(session_search), lsp_config)
+        .with_attachments(attachments);
 
     let registry = match plugin_config {
         Some(plugin_config) => {

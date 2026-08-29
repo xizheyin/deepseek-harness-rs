@@ -10,6 +10,8 @@ use super::credentials::CredentialRef;
 
 /// Provider route owned by this adapter.
 pub const DEEPSEEK_PROVIDER: &str = "deepseek-official";
+/// Exact current-master route that declares image input.
+pub const DEEPSEEK_VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
 /// Public DeepSeek API base.
 pub const PUBLIC_BASE_URL: &str = "https://api.deepseek.com";
 /// Default credential environment variable.

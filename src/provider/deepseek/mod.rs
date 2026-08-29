@@ -15,10 +15,10 @@ mod tests;
 
 pub use adapter::DeepSeekProvider;
 pub use config::{
-    DEEPSEEK_PROVIDER, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS, DEFAULT_STREAM_IDLE_TIMEOUT,
-    DeepSeekConfig, DeepSeekConfigError, DeepSeekModelConfig, DeepSeekReasoningEffort,
-    DeepSeekThinking, MAX_DEEPSEEK_MODEL_DESCRIPTION_BYTES, MAX_DEEPSEEK_MODEL_ID_BYTES,
-    MAX_DEEPSEEK_MODEL_NAME_BYTES, MAX_DEEPSEEK_MODELS,
+    DEEPSEEK_PROVIDER, DEEPSEEK_VISION_MODEL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS,
+    DEFAULT_STREAM_IDLE_TIMEOUT, DeepSeekConfig, DeepSeekConfigError, DeepSeekModelConfig,
+    DeepSeekReasoningEffort, DeepSeekThinking, MAX_DEEPSEEK_MODEL_DESCRIPTION_BYTES,
+    MAX_DEEPSEEK_MODEL_ID_BYTES, MAX_DEEPSEEK_MODEL_NAME_BYTES, MAX_DEEPSEEK_MODELS,
 };
 pub use credentials::{
     CredentialLookup, CredentialRef, CredentialSource, EnvironmentCredentials, SecretValue,

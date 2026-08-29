@@ -8,6 +8,7 @@ use crate::{
         ToolExecutionFuture, ToolExecutionMode, ToolExecutionRequest, ToolExecutionResult,
         ToolExecutor, ToolExecutorError, ToolShutdownFuture,
     },
+    attachment::AttachmentRuntime,
     goal::{GoalBlockReason, GoalError, GoalRuntime, GoalUpdate, MAX_GOAL_OBJECTIVE_BYTES},
     model::{ContentBlock, JsonValue, ToolSchema},
     plan_mode::{MAX_PLAN_BYTES, PlanModeRuntime},
@@ -33,7 +34,7 @@ use super::{
     web_fetch::{self, WebFetchProvider},
     web_search::{self, WebSearchProvider},
     workspace::Workspace,
-    {glob, grep, list, read},
+    {glob, grep, list, read, read_image},
 };
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -217,6 +218,7 @@ pub(crate) struct ToolAssemblyOptions {
     web: WebToolProviders,
     session_search: Option<SessionSearchRuntime>,
     lsp: Option<LspConfig>,
+    attachments: Option<AttachmentRuntime>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -230,7 +232,13 @@ impl ToolAssemblyOptions {
             web,
             session_search,
             lsp,
+            attachments: None,
         }
+    }
+
+    pub(crate) fn with_attachments(mut self, attachments: AttachmentRuntime) -> Self {
+        self.attachments = Some(attachments);
+        self
     }
 }
 
@@ -250,6 +258,7 @@ pub struct LocalToolRegistry {
     web_fetch: Option<Arc<dyn WebFetchProvider>>,
     session_search: Option<SessionSearchRuntime>,
     lsp: Option<Arc<LspHost>>,
+    attachments: Option<AttachmentRuntime>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -277,6 +286,7 @@ impl std::fmt::Debug for LocalToolRegistry {
             .field("web_fetch_enabled", &self.web_fetch.is_some())
             .field("session_search_enabled", &self.session_search.is_some())
             .field("lsp_enabled", &self.lsp.is_some())
+            .field("attachments_enabled", &self.attachments.is_some())
             .finish()
     }
 }
@@ -324,6 +334,7 @@ impl LocalToolRegistry {
             web,
             session_search,
             lsp: lsp_config,
+            attachments,
         } = options;
         let skills = SkillRuntime::from_authority(&authority);
         let lsp_authority = authority.clone();
@@ -336,6 +347,9 @@ impl LocalToolRegistry {
         let mut schemas = build_workspace_schemas()?;
         schemas.push(shell::schema()?);
         schemas.extend(jobs::schemas()?);
+        if attachments.is_some() {
+            schemas.push(read_image_schema()?);
+        }
         let jobs = BackgroundJobRuntime::new();
         if goal.is_some() {
             schemas.extend(build_goal_schemas()?);
@@ -425,6 +439,7 @@ impl LocalToolRegistry {
             web_fetch: web.fetch,
             session_search,
             lsp,
+            attachments,
         })
     }
 
@@ -570,6 +585,13 @@ impl ToolExecutor for LocalToolRegistry {
                 async move { dispatch_web_fetch(provider, &request, cancellation).await },
             );
         }
+        if request.name() == read_image::READ_IMAGE_TOOL_NAME {
+            let workspace = Arc::clone(&self.workspace);
+            let attachments = self.attachments.clone();
+            return Box::pin(async move {
+                read_image::execute(workspace.as_ref(), attachments, &request, &cancellation).await
+            });
+        }
         if request.name() == SKILL_TOOL_NAME {
             let skills = self.skills.clone();
             return Box::pin(async move { dispatch_skill(skills, &request, cancellation).await });
@@ -673,6 +695,7 @@ impl ToolExecutor for LocalToolRegistry {
         let skills = self.skills.clone();
         let session_search = self.session_search.clone();
         let lsp = self.lsp.clone();
+        let attachments = self.attachments.clone();
         Box::pin(async move {
             if is_goal_tool(request.name()) {
                 return prepare_goal(goal, &request);
@@ -693,6 +716,12 @@ impl ToolExecutor for LocalToolRegistry {
             }
             if request.name() == web_fetch::WEB_FETCH_TOOL_NAME {
                 let result = dispatch_web_fetch(web_fetch, &request, cancellation).await?;
+                return Ok(ToolPreparation::Complete(result));
+            }
+            if request.name() == read_image::READ_IMAGE_TOOL_NAME {
+                let result =
+                    read_image::execute(workspace.as_ref(), attachments, &request, &cancellation)
+                        .await?;
                 return Ok(ToolPreparation::Complete(result));
             }
             if request.name() == SKILL_TOOL_NAME {
@@ -1968,6 +1997,27 @@ fn build_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> {
     ])
 }
 
+fn read_image_schema() -> Result<ToolSchema, ToolRegistryBuildError> {
+    schema(
+        read_image::READ_IMAGE_TOOL_NAME,
+        "Read one bounded PNG/JPEG/WebP/GIF workspace file and return the image itself. Requires deepseek-v4-flash-vision-exp.",
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Nonblank workspace-relative or inside-workspace absolute PNG/JPEG/WebP/GIF regular file path; maximum is 4096 UTF-8 bytes",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "pattern": "^(?=.*\\S)[^\\u0000-\\u001F\\u007F-\\u009F]*$"
+                }
+            },
+            "required": ["file_path"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 #[cfg(unix)]
 fn build_workspace_schemas() -> Result<Vec<ToolSchema>, ToolRegistryBuildError> {
     let mut schemas = build_schemas()?;
@@ -2787,6 +2837,7 @@ mod tests {
             name.to_owned(),
             raw_arguments,
             JsonValue::new(arguments).unwrap(),
+            crate::model::LlmCallConfig::new("test", "test").unwrap(),
             ToolDispatchBinding::with_goal_caller(caller),
         )
     }

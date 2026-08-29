@@ -87,9 +87,10 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 能力 | 当前实现 |
 | --- | --- |
 | 多步骤 Agent Loop | 流式接收 DeepSeek 响应，关联 reasoning、文本、工具调用、结果、usage 和结束原因 |
-| 只读工具并行（实验性） | 同一步中的独立 `read`、`skill`、`web_search`、`web_fetch`、`lsp`、`job_list`、`job_output` 最多 10 个并行；结果仍按模型原顺序进入会话，其他工具保持独占执行 |
+| 只读工具并行（实验性） | 同一步中的独立 `read`、`skill`、`web_search`、`web_fetch`、`lsp`、`job_list`、`job_output` 最多 10 个并行；结果仍按模型原顺序进入会话，其他工具（包括 `read_image`）保持独占执行 |
 | 重复调用提醒（实验性） | 模型连续第 3、5、8 次用相同参数调用同一工具时，向下一步追加建议，避免无进展循环持续消耗时间和 token |
 | 代码理解 | 工作区内的 `list`、`glob`、`grep` 和 `read`，输出和扫描范围均有上限 |
+| 图片理解（实验性） | 选择 `deepseek-v4-flash-vision-exp` 后，模型可用 `read_image` 读取工作区 PNG/JPEG/WebP/GIF；图片会先完整校验并按 SHA-256 私有落盘，请求最多保留 4 张、4 MiB 原始字节 |
 | 联网工具（实验性） | `web_search` 并发执行 1–4 个 DeepSeek 原生查询并公平合并最多 8 个来源；`web_fetch` 匿名读取一个经过公网地址校验的 HTTP(S) 页面；两者均无需额外审批 |
 | 项目指令（实验性） | 有界加载用户级、根目录及已触达嵌套目录的 `AGENTS.md` / `CLAUDE.md`，写入会话并在恢复或文件工具成功后检查变化 |
 | 时间上下文（实验性） | 显式 `--time-zone` 后，每个模型步骤追加时间、时区和经过时长快照；会话恢复和上下文压缩后仍可回放，无需审批 |
@@ -434,6 +435,10 @@ dsh --resume session-550e8400-e29b-41d4-a716-446655440000 \
 
 空闲时执行 `/model` 会显示当前模型、实际推理强度和内置建议；执行
 `/model deepseek-v4-pro max` 会让下一次真实模型请求使用该模型和 `max` 强度。
+如果要让模型查看工作区里的截图或设计稿，先执行
+`/model deepseek-v4-flash-vision-exp`，再直接要求它读取图片路径。`read_image`
+只接受单张最多 4 MiB、最多 4000 万像素的 PNG/JPEG/WebP/GIF；文本模型会在
+读文件前明确拒绝。当前没有拖拽、剪贴板或直接终端图片上传。
 模型目录只是建议，其他不含空白、最多 256 字节的模型 ID 也会原样交给 DeepSeek；强度只
 接受 `off`、`high`、`max`。切换动作本身不调用网络，也不会加入对话；下一次请求写入
 `request/header` 后才随会话持久化。恢复会话会保留显式强度，而 Provider 自动补出的默认
@@ -509,6 +514,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | Phase 50 | 已完成：可取消的 `/export` 精确复制当前原始会话日志，私有创建且不覆盖已有文件；仅做本机必要验证 |
 | Phase 51 | 已完成：`/fork [EVENT_SEQ]` 从已完成回合创建私有、可恢复的子会话，并保留谱系、历史与标题；仅做本机必要验证 |
 | Phase 52 | 已完成：`/model [MODEL [EFFORT]]` 无网络切换下一次 DeepSeek 请求，显式推理强度可随 Session 恢复；仅做本机必要验证 |
+| Phase 54 | 已完成：工作区 `read_image`、私有内容寻址附件、恢复校验和 DeepSeek 视觉模型的有界内联图片请求；仅做本机必要验证 |
 
 Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHub-hosted
 `macos-14` arm64 和 `ubuntu-24.04` x86_64 的完整仓库检查、v0.1 安装版旅程与插件
@@ -536,6 +542,7 @@ Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHu
 - `/export` 只导出当前会话的一份原始 `.jsonl`，不是官方包含子会话和媒体的 ZIP，也不能直接导入；日志可能包含提示词、工具输出或其他敏感内容，请妥善保管或删除；
 - `/fork` 只操作当前已打开的会话，且至少需要一个已完成回合；它不会自动切换终端、直接 fork 另一个冷会话、复制外部媒体或启动第二个 Agent，子会话仍需用提示中的 `dsh --resume` 打开；
 - `/model` 只配置当前进程里的单个 DeepSeek Agent，不提供多 Provider、远程目录、Web 选择器或全局默认设置；若切换后没有再发出模型请求就直接退出，这个尚未写入 `request/header` 的选择不会保存；活动回合中必须等当前回合结束后再切换；
+- 图片路径目前只能由视觉模型通过 `read_image` 从启动工作区读取，不支持拖拽、剪贴板、终端直接上传、Files API 复用或附件导出；单图和每请求的 4 MiB 上限比最新官方实现更严，`read_image` 也为保证有界缓存顺序而串行；
 - `/permission` 只在 Agent 空闲时切换当前会话的 `ask` / `auto-edit`；它不提供官方 `danger-full-access`、自动 Shell/插件批准、全局默认或真实 OS 沙箱；
 - 自动压缩每个 turn 最多尝试一次摘要；手动 `/compact` 每次也只发一个有界摘要请求。两者都不保证摘要无损或事实完美；
 - Phase 11 的 Inspect 只保留当前回合，Review 只保留最近一个可信关联的摘要；它们不重建恢复点之前的历史，也不提供完整 canonical diff 或完整命令记录；主题选择只属于当前进程，恢复会话时重新使用 Adaptive，窄 Dock 可能截断主题列表；表格只支持上面列出的有限子集，命令面板也只包含上面列出的 16 条本地命令；文件建议只插入扫描时得到的相对路径字面量，不读取内容，也不保证文件在选择时仍存在；Session picker 会从已关闭且不超过 16 MiB 的严格日志读取最后标题，但不读取最后一条消息或统计最后活跃时间；`/refresh-title` 只使用第一条人工文本，不实现上游通用 all-messages Provider 或并发刷新 API；真实 iTerm/Terminal/VS Code 模拟器验收仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
@@ -602,6 +609,8 @@ DeepSeek。三条命令也会在发布 CI 中运行。贡献前请阅读
 - [Phase 43 本机验收记录](docs/validation/phase-43.md)
 - [Phase 44 后台作业增量输出设计](docs/design/background-job-incremental-output.md)
 - [Phase 44 本机验收记录](docs/validation/phase-44.md)
+- [Phase 54 图片读取与视觉请求设计](docs/design/image-read-and-vision.md)
+- [Phase 54 本机验收记录](docs/validation/phase-54.md)
 - [Phase 37 本机验收记录](docs/validation/phase-37.md)
 - [Phase 38 时间上下文设计](docs/design/time-context.md)
 - [Phase 38 本机验收记录](docs/validation/phase-38.md)

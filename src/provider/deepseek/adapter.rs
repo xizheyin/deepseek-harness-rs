@@ -7,6 +7,7 @@ use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
+    attachment::AttachmentRuntime,
     model::{
         LlmCallConfig, LlmCallConfigAdapterDefaults, LlmFailure, NonNegativeSafeInteger,
         ReasoningEffortId, StreamChunk, TrueMarker,
@@ -62,6 +63,19 @@ impl DeepSeekProvider {
         Self::new(config, Arc::new(EnvironmentCredentials))
     }
 
+    pub(crate) fn from_environment_with_attachments(
+        config: DeepSeekConfig,
+        attachments: AttachmentRuntime,
+    ) -> Result<Self, DeepSeekProviderBuildError> {
+        let transport = Arc::new(ReqwestTransport::new()?);
+        Ok(Self::with_transport_and_attachments(
+            config,
+            Arc::new(EnvironmentCredentials),
+            transport,
+            Some(attachments),
+        ))
+    }
+
     /// Start one lazy model call without requiring the trait to be imported.
     #[must_use]
     pub fn stream(
@@ -99,11 +113,21 @@ impl DeepSeekProvider {
         credentials: Arc<dyn CredentialSource>,
         transport: Arc<dyn HttpTransport>,
     ) -> Self {
+        Self::with_transport_and_attachments(config, credentials, transport, None)
+    }
+
+    fn with_transport_and_attachments(
+        config: DeepSeekConfig,
+        credentials: Arc<dyn CredentialSource>,
+        transport: Arc<dyn HttpTransport>,
+        attachments: Option<AttachmentRuntime>,
+    ) -> Self {
         Self {
             inner: Arc::new(DeepSeekInner {
                 config,
                 credentials,
                 transport,
+                attachments,
                 binding: ProviderBinding::new(),
             }),
         }
@@ -206,11 +230,15 @@ impl ModelProvider for DeepSeekProvider {
         draft: ProviderRequestDraft<'_>,
     ) -> Result<PreparedRequestPreflight, ProviderPreflightError> {
         let prepared = self.prepare_call(draft.config().clone())?;
-        let encoded_bytes =
-            match preflight_request_len(&self.inner.config, prepared.config(), draft) {
-                Ok(encoded_bytes) => encoded_bytes,
-                Err(error) => return Err(provider_preflight_error(error, prepared)),
-            };
+        let encoded_bytes = match preflight_request_len(
+            &self.inner.config,
+            self.inner.attachments.as_ref(),
+            prepared.config(),
+            draft,
+        ) {
+            Ok(encoded_bytes) => encoded_bytes,
+            Err(error) => return Err(provider_preflight_error(error, prepared)),
+        };
         draft.finish(prepared, encoded_bytes)
     }
 
@@ -252,6 +280,7 @@ struct DeepSeekInner {
     config: DeepSeekConfig,
     credentials: Arc<dyn CredentialSource>,
     transport: Arc<dyn HttpTransport>,
+    attachments: Option<AttachmentRuntime>,
     binding: ProviderBinding,
 }
 
@@ -315,7 +344,11 @@ impl ProviderState {
                     if self.cancellation.is_cancelled() {
                         return self.finish_with(DeepSeekFailure::cancelled());
                     }
-                    let body = match serialize_request(&self.inner.config, &request) {
+                    let body = match serialize_request(
+                        &self.inner.config,
+                        self.inner.attachments.as_ref(),
+                        &request,
+                    ) {
                         Ok(body) => body,
                         Err(error) => {
                             if self.cancellation.is_cancelled() {

@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    attachment::AttachmentRuntime,
     model::{
         ContentBlock, FinishReasonKind, FiniteNumber, JsonValue, LlmCallConfig,
         LlmCallConfigAdapterDefaults, Message, MessageSource, NonNegativeSafeInteger,
@@ -23,11 +24,15 @@ use crate::{
         MAX_PROVIDER_REQUEST_BYTES, ModelProvider, PreparedProviderCall, ProviderPreflightError,
         ProviderPrepareError, ProviderRequest, ProviderRequestDraft, RequestPurpose,
     },
+    session::SessionStore,
 };
 
 use super::{
     adapter::DeepSeekProvider,
-    config::{DEEPSEEK_PROVIDER, DeepSeekConfig, DeepSeekReasoningEffort, DeepSeekThinking},
+    config::{
+        DEEPSEEK_PROVIDER, DEEPSEEK_VISION_MODEL, DeepSeekConfig, DeepSeekReasoningEffort,
+        DeepSeekThinking,
+    },
     credentials::{
         ApiKey, CredentialLookup, CredentialRef, CredentialSource, SecretValue, StaticCredentials,
     },
@@ -163,7 +168,7 @@ fn request_serialization_matches_the_committed_upstream_oracle() {
     let request = full_request();
     let actual = request_value(&DeepSeekConfig::default(), &request).unwrap();
     assert_eq!(actual, oracle()["serialize"]["fullRequest"]["value"]);
-    let encoded = serialize_request(&DeepSeekConfig::default(), &request).unwrap();
+    let encoded = serialize_request(&DeepSeekConfig::default(), None, &request).unwrap();
     assert_eq!(encoded, serde_json::to_vec(&actual).unwrap());
     assert_eq!(serde_json::from_slice::<Value>(&encoded).unwrap(), actual);
 
@@ -191,11 +196,116 @@ fn preflight_counts_the_exact_wire_without_credentials_or_transport() {
     assert_eq!(transport.request_count(), 0);
 
     let request = draft.into_request(preflight).unwrap();
-    let encoded = serialize_request(&DeepSeekConfig::default(), &request).unwrap();
+    let encoded = serialize_request(&DeepSeekConfig::default(), None, &request).unwrap();
     assert_eq!(encoded.len(), encoded_bytes);
     assert_eq!(request.preflight_encoded_bytes(), Some(encoded_bytes));
     assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
     assert_eq!(transport.request_count(), 0);
+}
+
+#[tokio::test]
+async fn vision_request_inlines_verified_image_and_keeps_tool_image_order() {
+    use std::{fs, os::unix::fs::PermissionsExt as _};
+
+    const PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4,
+        0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15, 0, 1, 5,
+        1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let root = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("dsh-provider-image-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime =
+        AttachmentRuntime::open_for_test(SessionStore::open_existing(&root).unwrap(), &[])
+            .await
+            .unwrap();
+    let reference = runtime
+        .save_image(
+            PNG.to_vec(),
+            crate::model::ImageMediaType::Png,
+            Some("pixel.png".to_owned()),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let message = Message::user(
+        "tool-image",
+        vec![
+            ContentBlock::tool_result(
+                "call-image",
+                vec![
+                    ContentBlock::text("image output").unwrap(),
+                    ContentBlock::image(reference.clone()).unwrap(),
+                ],
+                None,
+            )
+            .unwrap(),
+        ],
+        MessageSource::plugin("tool-fs").unwrap(),
+    )
+    .unwrap();
+    let config = LlmCallConfig::from_parts(
+        DEEPSEEK_PROVIDER.to_owned(),
+        DEEPSEEK_VISION_MODEL.to_owned(),
+        Some(ReasoningEffortId::new("high")),
+        None,
+        Some(NonNegativeSafeInteger::new(256_000).unwrap()),
+        None,
+    )
+    .unwrap();
+    let request = ProviderRequest::new(prepared(config), vec![message]).unwrap();
+    let encoded = serialize_request(&DeepSeekConfig::default(), Some(&runtime), &request).unwrap();
+    let value: Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(value["model"], DEEPSEEK_VISION_MODEL);
+    assert_eq!(value["messages"][0]["role"], "tool");
+    assert!(
+        value["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("request preview 1x1px")
+    );
+    assert_eq!(value["messages"][1]["role"], "user");
+    assert_eq!(
+        value["messages"][1]["content"][0]["text"],
+        "Attached image(s) from tool result:"
+    );
+    assert!(
+        value["messages"][1]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
+
+    let repeated = Message::user(
+        "five-images",
+        (0..5)
+            .map(|_| ContentBlock::image(reference.clone()).unwrap())
+            .collect(),
+        MessageSource::user().unwrap(),
+    )
+    .unwrap();
+    let config = LlmCallConfig::from_parts(
+        DEEPSEEK_PROVIDER.to_owned(),
+        DEEPSEEK_VISION_MODEL.to_owned(),
+        Some(ReasoningEffortId::new("high")),
+        None,
+        Some(NonNegativeSafeInteger::new(256_000).unwrap()),
+        None,
+    )
+    .unwrap();
+    let request = ProviderRequest::new(prepared(config), vec![repeated]).unwrap();
+    let encoded = serialize_request(&DeepSeekConfig::default(), Some(&runtime), &request).unwrap();
+    let encoded = String::from_utf8(encoded).unwrap();
+    assert_eq!(
+        encoded
+            .matches("image omitted to fit request image limits")
+            .count(),
+        1
+    );
+    assert_eq!(encoded.matches("\"type\":\"image_url\"").count(), 4);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

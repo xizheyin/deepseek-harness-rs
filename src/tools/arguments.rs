@@ -41,6 +41,12 @@ struct ReadWire {
     limit: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+struct ReadImageWire {
+    file_path: String,
+}
+
 #[derive(Clone)]
 pub(crate) struct ListArgs {
     pub(crate) path: String,
@@ -64,6 +70,11 @@ pub(crate) struct ReadArgs {
     pub(crate) file_path: String,
     pub(crate) offset: usize,
     pub(crate) limit: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReadImageArgs {
+    pub(crate) file_path: String,
 }
 
 pub(crate) fn parse_list(value: &Value) -> ToolCallResult<ListArgs> {
@@ -137,6 +148,14 @@ pub(crate) fn parse_read(value: &Value) -> ToolCallResult<ReadArgs> {
     })
 }
 
+pub(crate) fn parse_read_image(value: &Value) -> ToolCallResult<ReadImageArgs> {
+    let wire: ReadImageWire = parse(value, "read_image")?;
+    validate_path(&wire.file_path, "read_image.file_path")?;
+    Ok(ReadImageArgs {
+        file_path: wire.file_path,
+    })
+}
+
 fn parse<T: for<'de> Deserialize<'de>>(value: &Value, tool: &str) -> ToolCallResult<T> {
     serde_json::from_value(value.clone()).map_err(|_| {
         ToolCallError::invalid_args(format!(
@@ -199,7 +218,10 @@ fn has_top_level_comma(pattern: &str) -> bool {
 mod tests {
     use serde_json::json;
 
-    use super::{MAX_TOOL_ARGUMENT_STRING_BYTES, parse_glob, parse_grep, parse_list, parse_read};
+    use super::{
+        MAX_TOOL_ARGUMENT_STRING_BYTES, parse_glob, parse_grep, parse_list, parse_read,
+        parse_read_image,
+    };
 
     #[test]
     fn fixed_argument_boundaries_accept_the_limit_and_reject_one_more() {
@@ -214,6 +236,8 @@ mod tests {
         assert!(parse_read(&json!({"file_path": "a", "limit": 2_000})).is_ok());
         assert!(parse_read(&json!({"file_path": "a", "limit": 2_001})).is_err());
         assert!(parse_read(&json!({"file_path": "a", "offset": 0})).is_err());
+        assert!(parse_read_image(&json!({"file_path": "a.png"})).is_ok());
+        assert!(parse_read_image(&json!({"file_path": "a.png", "extra": true})).is_err());
     }
 
     #[test]
@@ -249,5 +273,6 @@ mod tests {
 
         assert!(parse_read(&json!({"file_path": "   "})).is_err());
         assert!(parse_read(&json!({"file_path": "bad\rname"})).is_err());
+        assert!(parse_read_image(&json!({"file_path": "   "})).is_err());
     }
 }

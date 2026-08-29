@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–53 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–54 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -61,8 +61,25 @@ for behavior that users can run today.
 | 51 | Completed-turn current-Session fork | `complete` | [`validation/phase-51.md`](validation/phase-51.md) |
 | 52 | Idle Session model and reasoning-effort selection | `complete` | [`validation/phase-52.md`](validation/phase-52.md) |
 | 53 | Durable safe permission presets | `complete` | [`validation/phase-53.md`](validation/phase-53.md) |
+| 54 | Durable workspace image reading and bounded DeepSeek vision requests | `complete` | [`validation/phase-54.md`](validation/phase-54.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
+
+## Phase 54 boundary (2026-08-29)
+
+Phase 54 adds the fixed-upstream `read_image` tool plus the current-master
+DeepSeek visual route needed to make its result usable. A vision-model tool
+call can read one bounded PNG/JPEG/WebP/GIF from the existing workspace
+capability, fully validate it, durably publish a content-addressed attachment,
+and continue the same Agent turn with an image block. Resume verifies and
+preloads only the newest request-retained objects.
+
+The exact supported route is `deepseek-v4-flash-vision-exp`. Rust uses bounded
+inline base64 and deterministic oldest-first offloading instead of the latest
+official Files API preference. Direct terminal uploads, clipboard/drag input,
+image editing, attachment export, and remote attachment stores remain outside
+this phase. Full limits, ordering, failure behavior, and intentional storage
+differences are specified in `design/image-read-and-vision.md`.
 
 ## Phase 45 boundary (2026-08-29)
 

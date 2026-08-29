@@ -4,7 +4,7 @@ use std::{
     fs::File,
     io::{Read as _, Seek as _, Write as _},
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -185,6 +185,12 @@ impl std::fmt::Debug for SessionStore {
 impl SessionStore {
     pub(super) fn root_plan(&self) -> RootPlan {
         self.root.clone()
+    }
+
+    pub(crate) fn materialize_root_for_attachments(&self) -> Result<Arc<Dir>, StoreError> {
+        self.root
+            .materialize()
+            .map(|materialized| materialized.root)
     }
 
     /// Internal test seam for an already-opened exact-mode root.

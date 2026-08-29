@@ -556,12 +556,16 @@ fn write_lsp_config_with_timeout(
 }
 
 fn script_command(base_url: &str, workspace: &std::path::Path) -> Command {
+    script_command_with_model(base_url, workspace, "deepseek-chat")
+}
+
+fn script_command_with_model(base_url: &str, workspace: &std::path::Path, model: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dsh"));
     let session_root = std::fs::canonicalize(workspace)
         .expect("test workspace should canonicalize")
         .join(".dsh-test-sessions");
     command
-        .args(["--model", "deepseek-chat", "--workspace"])
+        .args(["--model", model, "--workspace"])
         .arg(workspace)
         .arg("--no-color")
         .env_clear()
@@ -953,6 +957,63 @@ fn a_real_script_session_is_immediately_keyless_listable() {
     assert_eq!(fields[2], canonical_workspace.to_str().unwrap());
     assert_eq!(fields[3], "create a durable session");
 
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn real_vision_script_reads_persists_and_sends_a_workspace_image() {
+    const PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4,
+        0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15, 0, 1, 5,
+        1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let workspace = script_workspace("vision-read-image");
+    std::fs::write(workspace.join("pixel.png"), PNG).unwrap();
+    let (base_url, server) = spawn_response_server(vec![
+        tool_round_sse(&[(
+            "call-image",
+            "read_image",
+            serde_json::json!({"file_path": "pixel.png"}),
+        )]),
+        text_sse("I inspected the image."),
+    ]);
+    let mut command =
+        script_command_with_model(&base_url, &workspace, "deepseek-v4-flash-vision-exp");
+    command
+        .args(["--prompt", "inspect pixel.png"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = OwnedScriptChild::new(command.spawn().expect("vision script should spawn"))
+        .wait_with_output(Duration::from_secs(10));
+    let requests = server.join().unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "I inspected the image.\n");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_json(&requests[0])["model"],
+        "deepseek-v4-flash-vision-exp"
+    );
+    assert!(
+        request_json(&requests[0])["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "read_image")
+    );
+    let second = request_json(&requests[1]);
+    let second_wire = serde_json::to_string(&second).unwrap();
+    assert!(second_wire.contains("Attached image(s) from tool result:"));
+    assert!(second_wire.contains("data:image/png;base64,"));
+    let objects = std::fs::read_dir(
+        std::fs::canonicalize(&workspace)
+            .unwrap()
+            .join(".dsh-test-sessions/attachments-v1/objects"),
+    )
+    .unwrap()
+    .count();
+    assert_eq!(objects, 1);
     std::fs::remove_dir_all(workspace).unwrap();
 }
 

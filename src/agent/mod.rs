@@ -4856,6 +4856,7 @@ fn release_parallel_unresolved(
 struct ToolRunEnvironment<'a> {
     tools: &'a dyn ToolExecutor,
     declared_tools: &'a [ToolSchema],
+    route: &'a LlmCallConfig,
     limits: &'a AgentLimits,
     turn_deadline: Instant,
 }
@@ -4865,6 +4866,7 @@ impl<'a> ToolRunEnvironment<'a> {
         Self {
             tools: driver.tools,
             declared_tools: &driver.config.tools,
+            route: &driver.config.call,
             limits: &driver.config.limits,
             turn_deadline: driver.deadline,
         }
@@ -4921,6 +4923,7 @@ async fn run_one_tool(
         call.name.clone(),
         raw,
         parsed,
+        environment.route.clone(),
         plan.dispatch.clone(),
     );
     let child = cancellation.child_token();

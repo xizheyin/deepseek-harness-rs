@@ -966,6 +966,7 @@ pub struct ToolExecutionRequest {
     name: String,
     raw_arguments: String,
     arguments: JsonValue,
+    route: crate::model::LlmCallConfig,
     dispatch: ToolDispatchBinding,
 }
 
@@ -986,6 +987,7 @@ impl ToolExecutionRequest {
         name: String,
         raw_arguments: String,
         arguments: JsonValue,
+        route: crate::model::LlmCallConfig,
         dispatch: ToolDispatchBinding,
     ) -> Self {
         Self {
@@ -993,6 +995,7 @@ impl ToolExecutionRequest {
             name,
             raw_arguments,
             arguments,
+            route,
             dispatch,
         }
     }
@@ -1015,6 +1018,11 @@ impl ToolExecutionRequest {
     #[must_use]
     pub fn arguments(&self) -> &JsonValue {
         &self.arguments
+    }
+
+    #[must_use]
+    pub fn route(&self) -> &crate::model::LlmCallConfig {
+        &self.route
     }
 
     #[must_use]

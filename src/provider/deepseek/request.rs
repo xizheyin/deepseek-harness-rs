@@ -1,6 +1,9 @@
 //! Provider-neutral messages to DeepSeek chat-completions JSON.
 
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    sync::Arc,
+};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -9,14 +12,21 @@ use serde_json::{Map, json};
 use thiserror::Error;
 
 use crate::{
-    model::{ContentBlock, ContentBlockKind, Message, MessageRole},
+    attachment::{AttachmentRuntime, retained_request_images},
+    model::{
+        ContentBlock, ContentBlockKind, ImageAttachmentRef, ImageMediaType, Message, MessageRole,
+    },
     provider::{MAX_PROVIDER_REQUEST_BYTES, ProviderRequest, ProviderRequestDraft, RequestPurpose},
 };
 
-use super::config::{DEEPSEEK_PROVIDER, DeepSeekConfig, DeepSeekReasoningEffort, DeepSeekThinking};
+use super::config::{
+    DEEPSEEK_PROVIDER, DEEPSEEK_VISION_MODEL, DeepSeekConfig, DeepSeekReasoningEffort,
+    DeepSeekThinking,
+};
 
 pub(super) fn serialize_request(
     config: &DeepSeekConfig,
+    attachments: Option<&AttachmentRuntime>,
     request: &ProviderRequest,
 ) -> Result<Vec<u8>, RequestBuildError> {
     let mut encoded = Vec::new();
@@ -32,6 +42,7 @@ pub(super) fn serialize_request(
             tools: request.tools(),
             purpose: request.purpose(),
         },
+        attachments,
         &mut encoded,
     )?;
     if request
@@ -45,6 +56,7 @@ pub(super) fn serialize_request(
 
 pub(super) fn preflight_request_len(
     config: &DeepSeekConfig,
+    attachments: Option<&AttachmentRuntime>,
     effective_config: &crate::model::LlmCallConfig,
     draft: ProviderRequestDraft<'_>,
 ) -> Result<usize, RequestBuildError> {
@@ -57,6 +69,7 @@ pub(super) fn preflight_request_len(
             tools: draft.tools(),
             purpose: draft.purpose(),
         },
+        attachments,
         &mut io::sink(),
     )
 }
@@ -73,16 +86,26 @@ struct WireRequest<'a> {
 fn encode_request(
     adapter: &DeepSeekConfig,
     request: WireRequest<'_>,
+    attachments: Option<&AttachmentRuntime>,
     output: &mut impl Write,
 ) -> Result<usize, RequestBuildError> {
     if request.config.provider() != DEEPSEEK_PROVIDER {
         return Err(RequestBuildError::WrongProvider);
     }
-    if request
+    let has_images = request
         .messages
         .iter()
-        .any(|message| content_has_image_without_allocation(message.content()))
-    {
+        .any(|message| content_has_image_without_allocation(message.content()));
+    if has_images && request.config.model() != DEEPSEEK_VISION_MODEL {
+        return Err(RequestBuildError::UnsupportedContent);
+    }
+    if has_images && attachments.is_none() {
+        return Err(RequestBuildError::AttachmentUnavailable);
+    }
+    if request.messages.iter().any(|message| {
+        message.role() != MessageRole::User
+            && content_has_image_without_allocation(message.content())
+    }) {
         return Err(RequestBuildError::UnsupportedContent);
     }
     let (thinking, effort) = resolve_thinking_parts(adapter, request.config, request.purpose)?;
@@ -100,7 +123,7 @@ fn encode_request(
     writer.raw(b"\"max_tokens\":")?;
     writer.json(&max_tokens)?;
     writer.raw(b",\"messages\":[")?;
-    write_messages(&mut writer, request.system, request.messages)?;
+    write_messages(&mut writer, request.system, request.messages, attachments)?;
     writer.raw(b"],\"model\":")?;
     writer.json(&request.config.model())?;
     if let Some(effort) = effort {
@@ -159,9 +182,11 @@ fn write_messages(
     writer: &mut WireWriter<'_, impl Write>,
     system: Option<&str>,
     messages: &[Message],
+    attachments: Option<&AttachmentRuntime>,
 ) -> Result<(), RequestBuildError> {
     let mut first = true;
     let mut scratch = String::new();
+    let mut images = attachments.map(|runtime| ImageWireState::new(runtime, messages));
     if let Some(system) = system {
         write_simple_message(writer, &mut first, "system", system)?;
     }
@@ -184,7 +209,7 @@ fn write_messages(
                 write_assistant_message(writer, &mut first, message, &mut scratch)?;
             }
             MessageRole::User => {
-                write_user_messages(writer, &mut first, message, &mut scratch)?;
+                write_user_messages(writer, &mut first, message, &mut scratch, &mut images)?;
             }
         }
     }
@@ -295,24 +320,58 @@ fn write_user_messages(
     first: &mut bool,
     message: &Message,
     scratch: &mut String,
+    images: &mut Option<ImageWireState<'_>>,
 ) -> Result<(), RequestBuildError> {
     let has_tool_results = message
         .content()
         .iter()
         .any(|block| matches!(block.kind(), ContentBlockKind::ToolResult { .. }));
-    concat_strings_into(
-        scratch,
-        message
+    let regular_has_images = message.content().iter().any(|block| {
+        !matches!(block.kind(), ContentBlockKind::ToolResult { .. })
+            && raw_value_has_image(block.raw().as_value())
+    });
+    if regular_has_images {
+        let image_state = images
+            .as_mut()
+            .ok_or(RequestBuildError::AttachmentUnavailable)?;
+        write_separator(writer, first)?;
+        writer.raw(b"{\"content\":[")?;
+        let mut first_part = true;
+        for block in message
             .content()
             .iter()
-            .filter_map(|block| match block.kind() {
-                ContentBlockKind::Text { text } => Some(text.as_str()),
-                _ => None,
-            }),
-    )?;
-    if !scratch.is_empty() || !has_tool_results {
-        write_simple_message(writer, first, "user", scratch)?;
+            .filter(|block| !matches!(block.kind(), ContentBlockKind::ToolResult { .. }))
+        {
+            match block.kind() {
+                ContentBlockKind::Text { text } if !text.is_empty() => {
+                    write_text_part(writer, &mut first_part, text)?;
+                }
+                ContentBlockKind::Image { attachment } => {
+                    write_image_occurrence(writer, &mut first_part, image_state, attachment)?;
+                }
+                _ if raw_value_has_image(block.raw().as_value()) => {
+                    return Err(RequestBuildError::UnsupportedContent);
+                }
+                _ => {}
+            }
+        }
+        writer.raw(b"],\"role\":\"user\"}")?;
+    } else {
+        concat_strings_into(
+            scratch,
+            message
+                .content()
+                .iter()
+                .filter_map(|block| match block.kind() {
+                    ContentBlockKind::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }),
+        )?;
+        if !scratch.is_empty() || !has_tool_results {
+            write_simple_message(writer, first, "user", scratch)?;
+        }
     }
+    let mut pending_tool_images = Vec::new();
     for result in message
         .content()
         .iter()
@@ -321,18 +380,10 @@ fn write_user_messages(
         let ContentBlockKind::ToolResult { tool_call_id, .. } = result.kind() else {
             continue;
         };
-        concat_strings_into(
-            scratch,
-            result
-                .tool_result_content()
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|block| {
-                    let fields = block.as_object()?;
-                    (fields.get("type")?.as_str()? == "text")
-                        .then(|| fields.get("text")?.as_str())?
-                }),
-        )?;
+        scratch.clear();
+        for block in result.tool_result_content().unwrap_or_default() {
+            collect_tool_content(block, scratch, &mut pending_tool_images, images)?;
+        }
         write_separator(writer, first)?;
         writer.raw(b"{\"content\":")?;
         writer.json(&if scratch.is_empty() {
@@ -344,7 +395,263 @@ fn write_user_messages(
         writer.json(&tool_call_id.as_str())?;
         writer.raw(b"}")?;
     }
+    if !pending_tool_images.is_empty() {
+        write_separator(writer, first)?;
+        writer.raw(
+            b"{\"content\":[{\"text\":\"Attached image(s) from tool result:\",\"type\":\"text\"}",
+        )?;
+        for image in pending_tool_images {
+            writer.raw(b",")?;
+            write_image_url_part(writer, image.media_type, &image.bytes)?;
+        }
+        writer.raw(b"],\"role\":\"user\"}")?;
+    }
     Ok(())
+}
+
+struct PendingWireImage {
+    media_type: ImageMediaType,
+    bytes: Arc<[u8]>,
+}
+
+struct ImageWireState<'a> {
+    runtime: &'a AttachmentRuntime,
+    offload_before: usize,
+    seen: usize,
+}
+
+impl<'a> ImageWireState<'a> {
+    fn new(runtime: &'a AttachmentRuntime, messages: &[Message]) -> Self {
+        let total = messages
+            .iter()
+            .map(|message| count_images(message.content()))
+            .sum::<usize>();
+        let retained = retained_request_images(messages).len();
+        Self {
+            runtime,
+            offload_before: total.saturating_sub(retained),
+            seen: 0,
+        }
+    }
+
+    fn next(
+        &mut self,
+        reference: &ImageAttachmentRef,
+        preceded_by_content: bool,
+    ) -> Result<ImageOccurrence, RequestBuildError> {
+        let offloaded = self.seen < self.offload_before;
+        self.seen = self.seen.saturating_add(1);
+        if offloaded {
+            return Ok(ImageOccurrence::Offloaded(offloaded_image_text(reference)));
+        }
+        let bytes = self
+            .runtime
+            .resolve_cached(reference)
+            .map_err(|_| RequestBuildError::AttachmentUnavailable)?;
+        Ok(ImageOccurrence::Retained {
+            handle: image_handle_text(reference, preceded_by_content),
+            image: PendingWireImage {
+                media_type: reference.media_type(),
+                bytes,
+            },
+        })
+    }
+}
+
+enum ImageOccurrence {
+    Offloaded(String),
+    Retained {
+        handle: String,
+        image: PendingWireImage,
+    },
+}
+
+fn write_image_occurrence(
+    writer: &mut WireWriter<'_, impl Write>,
+    first_part: &mut bool,
+    images: &mut ImageWireState<'_>,
+    reference: &ImageAttachmentRef,
+) -> Result<(), RequestBuildError> {
+    match images.next(reference, !*first_part)? {
+        ImageOccurrence::Offloaded(text) => write_text_part(writer, first_part, &text),
+        ImageOccurrence::Retained { handle, image } => {
+            write_text_part(writer, first_part, &handle)?;
+            write_part_separator(writer, first_part)?;
+            write_image_url_part(writer, image.media_type, &image.bytes)
+        }
+    }
+}
+
+fn write_text_part(
+    writer: &mut WireWriter<'_, impl Write>,
+    first_part: &mut bool,
+    text: &str,
+) -> Result<(), RequestBuildError> {
+    write_part_separator(writer, first_part)?;
+    writer.raw(b"{\"text\":")?;
+    writer.json(&text)?;
+    writer.raw(b",\"type\":\"text\"}")
+}
+
+fn write_part_separator(
+    writer: &mut WireWriter<'_, impl Write>,
+    first_part: &mut bool,
+) -> Result<(), RequestBuildError> {
+    if *first_part {
+        *first_part = false;
+        Ok(())
+    } else {
+        writer.raw(b",")
+    }
+}
+
+fn write_image_url_part(
+    writer: &mut WireWriter<'_, impl Write>,
+    media_type: ImageMediaType,
+    bytes: &[u8],
+) -> Result<(), RequestBuildError> {
+    writer.raw(b"{\"image_url\":{\"url\":\"data:")?;
+    writer.raw(media_type_name(media_type).as_bytes())?;
+    writer.raw(b";base64,")?;
+    write_base64(writer, bytes)?;
+    writer.raw(b"\"},\"type\":\"image_url\"}")
+}
+
+fn collect_tool_content(
+    value: &Value,
+    text: &mut String,
+    pending: &mut Vec<PendingWireImage>,
+    images: &mut Option<ImageWireState<'_>>,
+) -> Result<(), RequestBuildError> {
+    let Some(fields) = value.as_object() else {
+        return Ok(());
+    };
+    match fields.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            if let Some(value) = fields.get("text").and_then(Value::as_str) {
+                push_bounded(text, value)?;
+            }
+        }
+        Some("image") => {
+            let reference = fields
+                .get("attachment")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .ok_or(RequestBuildError::UnsupportedContent)?;
+            let image_state = images
+                .as_mut()
+                .ok_or(RequestBuildError::AttachmentUnavailable)?;
+            match image_state.next(&reference, !text.is_empty())? {
+                ImageOccurrence::Offloaded(value) => push_bounded(text, &value)?,
+                ImageOccurrence::Retained { handle, image } => {
+                    push_bounded(text, &handle)?;
+                    pending.push(image);
+                }
+            }
+        }
+        Some("tool-result") => {
+            if let Some(content) = fields.get("content").and_then(Value::as_array) {
+                for nested in content {
+                    collect_tool_content(nested, text, pending, images)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn push_bounded(output: &mut String, value: &str) -> Result<(), RequestBuildError> {
+    if output.len().saturating_add(value.len()) > MAX_PROVIDER_REQUEST_BYTES {
+        return Err(RequestBuildError::TooLarge {
+            maximum: MAX_PROVIDER_REQUEST_BYTES,
+            actual: output.len().saturating_add(value.len()),
+        });
+    }
+    output.push_str(value);
+    Ok(())
+}
+
+fn count_images(blocks: &[ContentBlock]) -> usize {
+    blocks
+        .iter()
+        .map(|block| count_images_in_value(block.raw().as_value()))
+        .sum()
+}
+
+fn count_images_in_value(value: &Value) -> usize {
+    let Some(fields) = value.as_object() else {
+        return 0;
+    };
+    match fields.get("type").and_then(Value::as_str) {
+        Some("image") => 1,
+        Some("tool-result") => fields
+            .get("content")
+            .and_then(Value::as_array)
+            .map_or(0, |content| content.iter().map(count_images_in_value).sum()),
+        _ => 0,
+    }
+}
+
+fn image_handle_text(reference: &ImageAttachmentRef, preceded_by_content: bool) -> String {
+    format!(
+        "{}Image {}; request preview {}x{}px.",
+        if preceded_by_content { "\n" } else { "" },
+        reference.attachment_id(),
+        reference.width().get(),
+        reference.height().get(),
+    )
+}
+
+fn offloaded_image_text(reference: &ImageAttachmentRef) -> String {
+    format!(
+        "[image omitted to fit request image limits; {}. No local normalized image path is available; ask the user to attach it again if needed.]",
+        reference.attachment_id()
+    )
+}
+
+fn media_type_name(media_type: ImageMediaType) -> &'static str {
+    match media_type {
+        ImageMediaType::Png => "image/png",
+        ImageMediaType::Jpeg => "image/jpeg",
+        ImageMediaType::Webp => "image/webp",
+        ImageMediaType::Gif => "image/gif",
+    }
+}
+
+fn write_base64(
+    writer: &mut WireWriter<'_, impl Write>,
+    bytes: &[u8],
+) -> Result<(), RequestBuildError> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in &mut chunks {
+        let encoded = [
+            TABLE[usize::from(chunk[0] >> 2)],
+            TABLE[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
+            TABLE[usize::from(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6))],
+            TABLE[usize::from(chunk[2] & 0x3f)],
+        ];
+        writer.raw(&encoded)?;
+    }
+    match chunks.remainder() {
+        [first] => writer.raw(&[
+            TABLE[usize::from(first >> 2)],
+            TABLE[usize::from((first & 0x03) << 4)],
+            b'=',
+            b'=',
+        ]),
+        [first, second] => writer.raw(&[
+            TABLE[usize::from(first >> 2)],
+            TABLE[usize::from(((first & 0x03) << 4) | (second >> 4))],
+            TABLE[usize::from((second & 0x0f) << 2)],
+            b'=',
+        ]),
+        [] => Ok(()),
+        _ => Err(RequestBuildError::Encode(
+            "invalid base64 remainder".to_owned(),
+        )),
+    }
 }
 
 fn concat_strings_into<'a>(
@@ -709,6 +1016,8 @@ pub(super) enum RequestBuildError {
     WrongProvider,
     #[error("DeepSeek chat completions do not support image content")]
     UnsupportedContent,
+    #[error("DeepSeek image attachment bytes are unavailable")]
+    AttachmentUnavailable,
     #[error("DeepSeek does not support reasoning effort {value:?}")]
     UnsupportedReasoningEffort { value: String },
     #[error("DeepSeek thinking is disabled for this deployment")]
@@ -733,6 +1042,7 @@ impl RequestBuildError {
     pub(super) fn code(&self) -> &'static str {
         match self {
             Self::UnsupportedContent => "UNSUPPORTED_CONTENT",
+            Self::AttachmentUnavailable => "ATTACHMENT_UNAVAILABLE",
             Self::UnsupportedReasoningEffort { .. } | Self::ThinkingDisabledWithEffort => {
                 "UNSUPPORTED_REASONING_EFFORT"
             }

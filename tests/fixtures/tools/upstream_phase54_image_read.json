@@ -1,0 +1,31 @@
+{
+  "fixedCommit": "47f943859bef60e4160492346772ded9b24f765a",
+  "latestReferenceCommit": "cd5ef8148158c3a752a658978873241fdf8e2bbc",
+  "fixedReadImage": {
+    "name": "read_image",
+    "arguments": { "file_path": "assets/pixel.png" },
+    "acceptedExtensions": ["png", "jpg", "jpeg", "webp", "gif"],
+    "gateBeforeFileIo": true,
+    "storageBeforeToolResult": true,
+    "attachmentId": "sha256:<64-lowercase-hex>",
+    "contentOrder": ["text", "image"],
+    "textEnvelope": "<path>assets/pixel.png</path>\n<type>image</type>\n<content>\nimage/png image, 1x1 px, 68 bytes\n</content>",
+    "fixedDeepSeekWire": "UNSUPPORTED_CONTENT"
+  },
+  "latestDeepSeekVision": {
+    "model": "deepseek-v4-flash-vision-exp",
+    "inputModalities": ["text", "image"],
+    "inlinePart": {
+      "type": "image_url",
+      "image_url": { "url": "data:image/png;base64,AAAA" }
+    },
+    "toolImageHeading": "Attached image(s) from tool result:",
+    "offloadOrder": "oldest-first"
+  },
+  "rustIntentionalDifferences": {
+    "storeRoot": "session-root/attachments-v1",
+    "representation": "base64-only",
+    "maxRawRequestImageBytes": 4194304,
+    "maxImagesPerRequest": 4
+  }
+}

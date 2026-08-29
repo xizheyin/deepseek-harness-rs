@@ -2688,3 +2688,44 @@ this CLI has no proven OS sandbox, it does not expose official
 file-change policy; Shell and subprocess plugins remain Ask. The source-derived
 contract is fixed in
 `tests/fixtures/tools/upstream_phase53_permission_presets.json`.
+
+## Phase 54 workspace image reading and DeepSeek vision — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. Focused fixed-commit evidence is:
+
+- `packages/fs/tool-fs/src/read-image.ts` and `tests/read-image.spec.ts` for
+  exact `read_image` naming/schema, extension and route gates before file I/O,
+  bounded regular-file reads, attachment-before-result ordering, the two-block
+  result envelope, and content-addressed parallel safety;
+- `packages/attachment/attachment/src/{index,types,error}.ts` and
+  `packages/attachment/attachment-local/src/{index,store,image}.ts`, with local
+  store tests, for full raster decode at admission, SHA-256 identities,
+  owner-only atomic publication, digest/metadata verification on read, and the
+  5 MiB/40-million-pixel upstream defaults;
+- `packages/llm/llm-deepseek/src/serialize.ts` and its tests for the fixed
+  adapter's explicit `UNSUPPORTED_CONTENT` result on every image block.
+
+Freshly fetched `origin/master` is
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Current-master evidence is:
+
+- `packages/llm/llm-deepseek/src/index.ts` for the exact
+  `deepseek-v4-flash-vision-exp` model and its declared `text`/`image` inputs;
+- `packages/llm/llm-deepseek/src/serialize.ts` and image serialization tests
+  for ordered text handles plus Files API or base64 image parts, grouped
+  tool-result images, unsupported-role rejection, and oldest-first offloading;
+- `packages/llm/llm-deepseek/src/adapter.ts`, `request-pricing.ts`, and Files
+  API sources/tests for request-image preparation, bounded representation,
+  preferred reusable uploads, inline fallback, and provider-owned cleanup.
+
+Rust Phase 54 combines the fixed tool/store contract with the latest exact
+visual route. It keeps raw bytes outside Session JSONL, uses SHA-256 references,
+fully decodes four formats, verifies retained objects on resume, and emits
+ordered inline data URLs. It intentionally stores objects below the existing
+private Session root, uses base64 only, caps one/request images at 4 MiB and a
+request at four images/4 MiB raw bytes, sends original validated rasters rather
+than resized request versions, and serializes `read_image` calls so the small
+verified cache follows model order. Direct terminal uploads, clipboard
+or drag input, the Files API, media export, and image editing remain outside
+this phase. The source-derived contract and differences are fixed in
+`tests/fixtures/tools/upstream_phase54_image_read.json`.

@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+mod attachment;
 mod entropy;
 mod goal;
 mod json_value;

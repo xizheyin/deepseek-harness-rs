@@ -16,6 +16,7 @@ mod plugin;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod process;
 mod read;
+mod read_image;
 mod registry;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod session_search;
