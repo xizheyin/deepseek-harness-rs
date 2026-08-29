@@ -2729,3 +2729,29 @@ verified cache follows model order. Direct terminal uploads, clipboard
 or drag input, the Files API, media export, and image editing remain outside
 this phase. The source-derived contract and differences are fixed in
 `tests/fixtures/tools/upstream_phase54_image_read.json`.
+
+## Phase 55 direct terminal image input — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. Focused fixed-commit evidence is:
+
+- `packages/host/apiproxy/src/api-proxy.ts` `durablePromptContent` and
+  `sessions.prompt` for capability-before-I/O rejection, count/aggregate
+  admission, complete-batch validation, save-before-message promotion and
+  serialized concurrent image admissions;
+- `packages/host/apiproxy/tests/api-proxy-models.spec.ts` for the executable
+  two-image ordering and validate-all-before-save assertion;
+- `packages/attachment/attachment/README.md` for temporary unsent drafts,
+  immutable durable references and the no-unreferenced-object validation pass;
+- `packages/client/ui-conversation/src/client/service.ts` for ordered temporary
+  browser files becoming image parts followed by optional text in one prompt.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Current master preserves the same
+Host admission and temporary-draft boundary, and additionally routes image
+attachments into supported commands. Rust Phase 55 maps ordinary browser
+prompt images to repeatable script `--image` paths and an interactive `/image`
+draft. It deliberately leaves image-bearing Goal/Plan commands, paste/drop,
+image-only prompts and previews outside this terminal slice. The fixed
+source-derived contract is recorded in
+`tests/fixtures/tools/upstream_phase55_direct_image_input.json`.

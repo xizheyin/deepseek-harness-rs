@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–54 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–55 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -62,8 +62,31 @@ for behavior that users can run today.
 | 52 | Idle Session model and reasoning-effort selection | `complete` | [`validation/phase-52.md`](validation/phase-52.md) |
 | 53 | Durable safe permission presets | `complete` | [`validation/phase-53.md`](validation/phase-53.md) |
 | 54 | Durable workspace image reading and bounded DeepSeek vision requests | `complete` | [`validation/phase-54.md`](validation/phase-54.md) |
+| 55 | Direct bounded terminal image attachments | `in-progress` | [`validation/phase-55.md`](validation/phase-55.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
+
+## Phase 55 boundary (2026-08-29)
+
+Phase 55 lets a human attach up to four workspace PNG/JPEG/WebP/GIF files to
+one ordinary prompt. Script mode accepts repeatable `--image <PATH>` options;
+the interactive terminal uses `/image <PATH>` as a process-local draft for the
+next ordinary prompt, `/image` to inspect that draft and `/image clear` to
+discard it.
+
+The exact vision route is still `deepseek-v4-flash-vision-exp`. A text-only
+route rejects the batch before path resolution or file I/O. The vision path
+reads only regular non-symlink workspace files, checks count and aggregate
+bytes, validates every image before persisting any member, then commits every
+attachment before one model-visible user message containing ordered image
+references followed by the prompt text. Cancellation or rejection produces no
+user-message fact and no Provider request; a content-addressed object committed
+just before a later failure may remain as an unreferenced private object.
+
+This phase does not add clipboard or drag-and-drop intake, image-only terminal
+submission, outside-workspace uploads, persistent drafts, attachment preview,
+or images on Goal/Plan commands. The complete boundary is specified in
+`design/direct-image-input.md`.
 
 ## Phase 54 boundary (2026-08-29)
 

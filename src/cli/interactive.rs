@@ -11,6 +11,7 @@ use crate::{
         AgentLoop, ManualCompactionOutcome, ManualModelSelectionOutcome,
         ManualSessionExportOutcome, ManualSessionForkOutcome, ManualTitleRefreshOutcome,
     },
+    attachment::MAX_REQUEST_IMAGES,
     entropy::EntropySource,
     goal::{GoalCommand, GoalError, GoalRound, GoalRuntime},
     plan_mode::{PlanModeCommand, PlanModeError, PlanModeRuntime},
@@ -55,12 +56,16 @@ use super::{
         FileSuggestionController, FileSuggestionEnter, FileSuggestionMove, JobSettlement,
         StagedFileSuggestionPresentation,
     },
-    identity::{new_session_id, prepare_goal_turn, prepare_injected_turn, prepare_user_turn},
+    identity::{
+        new_session_id, prepare_goal_turn, prepare_injected_turn, prepare_user_turn,
+        prepare_user_turn_with_images,
+    },
+    image_input::{PromptImageError, PromptImageRuntime},
     input::{
-        CanonicalRecordParser, ForkCommand, IdleInput, InputRecordEvent, MAX_APPROVAL_RECORD_BYTES,
-        MAX_INTERACTIVE_PROMPT_BYTES, ModelCommand, PermissionCommand, RenameCommand,
-        classify_idle_record, parse_fork_command, parse_model_command, parse_permission_command,
-        parse_rename_command,
+        CanonicalRecordParser, ForkCommand, IdleInput, ImageCommand, InputRecordEvent,
+        MAX_APPROVAL_RECORD_BYTES, MAX_INTERACTIVE_PROMPT_BYTES, ModelCommand, PermissionCommand,
+        RenameCommand, classify_idle_record, parse_fork_command, parse_image_command,
+        parse_model_command, parse_permission_command, parse_rename_command,
     },
     live::{
         EnhancedPresenter, InteractivePresenter, LiveFrame, LiveLifecycle, LiveRenderer,
@@ -268,15 +273,16 @@ pub(super) enum InteractivePresentation {
 pub(super) async fn run(
     assembly: InteractiveAssembly,
     terminal: AsyncTerminal,
+    image_paths: Vec<String>,
     signals: &mut SignalStreams,
     presentation: InteractivePresentation,
     reduced_motion: bool,
 ) -> Result<u8, InteractiveError> {
     let enhanced = presentation_uses_enhanced(presentation, terminal.size());
     if enhanced {
-        run_enhanced(assembly, terminal, signals, reduced_motion).await
+        run_enhanced(assembly, terminal, image_paths, signals, reduced_motion).await
     } else {
-        run_linear(assembly, terminal, signals, false).await
+        run_linear(assembly, terminal, image_paths, signals, false).await
     }
 }
 
@@ -293,6 +299,7 @@ pub(super) fn presentation_uses_enhanced(
 async fn run_enhanced(
     assembly: InteractiveAssembly,
     terminal: AsyncTerminal,
+    initial_image_paths: Vec<String>,
     signals: &mut SignalStreams,
     reduced_motion: bool,
 ) -> Result<u8, InteractiveError> {
@@ -309,6 +316,7 @@ async fn run_enhanced(
         session_forker,
         goal,
         plan_mode,
+        prompt_images,
     } = assembly;
     let mut file_suggestions = FileSuggestionController::new(file_suggestions);
     let job_notices = agent.job_notice_inbox();
@@ -396,7 +404,8 @@ async fn run_enhanced(
     } else {
         MotionPreference::Full
     });
-    let mut notice = None;
+    let mut image_paths = initial_image_paths;
+    let mut notice = (!image_paths.is_empty()).then(|| image_draft_notice(&image_paths));
     let mut screen = InlineScreen::default();
     let _ = file_suggestions
         .sync(input.composer(), false, false)
@@ -660,7 +669,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/model [MODEL [off|high|max]] | /permission [ask|auto-edit] | /compact | /rename TITLE | /refresh-title | /export | /fork [event-seq] | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/model [MODEL [off|high|max]] | /image [PATH|clear] | /permission [ask|auto-edit] | /compact | /rename TITLE | /refresh-title | /export | /fork [event-seq] | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -701,6 +710,12 @@ async fn run_enhanced(
                             }
                             CommandId::Model => {
                                 notice = Some(apply_model_command(&mut agent, ModelCommand::Show));
+                            }
+                            CommandId::Image => {
+                                notice = Some(apply_image_command(
+                                    &mut image_paths,
+                                    ImageCommand::Show,
+                                ));
                             }
                             CommandId::Permission => {
                                 notice = Some(
@@ -776,6 +791,9 @@ async fn run_enhanced(
                         EnhancedSubmission::Plan(_) => return Err(InteractiveError::Agent),
                         EnhancedSubmission::Model(command) => {
                             notice = Some(apply_model_command(&mut agent, command));
+                        }
+                        EnhancedSubmission::Image(command) => {
+                            notice = Some(apply_image_command(&mut image_paths, command));
                         }
                         EnhancedSubmission::Permission(command) => {
                             notice = Some(apply_permission_command(&mut agent, command).await);
@@ -873,6 +891,12 @@ async fn run_enhanced(
                                 signals,
                                 parser: &mut parser,
                                 scratch: &mut scratch,
+                                prompt_images: &prompt_images,
+                                image_paths: if goal_round.is_none() && !job_wake {
+                                    Some(&mut image_paths)
+                                } else {
+                                    None
+                                },
                                 prompt,
                                 prompt_committed: &mut prompt_committed,
                                 queued_input: Some(&mut input),
@@ -1185,7 +1209,9 @@ fn settle_enhanced_prompt(
                 .restore_uncommitted_draft(draft, cursor)
                 .map_err(|_| InteractiveError::Agent)?;
         }
-        *notice = Some("Prompt was not admitted; draft or queue entry kept".to_owned());
+        if notice.is_none() {
+            *notice = Some("Prompt was not admitted; draft or queue entry kept".to_owned());
+        }
     }
     Ok(())
 }
@@ -1290,6 +1316,7 @@ enum EnhancedSubmission {
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
     Model(ModelCommand),
+    Image(ImageCommand),
     Permission(PermissionCommand),
     Rename(RenameCommand),
     CompactUsage,
@@ -1309,6 +1336,8 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         EnhancedSubmission::Rename(rename)
     } else if let Some(model) = parse_model_command(command) {
         EnhancedSubmission::Model(model)
+    } else if let Some(image) = parse_image_command(command) {
+        EnhancedSubmission::Image(image)
     } else if let Some(permission) = parse_permission_command(command) {
         EnhancedSubmission::Permission(permission)
     } else if let Some(fork) = parse_fork_command(command) {
@@ -1374,6 +1403,35 @@ fn apply_model_command(agent: &mut AgentLoop, command: ModelCommand) -> String {
             }
         }
     }
+}
+
+fn apply_image_command(paths: &mut Vec<String>, command: ImageCommand) -> String {
+    match command {
+        ImageCommand::Show => image_draft_notice(paths),
+        ImageCommand::Clear => {
+            paths.clear();
+            "Image draft cleared · Usage: /image <WORKSPACE_PATH>".to_owned()
+        }
+        ImageCommand::Usage => "Usage: /image <WORKSPACE_PATH> | /image | /image clear".to_owned(),
+        ImageCommand::Add(path) => {
+            if paths.len() == MAX_REQUEST_IMAGES {
+                return format!("Image draft full · at most {MAX_REQUEST_IMAGES} images");
+            }
+            paths.push(path);
+            image_draft_notice(paths)
+        }
+    }
+}
+
+fn image_draft_notice(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return "Image draft · empty · Usage: /image <WORKSPACE_PATH>".to_owned();
+    }
+    format!(
+        "Image draft · {} of {MAX_REQUEST_IMAGES} · {} · next ordinary prompt sends them",
+        paths.len(),
+        paths.join(", ")
+    )
 }
 
 async fn apply_permission_command(agent: &mut AgentLoop, command: PermissionCommand) -> String {
@@ -2873,6 +2931,7 @@ async fn suspend_enhanced(
 async fn run_linear(
     assembly: InteractiveAssembly,
     terminal: AsyncTerminal,
+    initial_image_paths: Vec<String>,
     signals: &mut SignalStreams,
     color: bool,
 ) -> Result<u8, InteractiveError> {
@@ -2889,6 +2948,7 @@ async fn run_linear(
         session_forker,
         goal,
         plan_mode,
+        prompt_images,
     } = assembly;
     let job_notices = agent.job_notice_inbox();
     let mut live = LiveRenderer::for_session(resumed);
@@ -2898,6 +2958,7 @@ async fn run_linear(
     let mut presenter = InteractivePresenter::with_color(color);
     let mut parser = CanonicalRecordParser::new(MAX_INTERACTIVE_PROMPT_BYTES);
     let mut scratch = [0_u8; TERMINAL_READ_BYTES];
+    let mut image_paths = initial_image_paths;
 
     let result: Result<InteractiveExit, InteractiveError> = async {
         let banner = LiveFrame::startup_banner(&session_id, resumed)
@@ -2905,6 +2966,16 @@ async fn run_linear(
         if let Some(signal) = write_frame(banner, &mut presenter, &terminal, signals).await? {
             if let Some(signal) = handle_idle_signal(signal, &terminal, signals).await? {
                 return Ok(InteractiveExit::Signal(signal));
+            }
+        }
+        if !image_paths.is_empty() {
+            let message = format!("[{}]\n", image_draft_notice(&image_paths));
+            if let Some(signal) =
+                write_dynamic_notice(message, &mut presenter, &terminal, signals).await?
+            {
+                if let Some(signal) = handle_idle_signal(signal, &terminal, signals).await? {
+                    return Ok(InteractiveExit::Signal(signal));
+                }
             }
         }
         if let Some(frame) = live
@@ -2937,6 +3008,8 @@ async fn run_linear(
                         signals,
                         parser: &mut parser,
                         scratch: &mut scratch,
+                        prompt_images: &prompt_images,
+                        image_paths: None,
                         prompt: round.prompt().to_owned(),
                         prompt_committed: &mut prompt_committed,
                         queued_input: None,
@@ -3043,6 +3116,8 @@ async fn run_linear(
                         signals,
                         parser: &mut parser,
                         scratch: &mut scratch,
+                        prompt_images: &prompt_images,
+                        image_paths: None,
                         prompt: String::new(),
                         prompt_committed: &mut prompt_committed,
                         queued_input: None,
@@ -3202,6 +3277,20 @@ async fn run_linear(
                     }
                     IdleInput::Model(command) => {
                         let message = format!("[{}]\n", apply_model_command(&mut agent, command));
+                        if let Some(signal) =
+                            write_dynamic_notice(message, &mut presenter, &terminal, signals)
+                                .await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::Image(command) => {
+                        let message =
+                            format!("[{}]\n", apply_image_command(&mut image_paths, command));
                         if let Some(signal) =
                             write_dynamic_notice(message, &mut presenter, &terminal, signals)
                                 .await?
@@ -3402,6 +3491,8 @@ async fn run_linear(
                             signals,
                             parser: &mut parser,
                             scratch: &mut scratch,
+                            prompt_images: &prompt_images,
+                            image_paths: Some(&mut image_paths),
                             prompt,
                             prompt_committed: &mut prompt_committed,
                             queued_input: None,
@@ -3482,6 +3573,8 @@ struct ActiveTurn<'a> {
     signals: &'a mut SignalStreams,
     parser: &'a mut CanonicalRecordParser,
     scratch: &'a mut [u8; TERMINAL_READ_BYTES],
+    prompt_images: &'a PromptImageRuntime,
+    image_paths: Option<&'a mut Vec<String>>,
     prompt: String,
     prompt_committed: &'a mut bool,
     queued_input: Option<&'a mut InputMemory>,
@@ -4310,6 +4403,40 @@ async fn wait_active_file_suggestion(
 }
 
 async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, InteractiveError> {
+    let cancellation = CancellationToken::new();
+    let image_blocks = if active.job_wake || active.goal_round.is_some() {
+        Vec::new()
+    } else {
+        let paths = active
+            .image_paths
+            .as_ref()
+            .map_or_else(Vec::new, |paths| paths.to_vec());
+        if paths.is_empty() {
+            Vec::new()
+        } else {
+            let model = active
+                .agent
+                .current_model_selection()
+                .ok_or(InteractiveError::Agent)?
+                .model;
+            let prompt_images = active.prompt_images.clone();
+            let (result, signal) = prepare_prompt_images_with_signals(
+                &prompt_images,
+                &paths,
+                &model,
+                &cancellation,
+                active.signals,
+            )
+            .await;
+            if let Some(signal) = signal {
+                return finish_image_admission_signal(&mut active, signal).await;
+            }
+            match result {
+                Ok(blocks) => blocks,
+                Err(error) => return reject_image_prompt(&mut active, &error).await,
+            }
+        }
+    };
     let prepared = if active.job_wake {
         let proposal = active
             .agent
@@ -4337,7 +4464,12 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
                     round,
                 )
             }
-            None => prepare_user_turn(active.agent.session(), &active.prompt),
+            None if image_blocks.is_empty() => {
+                prepare_user_turn(active.agent.session(), &active.prompt)
+            }
+            None => {
+                prepare_user_turn_with_images(active.agent.session(), &active.prompt, image_blocks)
+            }
         }
     }
     .map_err(|_| InteractiveError::Agent)?;
@@ -4345,7 +4477,6 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
     let turn = prepared.turn;
     active.joins.begin_turn()?;
     active.parser.reset(MAX_INTERACTIVE_PROMPT_BYTES);
-    let cancellation = CancellationToken::new();
     let mut pending = None;
     let mut frame_deadline = None;
     let mut after_frame = AfterFrame::None;
@@ -6196,6 +6327,11 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
             .await?;
         }
     }
+    if *active.prompt_committed {
+        if let Some(paths) = active.image_paths.as_deref_mut() {
+            paths.clear();
+        }
+    }
 
     let disposition = finish_turn_disposition(
         stop,
@@ -6220,6 +6356,68 @@ async fn run_turn(mut active: ActiveTurn<'_>) -> Result<TurnDisposition, Interac
         Ok(TurnDisposition::Exit(1))
     } else {
         Ok(disposition)
+    }
+}
+
+async fn prepare_prompt_images_with_signals(
+    prompt_images: &PromptImageRuntime,
+    paths: &[String],
+    model: &str,
+    cancellation: &CancellationToken,
+    signals: &mut SignalStreams,
+) -> (
+    Result<Vec<crate::model::ContentBlock>, PromptImageError>,
+    Option<UiSignal>,
+) {
+    let future = prompt_images.prepare(paths, model, cancellation);
+    tokio::pin!(future);
+    let mut latch = SignalLatch::default();
+    let result = loop {
+        tokio::select! {
+            biased;
+            signal = signals.next() => {
+                latch.observe(DriverMode::Interactive, signal);
+                cancellation.cancel();
+            }
+            result = &mut future => break result,
+        }
+    };
+    tokio::task::yield_now().await;
+    signals.drain_ready(DriverMode::Interactive, &mut latch);
+    (result, latch.observed())
+}
+
+async fn reject_image_prompt(
+    active: &mut ActiveTurn<'_>,
+    error: &PromptImageError,
+) -> Result<TurnDisposition, InteractiveError> {
+    let message = format!("Image attachment error [{}] · {error}", error.code());
+    if let Some(notice) = active.queue_notice.as_deref_mut() {
+        *notice = Some(message);
+        return Ok(TurnDisposition::Continue);
+    }
+    let frame = format!("[{message}]\n");
+    match write_dynamic_notice(frame, active.presenter, active.terminal, active.signals).await? {
+        Some(signal) => match handle_idle_signal(signal, active.terminal, active.signals).await? {
+            Some(signal) => Ok(TurnDisposition::Signal(signal)),
+            None => Ok(TurnDisposition::Continue),
+        },
+        None => Ok(TurnDisposition::Continue),
+    }
+}
+
+async fn finish_image_admission_signal(
+    active: &mut ActiveTurn<'_>,
+    signal: UiSignal,
+) -> Result<TurnDisposition, InteractiveError> {
+    match signal {
+        UiSignal::Interrupt => reject_image_prompt(active, &PromptImageError::Cancelled).await,
+        UiSignal::Suspend if active.enhanced => Ok(TurnDisposition::Signal(UiSignal::Suspend)),
+        UiSignal::Suspend => match suspend_and_resume(active.terminal, active.signals).await? {
+            Some(signal) => Ok(TurnDisposition::Signal(signal)),
+            None => Ok(TurnDisposition::Continue),
+        },
+        signal => Ok(TurnDisposition::Signal(signal)),
     }
 }
 
@@ -6439,7 +6637,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/goal [objective|edit|pause|resume|clear] | /model waits for this turn | /permission waits for this turn | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /export waits for this turn | /fork waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/goal [objective|edit|pause|resume|clear] | /model waits for this turn | /image waits for this turn | /permission waits for this turn | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /export waits for this turn | /fork waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -6473,6 +6671,13 @@ fn handle_active_input(
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
                                 "Model selection busy · wait for the current turn or press Ctrl+C"
+                                    .to_owned(),
+                            );
+                        }
+                        CommandId::Image => {
+                            let _ = input.take_draft_for_turn()?;
+                            *notice = Some(
+                                "Image attachment busy · wait for the current turn or press Ctrl+C"
                                     .to_owned(),
                             );
                         }
@@ -6548,6 +6753,14 @@ fn handle_active_input(
                     let _ = input.take_draft_for_turn()?;
                     *notice = Some(
                         "Model selection busy · wait for the current turn or press Ctrl+C"
+                            .to_owned(),
+                    );
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::Image(_) => {
+                    let _ = input.take_draft_for_turn()?;
+                    *notice = Some(
+                        "Image attachment busy · wait for the current turn or press Ctrl+C"
                             .to_owned(),
                     );
                     return Ok(ActiveInputOutcome::Redraw);

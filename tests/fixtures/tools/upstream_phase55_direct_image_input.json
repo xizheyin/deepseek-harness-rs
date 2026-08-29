@@ -1,0 +1,32 @@
+{
+  "fixedCommit": "47f943859bef60e4160492346772ded9b24f765a",
+  "latestReferenceCommit": "cd5ef8148158c3a752a658978873241fdf8e2bbc",
+  "sources": {
+    "host": "packages/host/apiproxy/src/api-proxy.ts",
+    "hostTests": "packages/host/apiproxy/tests/api-proxy-models.spec.ts",
+    "attachmentContract": "packages/attachment/attachment/README.md",
+    "browserDraft": "packages/client/ui-conversation/src/client/service.ts"
+  },
+  "fixedPromptAdmission": {
+    "modelCapabilityBeforeImagePromotion": true,
+    "maxImagesBeforeValidation": true,
+    "aggregateBytesBeforeValidation": true,
+    "validateEveryImageBeforeFirstSave": true,
+    "saveEveryImageBeforeUserMessage": true,
+    "contentOrder": ["image:first.png", "text:compare", "image:second.png"],
+    "draftsBeforeSendAreRuntimeOnly": true
+  },
+  "rustCliMapping": {
+    "script": "repeatable --image <PATH>",
+    "interactive": ["/image <PATH>", "/image", "/image clear"],
+    "model": "deepseek-v4-flash-vision-exp",
+    "messageOrder": ["images-in-path-order", "prompt-text"],
+    "maxImages": 4,
+    "maxImageBytes": 4194304,
+    "maxMessageImageBytes": 4194304,
+    "workspaceOnly": true,
+    "finalSymlinks": "rejected",
+    "imageOnlyPrompt": false,
+    "goalOrPlanImages": false
+  }
+}

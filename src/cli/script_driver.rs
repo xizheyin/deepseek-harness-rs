@@ -4,7 +4,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{agent::AgentLoop, session::StoreError};
 
 use super::{
-    identity::prepare_user_turn,
+    assembly::ScriptAssembly,
+    identity::{prepare_user_turn, prepare_user_turn_with_images},
+    image_input::{PromptImageError, PromptImageRuntime},
     script::summarize_outcome,
     script_io::{ScriptOutputFrames, write_final_output_or_exit},
     shutdown,
@@ -12,7 +14,7 @@ use super::{
     storage_failure,
 };
 
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub(super) enum ScriptDriverError {
     #[error("CLI_AGENT_UNAVAILABLE")]
     Agent,
@@ -20,14 +22,22 @@ pub(super) enum ScriptDriverError {
     Output,
     #[error(transparent)]
     Storage(StoreError),
+    #[error(transparent)]
+    Image(PromptImageError),
 }
 
 pub(super) async fn run_one_turn(
-    mut agent: AgentLoop,
+    assembly: ScriptAssembly,
     prompt: String,
+    image_paths: Vec<String>,
     signals: &mut SignalStreams,
 ) -> Result<u8, ScriptDriverError> {
-    let result = run_one_turn_inner(&mut agent, prompt, signals).await;
+    let ScriptAssembly {
+        mut agent,
+        prompt_images,
+    } = assembly;
+    let result =
+        run_one_turn_inner(&mut agent, &prompt_images, prompt, &image_paths, signals).await;
     let initial_signal = result.as_ref().ok().and_then(|output| match output.exit {
         ScriptExit::Signal(signal) => Some(signal),
         ScriptExit::Ordinary(_) => None,
@@ -57,14 +67,48 @@ pub(super) async fn run_one_turn(
 
 async fn run_one_turn_inner(
     agent: &mut AgentLoop,
+    prompt_images: &PromptImageRuntime,
     prompt: String,
+    image_paths: &[String],
     signals: &mut SignalStreams,
 ) -> Result<ScriptTurnOutput, ScriptDriverError> {
-    let prepared = match prepare_user_turn(agent.session(), &prompt) {
+    let cancellation = CancellationToken::new();
+    let image_blocks = {
+        let model = agent
+            .current_model_selection()
+            .ok_or(ScriptDriverError::Agent)?
+            .model;
+        let future = prompt_images.prepare(image_paths, &model, &cancellation);
+        tokio::pin!(future);
+        let mut latch = SignalLatch::default();
+        let result = loop {
+            tokio::select! {
+                biased;
+                signal = signals.next() => {
+                    latch.observe(DriverMode::Script, signal);
+                    cancellation.cancel();
+                }
+                result = &mut future => break result,
+            }
+        };
+        tokio::task::yield_now().await;
+        signals.drain_ready(DriverMode::Script, &mut latch);
+        if let Some(signal) = latch.observed() {
+            return Ok(ScriptTurnOutput {
+                exit: ScriptExit::Signal(signal),
+                frames: None,
+            });
+        }
+        result.map_err(ScriptDriverError::Image)?
+    };
+    let prepared = match if image_blocks.is_empty() {
+        prepare_user_turn(agent.session(), &prompt)
+    } else {
+        prepare_user_turn_with_images(agent.session(), &prompt, image_blocks)
+    } {
         Ok(prepared) => prepared,
         Err(_) => return agent_failure_output(),
     };
-    let cancellation = CancellationToken::new();
     let outcome = {
         let future = agent.run_turn(prepared.proposal, cancellation.clone());
         tokio::pin!(future);

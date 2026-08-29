@@ -165,6 +165,46 @@ impl AttachmentRuntime {
         Ok(reference)
     }
 
+    /// Run the complete image admission policy without publishing an object.
+    /// Batch callers use this first so a malformed later member cannot leave
+    /// an earlier member stored but unreferenced.
+    pub(crate) async fn validate_image(
+        &self,
+        bytes: Vec<u8>,
+        declared: ImageMediaType,
+        cancellation: &CancellationToken,
+    ) -> Result<(), AttachmentError> {
+        if cancellation.is_cancelled() {
+            return Err(AttachmentError::Cancelled);
+        }
+        if bytes.is_empty() {
+            return Err(AttachmentError::InvalidImage);
+        }
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(AttachmentError::TooLarge);
+        }
+        let token = cancellation.clone();
+        task::spawn_blocking(move || {
+            if token.is_cancelled() {
+                return Err(AttachmentError::Cancelled);
+            }
+            let (detected, _, _) = inspect_image(&bytes)?;
+            if detected != declared {
+                return Err(AttachmentError::TypeMismatch);
+            }
+            if token.is_cancelled() {
+                return Err(AttachmentError::Cancelled);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| AttachmentError::Io)??;
+        if cancellation.is_cancelled() {
+            return Err(AttachmentError::Cancelled);
+        }
+        Ok(())
+    }
+
     pub(crate) fn resolve_cached(
         &self,
         reference: &ImageAttachmentRef,

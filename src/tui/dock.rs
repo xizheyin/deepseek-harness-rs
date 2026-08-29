@@ -1241,15 +1241,8 @@ mod tests {
                 24,
                 80,
                 vec![
-                    "/review",
-                    "/focus",
-                    "/theme",
-                    "/motion",
-                    "/exit",
-                    "/quit",
-                    "/goal",
-                    "/model",
-                    "/permission",
+                    "/review", "/focus", "/theme", "/motion", "/exit", "/quit", "/goal", "/model",
+                    "/image",
                 ],
             ),
             (

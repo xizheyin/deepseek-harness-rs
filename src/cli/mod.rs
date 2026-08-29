@@ -8,6 +8,7 @@ mod assembly;
 mod entry;
 mod file_suggestions;
 mod identity;
+mod image_input;
 mod input;
 mod interactive;
 mod live;

@@ -45,6 +45,7 @@ const HELP: &str = concat!(
     "\n",
     "Options:\n",
     "  -p, --prompt <TEXT>          Run one prompt and exit\n",
+    "      --image <PATH>           Attach a workspace image (repeat up to four times)\n",
     "  -m, --model <MODEL>          DeepSeek model (new: deepseek-v4-flash; resume: stored model)\n",
     "  -w, --workspace <PATH>       Workspace (new: current; resume: optional identity check)\n",
     "      --plugin-config <PATH>   Enable explicitly configured local tool plugins\n",
@@ -112,6 +113,7 @@ fn run_list_sessions(options: ListSessionsOptions) -> Result<u8, EntryError> {
 fn run_options(options: CliOptions) -> Result<u8, EntryError> {
     let CliOptions {
         prompt,
+        image_paths,
         model,
         workspace,
         plugin_config,
@@ -180,12 +182,18 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
     // registration can fail. Both therefore finish before a resume worker or
     // journal lock exists.
     let surface = if let Some(prompt) = prompt {
-        LaunchSurface::Script(prompt)
+        LaunchSurface::Script {
+            prompt,
+            image_paths,
+        }
     } else if !stdin_is_terminal {
         let prompt = runtime
             .block_on(read_piped_prompt_or_exit(&mut signals))
             .map_err(EntryError::input)?;
-        LaunchSurface::Script(prompt)
+        LaunchSurface::Script {
+            prompt,
+            image_paths,
+        }
     } else {
         if !stdout_is_terminal || !stderr_is_terminal {
             return Err(EntryError::partial_terminal());
@@ -194,10 +202,13 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
         let terminal = runtime
             .block_on(async move { open.register() })
             .map_err(EntryError::terminal)?;
-        LaunchSurface::Interactive(terminal)
+        LaunchSurface::Interactive {
+            terminal,
+            image_paths,
+        }
     };
     let mode = surface.mode();
-    let interactive = matches!(surface, LaunchSurface::Interactive(_));
+    let interactive = matches!(surface, LaunchSurface::Interactive { .. });
 
     let resume_plan = match resume {
         Some(ResumeTarget::Exact(id)) => Some((
@@ -214,7 +225,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             let sessions = store
                 .list(Some(authority.identity()))
                 .map_err(EntryError::storage)?;
-            let LaunchSurface::Interactive(terminal) = &surface else {
+            let LaunchSurface::Interactive { terminal, .. } = &surface else {
                 return Err(EntryError::usage(
                     ParseError::ResumePickerRequiresInteractive,
                 ));
@@ -266,8 +277,8 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
     let prepared = match resume_plan {
         Some((store, id, asserted_workspace, _workspace_guard)) => loop {
             let target = match &surface {
-                LaunchSurface::Script(_) => WarningTarget::Script,
-                LaunchSurface::Interactive(terminal) => WarningTarget::Interactive(terminal),
+                LaunchSurface::Script { .. } => WarningTarget::Script,
+                LaunchSurface::Interactive { terminal, .. } => WarningTarget::Interactive(terminal),
             };
             match runtime.block_on(super::session_resume::resume(
                 &store,
@@ -286,14 +297,14 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
                 Err(ResumeError::Output) => return Err(EntryError::failed_output()),
                 Err(ResumeError::Signal(signal)) => match resume_signal_action(mode, signal) {
                     ResumeSignalAction::RetryAfterInterrupt => {
-                        let LaunchSurface::Interactive(terminal) = &surface else {
+                        let LaunchSurface::Interactive { terminal, .. } = &surface else {
                             return Err(EntryError::agent());
                         };
                         terminal.flush_input().map_err(EntryError::terminal)?;
                         continue;
                     }
                     ResumeSignalAction::SuspendThenRetry => {
-                        let LaunchSurface::Interactive(terminal) = &surface else {
+                        let LaunchSurface::Interactive { terminal, .. } = &surface else {
                             return Err(EntryError::agent());
                         };
                         match runtime
@@ -360,7 +371,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
 
     if let Some(startup_signal) = startup_signal {
         let mut agent = match assembly {
-            AgentAssembly::Script(agent) => agent,
+            AgentAssembly::Script(assembly) => assembly.agent,
             AgentAssembly::Interactive(assembly) => assembly.agent,
         };
         let (cleanup, signal) = runtime.block_on(shutdown::agent_with_signals(
@@ -380,13 +391,31 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
     }
 
     match (surface, assembly) {
-        (LaunchSurface::Script(prompt), AgentAssembly::Script(agent)) => runtime
-            .block_on(script_driver::run_one_turn(agent, prompt, &mut signals))
+        (
+            LaunchSurface::Script {
+                prompt,
+                image_paths,
+            },
+            AgentAssembly::Script(assembly),
+        ) => runtime
+            .block_on(script_driver::run_one_turn(
+                assembly,
+                prompt,
+                image_paths,
+                &mut signals,
+            ))
             .map_err(EntryError::script),
-        (LaunchSurface::Interactive(terminal), AgentAssembly::Interactive(assembly)) => runtime
+        (
+            LaunchSurface::Interactive {
+                terminal,
+                image_paths,
+            },
+            AgentAssembly::Interactive(assembly),
+        ) => runtime
             .block_on(interactive::run(
                 assembly,
                 terminal,
+                image_paths,
                 &mut signals,
                 presentation,
                 reduced_motion,
@@ -394,7 +423,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
             .map_err(EntryError::interactive),
         (surface, assembly) => {
             let mut agent = match assembly {
-                AgentAssembly::Script(agent) => agent,
+                AgentAssembly::Script(assembly) => assembly.agent,
                 AgentAssembly::Interactive(assembly) => assembly.agent,
             };
             let (cleanup, signal) = runtime.block_on(shutdown::agent_with_signals(
@@ -463,8 +492,14 @@ fn interactive_presentation(
 }
 
 enum LaunchSurface {
-    Script(String),
-    Interactive(AsyncTerminal),
+    Script {
+        prompt: String,
+        image_paths: Vec<String>,
+    },
+    Interactive {
+        terminal: AsyncTerminal,
+        image_paths: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -485,8 +520,8 @@ const fn resume_signal_action(mode: DriverMode, signal: UiSignal) -> ResumeSigna
 impl LaunchSurface {
     const fn mode(&self) -> DriverMode {
         match self {
-            Self::Script(_) => DriverMode::Script,
-            Self::Interactive(_) => DriverMode::Interactive,
+            Self::Script { .. } => DriverMode::Script,
+            Self::Interactive { .. } => DriverMode::Interactive,
         }
     }
 }
@@ -670,6 +705,12 @@ impl EntryError {
         match error {
             ScriptDriverError::Agent => Self::agent(),
             ScriptDriverError::Storage(error) => Self::storage(error),
+            ScriptDriverError::Image(error) => Self {
+                code: error.code(),
+                exit: 2,
+                detail: Some(error.to_string()),
+                emit_diagnostic: true,
+            },
             ScriptDriverError::Output => {
                 let mut failure = Self::output();
                 failure.emit_diagnostic = false;

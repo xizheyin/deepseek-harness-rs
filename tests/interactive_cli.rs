@@ -435,8 +435,8 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
     dsh.expect(b"/quit");
     dsh.expect(b"/goal");
     dsh.expect(b"/model");
+    dsh.expect(b"/image");
     dsh.expect(b"/permission");
-    dsh.expect(b"/compact");
     dsh.expect("Enter complete · Esc close".as_bytes());
     dsh.write(b"\x1b[A");
     dsh.expect(b"> /exit");
@@ -3609,6 +3609,84 @@ fn enhanced_model_selection_is_used_by_the_next_request_and_linear_resume() {
     let resumed_request = request_json(&resumed_requests[0]);
     assert_eq!(resumed_request["model"], "deepseek-v4-pro");
     assert_eq!(resumed_request["reasoning_effort"], "max");
+    assert!(!transcript.contains(&0x1b));
+}
+
+#[test]
+fn linear_image_draft_survives_text_route_rejection_and_sends_on_vision_route() {
+    const PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4,
+        0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15, 0, 1, 5,
+        1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let server = SequenceSseServer::start(vec![text_sse("Direct terminal image received.")]);
+    let workspace = TestWorkspace::new();
+    std::fs::write(workspace.0.join("pixel.png"), PNG).unwrap();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"/image pixel.png\r");
+    dsh.expect(b"[Image draft");
+    dsh.expect(b"pixel.png");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    dsh.write(b"this must be rejected before file IO\r");
+    dsh.expect(b"MODEL_NOT_IMAGE_CAPABLE");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    dsh.write(b"/image\r");
+    dsh.expect(b"[Image draft");
+    dsh.expect(b"pixel.png");
+    dsh.expect_occurrences(b"dsh > ", 4);
+    dsh.write(b"/model deepseek-v4-flash-vision-exp\r");
+    dsh.expect(b"Model selected for next request");
+    dsh.expect_occurrences(b"dsh > ", 5);
+    dsh.write(b"describe the directly attached image\r");
+    dsh.expect(b"Direct terminal image received.");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 6);
+    dsh.write(b"/image\r");
+    dsh.expect(b"Image draft");
+    dsh.expect(b"empty");
+    dsh.expect_occurrences(b"dsh > ", 7);
+
+    let (status, transcript) = dsh.exit_cleanly();
+    assert!(status.success());
+    let requests = server.finish();
+    assert!((1..=2).contains(&requests.len()));
+    let request = requests
+        .iter()
+        .map(|request| request_json(request))
+        .find(|request| {
+            serde_json::to_string(request)
+                .unwrap()
+                .contains("data:image/png;base64,")
+        })
+        .expect("one request should carry the direct image");
+    assert_eq!(request["model"], "deepseek-v4-flash-vision-exp");
+    let wire = serde_json::to_string(&request).unwrap();
+    assert!(wire.contains("data:image/png;base64,"));
+    assert!(wire.contains("describe the directly attached image"));
+    assert!(!wire.contains("this must be rejected before file IO"));
+    let journals = session_journals(session_root.path());
+    assert_eq!(journals.len(), 1);
+    let rows = journal_rows(&journals[0]);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| {
+                row["type"] == "user/message" && row["data"]["source"]["kind"] == "user"
+            })
+            .count(),
+        1
+    );
+    assert!(
+        !serde_json::to_string(&rows)
+            .unwrap()
+            .contains("this must be rejected before file IO")
+    );
     assert!(!transcript.contains(&0x1b));
 }
 

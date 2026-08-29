@@ -34,7 +34,15 @@ pub(super) fn prepare_user_turn(
     session: &Session,
     prompt: &str,
 ) -> Result<PreparedUserTurn, IdentityError> {
-    prepare_turn(session, prompt, None)
+    prepare_turn(session, prompt, Vec::new(), None)
+}
+
+pub(super) fn prepare_user_turn_with_images(
+    session: &Session,
+    prompt: &str,
+    images: Vec<ContentBlock>,
+) -> Result<PreparedUserTurn, IdentityError> {
+    prepare_turn(session, prompt, images, None)
 }
 
 pub(super) fn prepare_goal_turn(
@@ -44,7 +52,12 @@ pub(super) fn prepare_goal_turn(
     revision: u64,
     round: u32,
 ) -> Result<PreparedUserTurn, IdentityError> {
-    prepare_turn(session, prompt, Some((goal_id, revision, round)))
+    prepare_turn(
+        session,
+        prompt,
+        Vec::new(),
+        Some((goal_id, revision, round)),
+    )
 }
 
 pub(super) fn prepare_injected_turn(
@@ -64,13 +77,17 @@ pub(super) fn prepare_injected_turn(
 fn prepare_turn(
     session: &Session,
     prompt: &str,
+    mut content: Vec<ContentBlock>,
     goal_round: Option<(&str, u64, u32)>,
 ) -> Result<PreparedUserTurn, IdentityError> {
     let start_seq = session
         .next_seq()
         .ok_or(IdentityError::SessionSequenceExhausted)?;
     let turn = session.state().next_turn();
-    let content = ContentBlock::text(prompt).map_err(|_| IdentityError::InvalidUserMessage)?;
+    content
+        .try_reserve_exact(1)
+        .map_err(|_| IdentityError::InvalidUserMessage)?;
+    content.push(ContentBlock::text(prompt).map_err(|_| IdentityError::InvalidUserMessage)?);
     let source = match goal_round {
         Some((goal_id, revision, round)) => MessageSource::from_value(serde_json::json!({
             "kind": "goal",
@@ -85,7 +102,7 @@ fn prepare_turn(
         || format!("user-{turn}"),
         |(_, _, round)| format!("goal-{turn}-{round}"),
     );
-    let message = Message::user(message_id, vec![content], source)
+    let message = Message::user(message_id, content, source)
         .map_err(|_| IdentityError::InvalidUserMessage)?;
     Ok(PreparedUserTurn {
         start_seq,
@@ -103,7 +120,10 @@ mod tests {
         session::{EventKind, NewEvent, Session, TurnEndReason, TurnId},
     };
 
-    use super::{IdentityError, new_session_id, prepare_goal_turn, prepare_user_turn};
+    use super::{
+        IdentityError, new_session_id, prepare_goal_turn, prepare_user_turn,
+        prepare_user_turn_with_images,
+    };
 
     fn zeroes(bytes: &mut [u8]) -> Result<(), EntropyError> {
         bytes.fill(0);
@@ -175,5 +195,36 @@ mod tests {
         assert_eq!(messages[0].source().raw().as_value()["goalId"], "goal-1");
         assert_eq!(messages[0].source().raw().as_value()["revision"], 3);
         assert_eq!(messages[0].source().raw().as_value()["round"], 2);
+    }
+
+    #[test]
+    fn direct_images_precede_the_exact_prompt_in_one_user_message() {
+        let session = Session::new("image-identity").unwrap();
+        let image = crate::model::ImageAttachmentRef::new(
+            format!("sha256:{}", "a".repeat(64)),
+            crate::model::ImageMediaType::Png,
+            1,
+            1,
+            1,
+            Some("pixel.png".to_owned()),
+        )
+        .unwrap();
+        let prepared = prepare_user_turn_with_images(
+            &session,
+            " inspect ",
+            vec![crate::model::ContentBlock::image(image).unwrap()],
+        )
+        .unwrap();
+        let TurnProposal::Enter(messages) = prepared.proposal else {
+            panic!("an image prompt must enter the turn")
+        };
+        assert!(matches!(
+            messages[0].content()[0].kind(),
+            ContentBlockKind::Image { .. }
+        ));
+        assert!(matches!(
+            messages[0].content()[1].kind(),
+            ContentBlockKind::Text { text } if text == " inspect "
+        ));
     }
 }

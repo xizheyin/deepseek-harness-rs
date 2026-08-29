@@ -1019,6 +1019,79 @@ fn real_vision_script_reads_persists_and_sends_a_workspace_image() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
+fn real_script_direct_image_is_durable_before_the_first_vision_request() {
+    const PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4,
+        0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15, 0, 1, 5,
+        1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let workspace = script_workspace("vision-direct-image");
+    std::fs::write(workspace.join("pixel.png"), PNG).unwrap();
+    let (base_url, server) = spawn_response_server(vec![text_sse("Direct image received.")]);
+    let mut command =
+        script_command_with_model(&base_url, &workspace, "deepseek-v4-flash-vision-exp");
+    command
+        .args([
+            "--image",
+            "pixel.png",
+            "--prompt",
+            "describe this attached pixel",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = OwnedScriptChild::new(command.spawn().expect("direct image script should spawn"))
+        .wait_with_output(Duration::from_secs(10));
+    let requests = server.join().unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Direct image received.\n");
+    assert_eq!(requests.len(), 1);
+    let request = request_json(&requests[0]);
+    assert_eq!(request["model"], "deepseek-v4-flash-vision-exp");
+    let wire = serde_json::to_string(&request).unwrap();
+    assert!(wire.contains("data:image/png;base64,"));
+    assert!(wire.contains("describe this attached pixel"));
+
+    let root = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join(".dsh-test-sessions");
+    let journal = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .unwrap();
+    let rows = std::fs::read_to_string(journal)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let user = rows
+        .iter()
+        .find(|row| row["type"] == "user/message")
+        .unwrap();
+    assert_eq!(user["data"]["content"][0]["type"], "image");
+    assert_eq!(user["data"]["content"][1]["type"], "text");
+    assert_eq!(
+        user["data"]["content"][1]["text"],
+        "describe this attached pixel"
+    );
+    assert!(
+        user["data"]["content"][0]["attachment"]["attachmentId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("sha256:"))
+    );
+    assert_eq!(
+        std::fs::read_dir(root.join("attachments-v1/objects"))
+            .unwrap()
+            .count(),
+        1
+    );
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
 fn a_real_script_session_resumes_from_its_stored_workspace_and_model() {
     let workspace = script_workspace("resume-real-script-session");
     let caller_workspace = script_workspace("resume-caller-workspace");

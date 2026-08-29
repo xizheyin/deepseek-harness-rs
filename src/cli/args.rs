@@ -2,15 +2,18 @@ use std::ffi::OsString;
 
 use thiserror::Error;
 
-use crate::{session::SessionId, time_context::MAX_TIME_ZONE_BYTES};
+use crate::{
+    attachment::MAX_REQUEST_IMAGES, session::SessionId, time_context::MAX_TIME_ZONE_BYTES,
+};
 
-pub(super) const MAX_ARGV_ENTRIES: usize = 18;
+pub(super) const MAX_ARGV_ENTRIES: usize = 26;
 pub(super) const MAX_ARGV_AGGREGATE_BYTES: usize = 1024 * 1024 + 8 * 1024;
 pub(super) const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_WORKSPACE_BYTES: usize = 4_096;
 pub(super) const MAX_PLUGIN_CONFIG_BYTES: usize = 4_096;
 pub(super) const MAX_LSP_CONFIG_BYTES: usize = 4_096;
 pub(super) const MAX_MODEL_BYTES: usize = 256;
+pub(super) const MAX_IMAGE_PATH_BYTES: usize = 4_096;
 pub(super) const MAX_SESSION_ID_BYTES: usize = 44;
 pub(super) const MAX_APPROVAL_MODE_BYTES: usize = 9;
 pub(super) const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -53,6 +56,7 @@ pub(super) struct ListSessionsOptions {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct CliOptions {
     pub(super) prompt: Option<String>,
+    pub(super) image_paths: Vec<String>,
     pub(super) model: Option<String>,
     pub(super) workspace: Option<String>,
     pub(super) plugin_config: Option<String>,
@@ -94,6 +98,8 @@ pub(super) enum ParseError {
     EmptyValue { option: &'static str },
     #[error("option {option} exceeds its size limit")]
     ValueTooLarge { option: &'static str },
+    #[error("--image may be supplied at most four times")]
+    TooManyImages,
     #[error("--resume requires one canonical lower-case session UUID v4")]
     InvalidSessionId,
     #[error("bare --resume is available only in interactive terminal mode")]
@@ -179,6 +185,19 @@ pub(super) fn parse_args_os(
                     index += 1;
                 }
             }
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--image=") {
+            push_image(&mut options.image_paths, value)?;
+            index += 1;
+            continue;
+        }
+        if argument == "--image" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or(ParseError::MissingValue { option: "--image" })?;
+            push_image(&mut options.image_paths, value)?;
+            index += 2;
             continue;
         }
 
@@ -270,6 +289,7 @@ pub(super) fn parse_args_os(
             || tui_seen
             || approval_mode_seen
             || reduced_motion_seen
+            || !options.image_paths.is_empty()
         {
             return Err(ParseError::InvalidListSessionsOptions);
         }
@@ -307,6 +327,20 @@ fn mark_once(seen: &mut bool, option: &'static str) -> Result<(), ParseError> {
         return Err(ParseError::DuplicateOption { option });
     }
     *seen = true;
+    Ok(())
+}
+
+fn push_image(images: &mut Vec<String>, value: &str) -> Result<(), ParseError> {
+    if value.is_empty() {
+        return Err(ParseError::EmptyValue { option: "--image" });
+    }
+    if value.len() > MAX_IMAGE_PATH_BYTES || value.chars().any(char::is_control) {
+        return Err(ParseError::ValueTooLarge { option: "--image" });
+    }
+    if images.len() == MAX_REQUEST_IMAGES {
+        return Err(ParseError::TooManyImages);
+    }
+    images.push(value.to_owned());
     Ok(())
 }
 
@@ -395,10 +429,10 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     use super::{
-        ApprovalMode, MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_LSP_CONFIG_BYTES,
-        MAX_MODEL_BYTES, MAX_PLUGIN_CONFIG_BYTES, MAX_PROMPT_BYTES, MAX_SESSION_ID_BYTES,
-        MAX_TIME_ZONE_BYTES, MAX_WORKSPACE_BYTES, ParseAction, ParseError, ResumeTarget, TuiMode,
-        admit_args_os, parse_args_os,
+        ApprovalMode, MAX_ARGV_AGGREGATE_BYTES, MAX_ARGV_ENTRIES, MAX_IMAGE_PATH_BYTES,
+        MAX_LSP_CONFIG_BYTES, MAX_MODEL_BYTES, MAX_PLUGIN_CONFIG_BYTES, MAX_PROMPT_BYTES,
+        MAX_SESSION_ID_BYTES, MAX_TIME_ZONE_BYTES, MAX_WORKSPACE_BYTES, ParseAction, ParseError,
+        ResumeTarget, TuiMode, admit_args_os, parse_args_os,
     };
 
     fn os(values: &[&str]) -> Vec<OsString> {
@@ -433,6 +467,9 @@ mod tests {
         let separate = parse_args_os(os(&[
             "--prompt",
             "hello",
+            "--image",
+            "first.png",
+            "--image=second.jpg",
             "--model",
             "model-a",
             "--workspace",
@@ -453,6 +490,9 @@ mod tests {
         .unwrap();
         let equals = parse_args_os(os(&[
             "--prompt=hello",
+            "--image=first.png",
+            "--image",
+            "second.jpg",
             "--model=model-a",
             "--workspace=/tmp/work",
             "--plugin-config=/tmp/plugins.json",
@@ -469,6 +509,7 @@ mod tests {
             panic!("expected run options");
         };
         assert_eq!(options.prompt.as_deref(), Some("hello"));
+        assert_eq!(options.image_paths, ["first.png", "second.jpg"]);
         assert_eq!(options.model.as_deref(), Some("model-a"));
         assert_eq!(options.workspace.as_deref(), Some("/tmp/work"));
         assert_eq!(options.plugin_config.as_deref(), Some("/tmp/plugins.json"));
@@ -536,6 +577,7 @@ mod tests {
             "--time-zone",
             "--tui",
             "--approval-mode",
+            "--image",
             "-p",
             "-m",
             "-w",
@@ -584,6 +626,7 @@ mod tests {
             &["--resume="][..],
             &["--tui="][..],
             &["--approval-mode="][..],
+            &["--image="][..],
         ] {
             assert!(matches!(
                 parse_args_os(os(values)),
@@ -608,6 +651,11 @@ mod tests {
                 Err(ParseError::ValueTooLarge { .. })
             ));
         }
+        assert!(parse_args_os(os(&["--image", &"x".repeat(MAX_IMAGE_PATH_BYTES)])).is_ok());
+        assert!(matches!(
+            parse_args_os(os(&["--image", &"x".repeat(MAX_IMAGE_PATH_BYTES + 1)])),
+            Err(ParseError::ValueTooLarge { option: "--image" })
+        ));
         let exact_multibyte = "界".repeat(MAX_MODEL_BYTES / "界".len());
         assert!(parse_args_os(os(&["--model", &exact_multibyte])).is_ok());
         let over_multibyte = format!("{exact_multibyte}界");
@@ -618,6 +666,34 @@ mod tests {
         assert!(matches!(
             parse_args_os(os(&["--resume", &"x".repeat(MAX_SESSION_ID_BYTES + 1)])),
             Err(ParseError::ValueTooLarge { option: "--resume" })
+        ));
+    }
+
+    #[test]
+    fn image_is_repeatable_but_bounded_and_not_a_list_sessions_option() {
+        let action = parse_args_os(os(&[
+            "--image",
+            "a.png",
+            "--image=b.jpg",
+            "--image",
+            "c.webp",
+            "--image=d.gif",
+        ]))
+        .unwrap();
+        let ParseAction::Run(options) = action else {
+            panic!("expected run options");
+        };
+        assert_eq!(options.image_paths, ["a.png", "b.jpg", "c.webp", "d.gif"]);
+        assert!(matches!(
+            parse_args_os(os(&[
+                "--image", "a.png", "--image", "b.png", "--image", "c.png", "--image", "d.png",
+                "--image", "e.png",
+            ])),
+            Err(ParseError::TooManyImages)
+        ));
+        assert!(matches!(
+            parse_args_os(os(&["--list-sessions", "--image", "a.png"])),
+            Err(ParseError::InvalidListSessionsOptions)
         ));
     }
 

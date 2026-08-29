@@ -30,6 +30,7 @@ mod workspace;
 #[cfg(unix)]
 mod write_edit;
 
+pub(crate) use error::ToolCallError;
 pub use error::ToolRegistryBuildError;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use lsp::{LSP_PROMPT_TEXT, LspConfig, LspConfigError};
@@ -53,7 +54,7 @@ pub(crate) use web_search::{
     WebSearchResult, normalize_source,
 };
 #[cfg(unix)]
-pub(crate) use workspace::{WorkspaceFileCatalogue, WorkspaceFileCatalogueError};
+pub(crate) use workspace::{Workspace, WorkspaceFileCatalogue, WorkspaceFileCatalogueError};
 
 const MAX_TOOL_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_READ_CHUNK_BYTES: usize = 64 * 1024;

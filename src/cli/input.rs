@@ -43,6 +43,35 @@ pub(super) enum PermissionCommand {
     Usage,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ImageCommand {
+    Show,
+    Add(String),
+    Clear,
+    Usage,
+}
+
+pub(super) fn parse_image_command(command: &str) -> Option<ImageCommand> {
+    if command == "/image" {
+        return Some(ImageCommand::Show);
+    }
+    let suffix = command.strip_prefix("/image")?;
+    if !suffix.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let path = suffix.trim_matches(|character: char| character.is_ascii_whitespace());
+    if path.is_empty() {
+        return Some(ImageCommand::Show);
+    }
+    if path == "clear" {
+        return Some(ImageCommand::Clear);
+    }
+    if path.len() > super::args::MAX_IMAGE_PATH_BYTES || path.chars().any(char::is_control) {
+        return Some(ImageCommand::Usage);
+    }
+    Some(ImageCommand::Add(path.to_owned()))
+}
+
 pub(super) fn parse_permission_command(command: &str) -> Option<PermissionCommand> {
     if command == "/permission" {
         return Some(PermissionCommand::Show);
@@ -235,6 +264,7 @@ pub(super) enum IdleInput {
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
     Model(ModelCommand),
+    Image(ImageCommand),
     Permission(PermissionCommand),
     Rename(RenameCommand),
     RefreshTitle,
@@ -264,6 +294,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     }
     if let Some(model) = parse_model_command(command) {
         return IdleInput::Model(model);
+    }
+    if let Some(image) = parse_image_command(command) {
+        return IdleInput::Image(image);
     }
     if let Some(permission) = parse_permission_command(command) {
         return IdleInput::Permission(permission);
@@ -308,8 +341,8 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalRecordParser, ForkCommand, IdleInput, InputRecordEvent, ModelCommand, ModelEffort,
-        PermissionCommand, RenameCommand, classify_idle_record,
+        CanonicalRecordParser, ForkCommand, IdleInput, ImageCommand, InputRecordEvent,
+        ModelCommand, ModelEffort, PermissionCommand, RenameCommand, classify_idle_record,
     };
     use crate::session::PermissionPreset;
     use crate::tui::{
@@ -469,6 +502,22 @@ mod tests {
                 model: "deepseek-v4-pro".to_owned(),
                 effort: None,
             })
+        );
+        assert_eq!(
+            classify_idle_record(" /image assets/my pixel.png ", true),
+            IdleInput::Image(ImageCommand::Add("assets/my pixel.png".to_owned()))
+        );
+        assert_eq!(
+            classify_idle_record(" /image clear ", true),
+            IdleInput::Image(ImageCommand::Clear)
+        );
+        assert_eq!(
+            classify_idle_record(" /image ", true),
+            IdleInput::Image(ImageCommand::Show)
+        );
+        assert_eq!(
+            classify_idle_record(" /images are ordinary text ", true),
+            IdleInput::Submit(" /images are ordinary text ".to_owned())
         );
         for invalid in [
             "/model model medium",
