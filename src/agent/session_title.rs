@@ -24,6 +24,8 @@ use crate::{
     },
 };
 
+use super::AgentLoopError;
+
 const TITLE_PROVIDER: &str = "session-title-first-prompt-llm";
 const TITLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TITLE_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -229,6 +231,38 @@ impl SessionTitleRuntime {
         self.collect(session, true).await;
     }
 
+    pub(super) async fn rename(
+        &mut self,
+        session: &mut Session,
+        title: String,
+    ) -> Result<String, AgentLoopError> {
+        self.supersede().await;
+        let event = SessionTitleEvent::new(title.clone(), Vec::new(), SessionTitleSource::User)?;
+        session
+            .append_settled(NewEvent::log(EventKind::session_title(event)))
+            .await?;
+        Ok(title)
+    }
+
+    async fn supersede(&mut self) {
+        let state = std::mem::replace(&mut self.state, TitleState::Done);
+        let TitleState::Running {
+            cancellation,
+            mut task,
+        } = state
+        else {
+            return;
+        };
+        cancellation.cancel();
+        if tokio::time::timeout(TITLE_SHUTDOWN_GRACE, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     async fn collect(&mut self, session: &mut Session, shutdown: bool) {
         let state = std::mem::replace(&mut self.state, TitleState::Done);
         let TitleState::Running {
@@ -375,7 +409,10 @@ fn truncate_utf8(mut value: String, maximum: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use futures_util::stream;
 
@@ -396,6 +433,8 @@ mod tests {
     #[derive(Default)]
     struct TitleProvider {
         purposes: Mutex<Vec<RequestPurpose>>,
+        defer_title: bool,
+        title_cancelled: Arc<AtomicBool>,
     }
 
     impl ModelProvider for TitleProvider {
@@ -433,9 +472,20 @@ mod tests {
         fn stream(
             &self,
             request: ProviderRequest,
-            _cancellation: CancellationToken,
+            cancellation: CancellationToken,
         ) -> ProviderStream {
             self.purposes.lock().unwrap().push(request.purpose());
+            if request.purpose() == RequestPurpose::SessionTitle && self.defer_title {
+                let title_cancelled = self.title_cancelled.clone();
+                return Box::pin(stream::once(async move {
+                    cancellation.cancelled().await;
+                    title_cancelled.store(true, Ordering::SeqCst);
+                    Ok(
+                        StreamChunk::finish(crate::model::FinishReason::stop().unwrap(), None)
+                            .unwrap(),
+                    )
+                }));
+            }
             let text = if request.purpose() == RequestPurpose::SessionTitle {
                 "修复解析器取消问题"
             } else {
@@ -516,6 +566,100 @@ mod tests {
             purposes
                 .iter()
                 .filter(|purpose| **purpose == RequestPurpose::Conversation)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_rename_normalizes_supersedes_and_pins_the_user_title() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/tools/upstream_phase48_manual_session_title.json"
+        ))
+        .unwrap();
+        let provider = Arc::new(TitleProvider {
+            defer_title: true,
+            ..TitleProvider::default()
+        });
+        let session = Session::new("session-title-rename-test").unwrap();
+        let config = AgentLoopConfig::new(LlmCallConfig::new("deepseek", "test-model").unwrap());
+        let mut agent =
+            AgentLoop::new(session, provider.clone(), Arc::new(NoTools), config).unwrap();
+
+        let first = Message::user(
+            "human-1",
+            vec![ContentBlock::text("Prompt that triggers generation").unwrap()],
+            MessageSource::user().unwrap(),
+        )
+        .unwrap();
+        agent
+            .run_turn(TurnProposal::Enter(vec![first]), CancellationToken::new())
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            if provider
+                .purposes
+                .lock()
+                .unwrap()
+                .contains(&RequestPurpose::SessionTitle)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            agent
+                .rename_session_title("  Hand\tpicked   name  ")
+                .await
+                .unwrap(),
+            Some("Hand picked name".to_owned())
+        );
+        assert!(provider.title_cancelled.load(Ordering::SeqCst));
+        assert_eq!(
+            agent
+                .session()
+                .state()
+                .session_title()
+                .map(|title| title.title()),
+            Some("Hand picked name")
+        );
+
+        let second = Message::user(
+            "human-2",
+            vec![ContentBlock::text("A later eligible prompt").unwrap()],
+            MessageSource::user().unwrap(),
+        )
+        .unwrap();
+        agent
+            .run_turn(TurnProposal::Enter(vec![second]), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.rename_session_title(" \u{1b}[31m ").await.unwrap(),
+            None
+        );
+        let session = agent.shutdown_into_session().await.unwrap();
+
+        let titles = session
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind() {
+                EventKind::SessionTitle { title } => Some(title),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let latest = titles.last().unwrap();
+        assert_eq!(latest.title(), fixture["accepted"]["title"]);
+        assert!(latest.message_seqs().is_empty());
+        assert!(matches!(latest.source(), SessionTitleSource::User));
+        assert_eq!(
+            provider
+                .purposes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|purpose| **purpose == RequestPurpose::SessionTitle)
                 .count(),
             1
         );

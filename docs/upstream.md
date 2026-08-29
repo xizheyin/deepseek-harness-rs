@@ -2482,3 +2482,28 @@ are unchanged. Rust Phase 47 copies title metadata from the same strict journal
 candidate already used for each event or lineage fact, so it adds no scan or
 authority. As in Phase 46, unavailable and absent titles both render
 `untitled` rather than carrying an official sanitized per-item error code.
+
+## Phase 48 manual Session title rename — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. Before design and implementation,
+the focused fixed-commit paths inspected were:
+
+- `packages/session/session-title/src/index.ts`, especially
+  `SessionTitleService.rename` and its automatic-work supersession path;
+- `packages/session/session-title/tests/rename.spec.ts` for normalized
+  user-source acceptance, visible-character rejection, pinned later prompts,
+  explicit refresh as the unpin, and late-provider suppression.
+
+Official rename verifies an exact live Session, normalizes to the configured
+maximum, rejects an empty visible result, supersedes scheduled or running
+automatic generation, and appends `session/title` with empty `messageSeqs` and
+`source.kind=user`. A later eligible prompt schedules no automatic revision
+while that source remains latest. Explicit refresh deliberately removes the
+pin and is outside Rust Phase 48.
+
+Fresh `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`; the same rename tests and behavior
+remain present. Rust maps the service method to idle `/rename <TITLE>` on the
+current Agent. Its single Session writer cancels and joins the owned auxiliary
+title task before appending the same bounded user event.

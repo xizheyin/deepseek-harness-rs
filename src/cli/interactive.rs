@@ -53,7 +53,7 @@ use super::{
     identity::{prepare_goal_turn, prepare_injected_turn, prepare_user_turn},
     input::{
         CanonicalRecordParser, IdleInput, InputRecordEvent, MAX_APPROVAL_RECORD_BYTES,
-        MAX_INTERACTIVE_PROMPT_BYTES, classify_idle_record,
+        MAX_INTERACTIVE_PROMPT_BYTES, RenameCommand, classify_idle_record, parse_rename_command,
     },
     live::{
         EnhancedPresenter, InteractivePresenter, LiveFrame, LiveLifecycle, LiveRenderer,
@@ -584,6 +584,7 @@ async fn run_enhanced(
                                 | EnhancedSubmission::Motion(_)
                                 | EnhancedSubmission::Goal(_)
                                 | EnhancedSubmission::Plan(_)
+                                | EnhancedSubmission::Rename(_)
                                 | EnhancedSubmission::CompactUsage
                         );
                     let (mut draft, mut cursor) = if job_wake {
@@ -645,7 +646,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/compact | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/compact | /rename TITLE | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -692,6 +693,14 @@ async fn run_enhanced(
                                     pending_signal = signal;
                                 }
                             }
+                            CommandId::Rename => {
+                                apply_rename_command(
+                                    &mut agent,
+                                    RenameCommand::Show,
+                                    &mut notice,
+                                )
+                                .await;
+                            }
                             CommandId::Exit | CommandId::Quit => {
                                 break Ok(InteractiveExit::Ordinary(0));
                             }
@@ -706,6 +715,9 @@ async fn run_enhanced(
                             apply_goal_command(&mut agent, &goal, command, &mut notice).await;
                         }
                         EnhancedSubmission::Plan(_) => return Err(InteractiveError::Agent),
+                        EnhancedSubmission::Rename(command) => {
+                            apply_rename_command(&mut agent, command, &mut notice).await;
+                        }
                         EnhancedSubmission::CompactUsage => {
                             notice = Some("Usage: /compact (no arguments)".to_owned());
                         }
@@ -1193,6 +1205,7 @@ enum EnhancedSubmission {
     Motion(MotionCommand),
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
+    Rename(RenameCommand),
     CompactUsage,
     Prompt,
 }
@@ -1203,6 +1216,8 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         EnhancedSubmission::Empty
     } else if let Some(command) = CommandId::from_exact(command) {
         EnhancedSubmission::Command(command)
+    } else if let Some(rename) = parse_rename_command(command) {
+        EnhancedSubmission::Rename(rename)
     } else if let Some(goal) = GoalCommand::parse(command) {
         EnhancedSubmission::Goal(goal)
     } else if let Some(plan) = PlanModeCommand::parse(command) {
@@ -1324,6 +1339,28 @@ async fn apply_goal_command(
         }
         .unwrap_or_else(|error| format!("Goal error · {error}")),
     );
+}
+
+async fn apply_rename_command(
+    agent: &mut AgentLoop,
+    command: RenameCommand,
+    notice: &mut Option<String>,
+) {
+    *notice = Some(match command {
+        RenameCommand::Show => {
+            let current = agent
+                .session()
+                .state()
+                .session_title()
+                .map_or_else(|| "untitled".to_owned(), |title| title.title().to_owned());
+            format!("Session title · {current} | Usage: /rename <TITLE>")
+        }
+        RenameCommand::Set(raw_title) => match agent.rename_session_title(&raw_title).await {
+            Ok(Some(title)) => format!("Session renamed · {title}"),
+            Ok(None) => "Rename error · title must contain visible characters".to_owned(),
+            Err(_) => "Rename error · the title change could not be recorded".to_owned(),
+        },
+    });
 }
 
 async fn pause_goal_after_round_failure(
@@ -1795,7 +1832,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/compact · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
+                "/compact · /rename TITLE · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -2846,6 +2883,24 @@ async fn run_linear(
                         let message = format!(
                             "[{}]\n",
                             notice.as_deref().unwrap_or("Plan Mode state unavailable")
+                        );
+                        if let Some(signal) =
+                            write_dynamic_notice(message, &mut presenter, &terminal, signals)
+                                .await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::Rename(command) => {
+                        let mut notice = None;
+                        apply_rename_command(&mut agent, command, &mut notice).await;
+                        let message = format!(
+                            "[{}]\n",
+                            notice.as_deref().unwrap_or("Session title unavailable")
                         );
                         if let Some(signal) =
                             write_dynamic_notice(message, &mut presenter, &terminal, signals)
@@ -5950,7 +6005,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -5987,6 +6042,13 @@ fn handle_active_input(
                                     .to_owned(),
                             );
                         }
+                        CommandId::Rename => {
+                            let _ = input.take_draft_for_turn()?;
+                            *notice = Some(
+                                "Rename busy · wait for the current turn or press Ctrl+C"
+                                    .to_owned(),
+                            );
+                        }
                     }
                     return Ok(ActiveInputOutcome::Redraw);
                 }
@@ -6011,6 +6073,12 @@ fn handle_active_input(
                         "Plan Mode error · wait for the current turn or press Ctrl+C before changing mode"
                             .to_owned(),
                     );
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::Rename(_) => {
+                    let _ = input.take_draft_for_turn()?;
+                    *notice =
+                        Some("Rename busy · wait for the current turn or press Ctrl+C".to_owned());
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::CompactUsage => {
@@ -7306,7 +7374,7 @@ mod tests {
         cli::{
             approval::{ApprovalChallengePool, ApprovalEnvelope},
             approval_join::ApprovalJoin,
-            input::CanonicalRecordParser,
+            input::{CanonicalRecordParser, RenameCommand},
             signal::{SignalLatch, UiSignal},
             terminal::{AsyncTerminal, TerminalSize},
         },
@@ -8469,6 +8537,22 @@ mod tests {
         assert_eq!(
             notice.as_deref(),
             Some("Unknown motion mode | Motion modes · full · reduced")
+        );
+    }
+
+    #[test]
+    fn rename_commands_are_local_closed_and_keep_the_raw_title_suffix() {
+        assert_eq!(
+            classify_enhanced_submission(" /rename "),
+            EnhancedSubmission::Command(CommandId::Rename)
+        );
+        assert_eq!(
+            classify_enhanced_submission(" /rename  Hand\tpicked   name "),
+            EnhancedSubmission::Rename(RenameCommand::Set("  Hand\tpicked   name".to_owned()))
+        );
+        assert_eq!(
+            classify_enhanced_submission("/renamed remains a prompt"),
+            EnhancedSubmission::Prompt
         );
     }
 

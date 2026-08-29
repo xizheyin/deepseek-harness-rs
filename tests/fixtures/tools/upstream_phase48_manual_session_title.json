@@ -1,0 +1,19 @@
+{
+  "upstreamCommit": "47f943859bef60e4160492346772ded9b24f765a",
+  "sources": [
+    "packages/session/session-title/src/index.ts",
+    "packages/session/session-title/tests/rename.spec.ts"
+  ],
+  "accepted": {
+    "input": "  Hand\tpicked   name  ",
+    "title": "Hand picked name",
+    "messageSeqs": [],
+    "source": {
+      "kind": "user"
+    }
+  },
+  "emptyAfterNormalization": "reject-without-append",
+  "inFlightAutomaticGeneration": "cancel-and-never-overwrite-user-title",
+  "laterEligiblePrompts": "do-not-schedule-automatic-generation",
+  "explicitRefreshUnpins": true
+}

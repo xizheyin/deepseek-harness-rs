@@ -42,10 +42,10 @@ use crate::{
         AppendError, AppendReceipt, ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome,
         ApprovalRequestId, AttemptDisposition, AttemptResidentGuard, AttemptToken, BarrierError,
         ClaimedAppend, EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent,
-        LlmRetryStartedEvent, NewEvent, PreparedAttempt, RequestContext, RequestHeaderReason,
-        RetryId, RetryNumber, Session, SessionReadError, SessionReservation, StepId, SurfaceIntent,
-        TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause, TurnEndCancelCause,
-        TurnEndReason, TurnId,
+        LlmRetryStartedEvent, NewEvent, PROVIDER_TITLE_MAX_BYTES, PreparedAttempt, RequestContext,
+        RequestHeaderReason, RetryId, RetryNumber, Session, SessionReadError, SessionReservation,
+        StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause,
+        TurnEndCancelCause, TurnEndReason, TurnId, normalize_title,
     },
     skills::{SkillRuntime, SkillRuntimeError},
     time_context::TimeContextRuntime,
@@ -1010,6 +1010,27 @@ impl AgentLoop {
         mutation
             .commit()
             .map_err(|_| AgentLoopError::Invariant("committed Plan Mode state was not installable"))
+    }
+
+    /// Replace the current Session title with one explicit user-owned fact.
+    pub(crate) async fn rename_session_title(
+        &mut self,
+        raw_title: &str,
+    ) -> Result<Option<String>, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        let Some(title) = normalize_title(raw_title, PROVIDER_TITLE_MAX_BYTES) else {
+            return Ok(None);
+        };
+        self.session.materialize_if_needed().await?;
+        self.session_titles
+            .rename(&mut self.session, title)
+            .await
+            .map(Some)
     }
 
     /// Run one standalone `/compact` transaction without opening an Agent turn.

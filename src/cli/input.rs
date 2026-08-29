@@ -8,6 +8,25 @@ pub(super) const MAX_INTERACTIVE_PROMPT_BYTES: usize = 1_000;
 pub(super) const MAX_APPROVAL_RECORD_BYTES: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RenameCommand {
+    Show,
+    Set(String),
+}
+
+pub(super) fn parse_rename_command(command: &str) -> Option<RenameCommand> {
+    if command == "/rename" {
+        return Some(RenameCommand::Show);
+    }
+    command.strip_prefix("/rename").and_then(|suffix| {
+        suffix
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+            .then(|| RenameCommand::Set(suffix.to_owned()))
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum InputRecordEvent {
     Record {
         text: String,
@@ -101,6 +120,7 @@ pub(super) enum IdleInput {
     Motion(MotionCommand),
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
+    Rename(RenameCommand),
     Compact,
     CompactUsage,
     Exit,
@@ -121,6 +141,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     if let Some(plan) = PlanModeCommand::parse(command) {
         return IdleInput::Plan(plan);
     }
+    if let Some(rename) = parse_rename_command(command) {
+        return IdleInput::Rename(rename);
+    }
     if command
         .strip_prefix("/compact")
         .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
@@ -140,7 +163,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalRecordParser, IdleInput, InputRecordEvent, classify_idle_record};
+    use super::{
+        CanonicalRecordParser, IdleInput, InputRecordEvent, RenameCommand, classify_idle_record,
+    };
     use crate::tui::{
         motion::{MotionCommand, MotionPreference},
         theme::{ThemeCommand, ThemePalette},
@@ -276,6 +301,18 @@ mod tests {
         assert_eq!(classify_idle_record(" /inspect ", true), IdleInput::Inspect);
         assert_eq!(classify_idle_record(" /review ", true), IdleInput::Review);
         assert_eq!(classify_idle_record(" /compact ", true), IdleInput::Compact);
+        assert_eq!(
+            classify_idle_record(" /rename ", true),
+            IdleInput::Rename(RenameCommand::Show)
+        );
+        assert_eq!(
+            classify_idle_record(" /rename  Hand\tpicked   name ", true),
+            IdleInput::Rename(RenameCommand::Set("  Hand\tpicked   name".to_owned()))
+        );
+        assert_eq!(
+            classify_idle_record(" /renamed is a prompt ", true),
+            IdleInput::Submit(" /renamed is a prompt ".to_owned())
+        );
         assert_eq!(
             classify_idle_record("/compact now", true),
             IdleInput::CompactUsage

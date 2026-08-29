@@ -1241,8 +1241,8 @@ mod tests {
                 24,
                 80,
                 vec![
-                    "/inspect", "/review", "/focus", "/theme", "/motion", "/exit", "/quit",
-                    "/goal", "/compact",
+                    "/review", "/focus", "/theme", "/motion", "/exit", "/quit", "/goal",
+                    "/compact", "/rename",
                 ],
             ),
             (

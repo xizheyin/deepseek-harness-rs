@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–47 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–48 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -55,6 +55,7 @@ for behavior that users can run today.
 | 45 | Durable first-prompt Session titles | `complete` | [`validation/phase-45.md`](validation/phase-45.md) |
 | 46 | Title-enriched prior-Session search | `complete` | [`validation/phase-46.md`](validation/phase-46.md) |
 | 47 | Title-enriched historical event and lineage tools | `complete` | [`validation/phase-47.md`](validation/phase-47.md) |
+| 48 | Durable manual Session title rename | `complete` | [`validation/phase-48.md`](validation/phase-48.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -90,6 +91,21 @@ Phase 47 applies the same already-authorized title metadata to
 rows; event payloads, filters, ranking, ancestry, surface classification and
 workspace authorization remain unchanged. Missing title metadata renders as
 `untitled` and never removes the underlying result.
+
+## Phase 48 boundary (2026-08-29)
+
+Phase 48 adds idle terminal `/rename <TITLE>` for the current Session. A valid
+title is normalized to the existing 80-byte terminal-safe bound, appended as a
+user-sourced `session/title` fact, and becomes the durable latest title used by
+resume and historical tools. Renaming supersedes any in-flight automatic title
+request, and later prompts cannot overwrite the user title.
+
+The command changes no conversation messages, starts no model/tool request and
+requires no approval. It is accepted only while the Agent is idle. `/rename`
+without a title reports the current title and usage; a title containing no
+visible characters is rejected without changing the existing title. Official
+explicit title refresh/unpin, rename APIs outside this CLI, and cross-process
+live-session mutation remain future work.
 
 ## Phase 8 revised boundary (2026-08-18)
 
@@ -181,7 +197,7 @@ tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
 The current green checkpoints implement bounded assistant-message markup,
 source-preserving 2–8-column pipe tables, six closed process-local semantic
-themes with transactional redraw, a closed ten-command completion palette, a
+themes with transactional redraw, a closed eleven-command completion palette, a
 generator-provenanced semantic card for the real single-file `apply_patch`
 approval preview, bounded workspace-file suggestions, and bounded primary-screen Inspect/Review panels. Inspect
 shows only current-turn committed metadata and retained reasoning; Review keeps

@@ -428,7 +428,6 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
 
     dsh.write(b"/");
     dsh.expect(b"> /quit");
-    dsh.expect(b"/inspect");
     dsh.expect(b"/review");
     dsh.expect(b"/focus");
     dsh.expect(b"/theme");
@@ -437,6 +436,7 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
     dsh.expect(b"/quit");
     dsh.expect(b"/goal");
     dsh.expect(b"/compact");
+    dsh.expect(b"/rename");
     dsh.expect("Enter complete · Esc close".as_bytes());
     dsh.write(b"\x1b[A");
     dsh.expect(b"> /exit");
@@ -3194,6 +3194,63 @@ fn manual_compact_runs_one_idle_request_and_persists_a_null_turn_transaction() {
         rows[start]["data"]["sourceCommandId"],
         rows[start + 3]["data"]["sourceCommandId"]
     );
+}
+
+#[test]
+fn manual_rename_is_local_durable_and_reports_the_normalized_title() {
+    let server = SequenceSseServer::start(Vec::new());
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"/rename   Hand   picked name  \r");
+    dsh.expect(b"Session renamed");
+    dsh.expect(b"Hand picked name");
+    dsh.write(b"/rename\r");
+    dsh.expect(b"Session title");
+    dsh.expect(b"Usage: /rename <TITLE>");
+    let (status, _) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert!(server.finish().is_empty());
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let latest_title = std::fs::read_to_string(entry.path())
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row["type"] == "session/title")
+        .next_back()
+        .unwrap();
+    assert_eq!(latest_title["data"]["title"], "Hand picked name");
+    assert_eq!(latest_title["data"]["messageSeqs"], serde_json::json!([]));
+    assert_eq!(latest_title["data"]["source"]["kind"], "user");
+}
+
+#[test]
+fn manual_rename_works_in_the_linear_fallback_without_a_model_request() {
+    let server = SequenceSseServer::start(Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"/rename Linear session name\r");
+    dsh.expect(b"[Session renamed");
+    dsh.expect(b"Linear session name");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let (status, transcript) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert!(server.finish().is_empty());
+    assert!(!transcript.contains(&0x1b));
 }
 
 #[test]

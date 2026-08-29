@@ -4,7 +4,7 @@ use std::fmt;
 
 use super::composer::Composer;
 
-pub(crate) const COMMAND_COUNT: usize = 10;
+pub(crate) const COMMAND_COUNT: usize = 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandId {
@@ -16,6 +16,7 @@ pub(crate) enum CommandId {
     Motion,
     Goal,
     Compact,
+    Rename,
     Exit,
     Quit,
 }
@@ -32,6 +33,7 @@ impl CommandId {
         Self::Quit,
         Self::Goal,
         Self::Compact,
+        Self::Rename,
     ];
 
     pub(crate) const fn command(self) -> &'static str {
@@ -44,6 +46,7 @@ impl CommandId {
             Self::Motion => "/motion",
             Self::Goal => "/goal",
             Self::Compact => "/compact",
+            Self::Rename => "/rename",
             Self::Exit => "/exit",
             Self::Quit => "/quit",
         }
@@ -59,6 +62,7 @@ impl CommandId {
             Self::Motion => "show or select motion",
             Self::Goal => "show or manage Goal",
             Self::Compact => "summarize older history",
+            Self::Rename => "rename the current session",
             Self::Exit => "clean up and exit",
             Self::Quit => "clean up and exit",
         }
@@ -288,7 +292,7 @@ mod tests {
 
     #[test]
     fn catalogue_and_prefixes_are_closed_ordered_and_ascii() {
-        assert_eq!(CommandId::ALL.len(), 10);
+        assert_eq!(CommandId::ALL.len(), 11);
         assert_eq!(CommandId::ALL[0], CommandId::Help);
         for (index, command) in CommandId::ALL.into_iter().enumerate() {
             assert!(command.command().is_ascii());
