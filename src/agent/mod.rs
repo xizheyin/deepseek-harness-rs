@@ -11,11 +11,14 @@ mod phase6_tests;
 mod phase7_tests;
 mod repeat_tool_reminder;
 mod retry;
+#[cfg(test)]
+mod session_export_tests;
 mod session_title;
 mod tool;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::File,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
     time::Duration,
@@ -43,9 +46,10 @@ use crate::{
         ApprovalRequestId, AttemptDisposition, AttemptResidentGuard, AttemptToken, BarrierError,
         ClaimedAppend, EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent,
         LlmRetryStartedEvent, NewEvent, PROVIDER_TITLE_MAX_BYTES, PreparedAttempt, RequestContext,
-        RequestHeaderReason, RetryId, RetryNumber, Session, SessionReadError, SessionReservation,
-        StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause,
-        TurnEndCancelCause, TurnEndReason, TurnId, normalize_title,
+        RequestHeaderReason, RetryId, RetryNumber, Session, SessionRawExportError,
+        SessionReadError, SessionReservation, StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN,
+        ToolFailure, ToolResultPrunePassCause, TurnEndCancelCause, TurnEndReason, TurnId,
+        normalize_title,
     },
     skills::{SkillRuntime, SkillRuntimeError},
     time_context::TimeContextRuntime,
@@ -804,6 +808,14 @@ pub(crate) enum ManualTitleRefreshOutcome {
     Failed,
 }
 
+/// User-facing result of one idle current-Session raw-log export.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualSessionExportOutcome {
+    Exported { bytes: u64 },
+    Cancelled,
+    Failed,
+}
+
 /// Stateful owner of one session and its request-header lifecycle.
 pub struct AgentLoop {
     session: Session,
@@ -1067,6 +1079,33 @@ impl AgentLoop {
         self.session_titles
             .refresh(&mut self.session, &config, seq, text, cancellation)
             .await
+    }
+
+    /// Flush and copy the current durable Session without opening a turn.
+    pub(crate) async fn export_session_log(
+        &mut self,
+        destination: File,
+        cancellation: CancellationToken,
+    ) -> Result<ManualSessionExportOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if cancellation.is_cancelled() {
+            return Ok(ManualSessionExportOutcome::Cancelled);
+        }
+        self.session.materialize_if_needed().await?;
+        self.session_titles.collect_ready(&mut self.session).await;
+        match self.session.export_raw_to(destination, cancellation).await {
+            Ok(bytes) => Ok(ManualSessionExportOutcome::Exported { bytes }),
+            Err(SessionRawExportError::Cancelled) => Ok(ManualSessionExportOutcome::Cancelled),
+            Err(SessionRawExportError::Destination | SessionRawExportError::Unavailable) => {
+                Ok(ManualSessionExportOutcome::Failed)
+            }
+            Err(SessionRawExportError::Barrier(error)) => Err(error.into()),
+        }
     }
 
     /// Run one standalone `/compact` transaction without opening an Agent turn.

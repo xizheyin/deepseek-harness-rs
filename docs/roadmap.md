@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–49 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–50 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -57,6 +57,7 @@ for behavior that users can run today.
 | 47 | Title-enriched historical event and lineage tools | `complete` | [`validation/phase-47.md`](validation/phase-47.md) |
 | 48 | Durable manual Session title rename | `complete` | [`validation/phase-48.md`](validation/phase-48.md) |
 | 49 | Explicit cancellable Session title refresh | `complete` | [`validation/phase-49.md`](validation/phase-49.md) |
+| 50 | Safe current-Session raw log export | `complete` | [`validation/phase-50.md`](validation/phase-50.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -123,6 +124,23 @@ or cancellation preserve the current title. Rust serializes explicit refreshes
 through its one idle Agent instead of exposing the official service's
 overlapping caller API. All-messages title providers, remote/cross-process
 refresh, refresh queues and title projection caching remain out of scope.
+
+## Phase 50 boundary (2026-08-29)
+
+Phase 50 maps the fixed upstream's pathless `/export` onto the local terminal.
+The current idle Session is synchronized, then its exact durable JSONL prefix
+is copied in bounded chunks to a new owner-only file in the already-opened
+workspace. The generated filename contains only a sanitized Session id and a
+bounded collision suffix. Existing files are never overwritten. Success prints
+the filename, workspace-root location and byte count without opening a model
+turn, tool or approval.
+
+`Ctrl+C`, destination failure or source failure never reports success and
+removes the incomplete output when possible. The source journal is not parsed,
+re-encoded or mutated. Rust exports one raw `.jsonl` because this product has
+one current Agent and no image-attachment store; it does not claim the official
+multi-Session ZIP, descendant or media behavior. The copy is an external
+artifact, not a registered resumable Session or a substitute for a backup.
 
 ## Phase 8 revised boundary (2026-08-18)
 
@@ -214,7 +232,7 @@ tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
 The current green checkpoints implement bounded assistant-message markup,
 source-preserving 2–8-column pipe tables, six closed process-local semantic
-themes with transactional redraw, a closed twelve-command completion palette, a
+themes with transactional redraw, a closed thirteen-command completion palette, a
 generator-provenanced semantic card for the real single-file `apply_patch`
 approval preview, bounded workspace-file suggestions, and bounded primary-screen Inspect/Review panels. Inspect
 shows only current-turn committed metadata and retained reasoning; Review keeps

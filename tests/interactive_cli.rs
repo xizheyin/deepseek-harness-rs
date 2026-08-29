@@ -3336,6 +3336,117 @@ fn fallback_title_refresh_replays_the_first_prompt_after_resume() {
 }
 
 #[test]
+fn enhanced_export_copies_exact_raw_log_and_never_overwrites() {
+    let server = SequenceSseServer::start(vec![text_sse("Exported response.")]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"record an exact export fixture\r");
+    dsh.expect(b"Exported response.");
+    dsh.expect(b"Turn complete");
+
+    dsh.write(b"/export output.zip\r");
+    dsh.expect(b"Usage: /export (no arguments)");
+    assert!(exported_logs(&workspace.0).is_empty());
+
+    dsh.write(b"/export\r");
+    dsh.expect(b"Session log exported");
+    let first = exported_logs(&workspace.0);
+    assert_eq!(first.len(), 1);
+    let source = only_session_journal(session_root.path());
+    assert_eq!(
+        std::fs::read(&first[0]).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+    assert_eq!(
+        std::fs::metadata(&first[0]).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    dsh.write(b"/export\r");
+    dsh.expect_occurrences(b"Session log exported", 2);
+    let second = exported_logs(&workspace.0);
+    assert_eq!(second.len(), 2);
+    assert_ne!(second[0], second[1]);
+    assert_eq!(
+        std::fs::read(&second[0]).unwrap(),
+        std::fs::read(&second[1]).unwrap()
+    );
+
+    let (status, _) = dsh.exit_cleanly();
+    assert!(status.success());
+    assert_eq!(server.finish().len(), 1);
+    assert_eq!(
+        std::fs::read(&second[0]).unwrap(),
+        std::fs::read(source).unwrap()
+    );
+}
+
+#[test]
+fn linear_export_of_a_new_session_is_local_exact_and_zero_ansi() {
+    let server = SequenceSseServer::start(Vec::new());
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"/export\r");
+    dsh.expect(b"[Session log exported");
+    dsh.expect(b".jsonl (workspace root)]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    let output = exported_logs(&workspace.0);
+    assert_eq!(output.len(), 1);
+    let source = only_session_journal(session_root.path());
+    assert_eq!(
+        std::fs::read(&output[0]).unwrap(),
+        std::fs::read(&source).unwrap()
+    );
+
+    let (status, transcript) = dsh.exit_cleanly();
+    assert!(status.success());
+    assert!(server.finish().is_empty());
+    assert!(!transcript.contains(&0x1b));
+    assert_eq!(
+        std::fs::read(&output[0]).unwrap(),
+        std::fs::read(source).unwrap()
+    );
+}
+
+fn exported_logs(workspace: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths = std::fs::read_dir(workspace)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("dsh-session-") && name.ends_with(".jsonl"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn only_session_journal(root: &std::path::Path) -> std::path::PathBuf {
+    let entries = std::fs::read_dir(root)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    entries[0].path()
+}
+
+#[test]
 fn workspace_instructions_persist_reconcile_and_do_not_duplicate_on_resume() {
     let first_server = SequenceSseServer::start(vec![text_sse("Workspace guidance received.")]);
     let workspace = TestWorkspace::new();

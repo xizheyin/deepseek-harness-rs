@@ -57,6 +57,11 @@ enum Command {
         cancellation: CancellationToken,
         ack: oneshot::Sender<Result<Vec<u8>, ReadCommandError>>,
     },
+    ExportRaw {
+        destination: File,
+        cancellation: CancellationToken,
+        ack: oneshot::Sender<Result<u64, JournalExportError>>,
+    },
     Finish {
         ack: oneshot::Sender<Result<JournalCursor, JournalError>>,
     },
@@ -95,10 +100,25 @@ struct ReadFlight {
     ack: oneshot::Receiver<Result<Vec<u8>, ReadCommandError>>,
 }
 
+struct ExportFlight {
+    cancellation: CancellationToken,
+    ack: oneshot::Receiver<Result<u64, JournalExportError>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadCommandError {
     Cancelled,
     Writer(JournalError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum JournalExportError {
+    #[error("the session journal export was cancelled")]
+    Cancelled,
+    #[error("the session journal export destination failed")]
+    Destination,
+    #[error(transparent)]
+    Writer(#[from] JournalError),
 }
 
 enum PendingWrite {
@@ -219,6 +239,7 @@ pub(crate) struct JournalWriter {
     pending: Option<PendingWrite>,
     flight: Option<Flight>,
     read_flight: Option<ReadFlight>,
+    export_flight: Option<ExportFlight>,
     join: Option<thread::JoinHandle<()>>,
     cursor: JournalCursor,
     poisoned: bool,
@@ -289,6 +310,7 @@ impl JournalWriter {
             pending: None,
             flight: None,
             read_flight: None,
+            export_flight: None,
             join: Some(join),
             cursor,
             poisoned: false,
@@ -356,7 +378,7 @@ impl JournalWriter {
 
     pub(crate) fn ensure_stageable(&self) -> Result<(), JournalError> {
         self.ensure_usable()?;
-        if self.flight.is_some() {
+        if self.flight.is_some() || self.export_flight.is_some() {
             return Err(JournalError::FlightInProgress);
         }
         if self.read_flight.is_some() {
@@ -418,6 +440,7 @@ impl JournalWriter {
     /// Settle any command already owned by this writer before staging bytes.
     pub(crate) async fn settle_before_stage(&mut self) -> Result<JournalCursor, JournalError> {
         self.ensure_usable()?;
+        self.settle_export_before_other_command().await?;
         if self.read_flight.is_some() {
             self.settle_read_before_other_command().await?;
         }
@@ -430,6 +453,7 @@ impl JournalWriter {
 
     pub(crate) async fn barrier(&mut self) -> Result<JournalCursor, JournalError> {
         self.ensure_usable()?;
+        self.settle_export_before_other_command().await?;
         if self.read_flight.is_some() {
             self.settle_read_before_other_command().await?;
         }
@@ -454,7 +478,10 @@ impl JournalWriter {
         if self.finished {
             return self.finish_error.map_or(Ok(self.cursor), Err);
         }
-        let settle = if self.read_flight.is_some() {
+        let settle_export = self.settle_export_before_other_command().await;
+        let settle = if settle_export.is_err() {
+            settle_export.map(|()| self.cursor)
+        } else if self.read_flight.is_some() {
             self.settle_read_before_other_command()
                 .await
                 .map(|()| self.cursor)
@@ -491,6 +518,9 @@ impl JournalWriter {
         cancellation: CancellationToken,
     ) -> Result<Vec<u8>, JournalReadError> {
         self.ensure_usable().map_err(JournalReadError::Writer)?;
+        self.settle_export_before_other_command()
+            .await
+            .map_err(JournalReadError::Writer)?;
         if let Some(active) = self.read_flight.as_ref() {
             if active.locator == locator {
                 return self.settle_read_flight().await;
@@ -549,6 +579,67 @@ impl JournalWriter {
             ack: receiver,
         });
         self.settle_read_flight().await
+    }
+
+    /// Copy the exact durable journal prefix into one caller-owned file.
+    ///
+    /// The worker performs positional reads, so this never moves the append
+    /// cursor. Destination failures do not poison the source journal; source
+    /// failures do. Cancellation is checked between fixed-size chunks.
+    pub(crate) async fn export_raw_to(
+        &mut self,
+        destination: File,
+        cancellation: CancellationToken,
+    ) -> Result<u64, JournalExportError> {
+        self.ensure_usable().map_err(JournalExportError::Writer)?;
+        self.settle_export_before_other_command()
+            .await
+            .map_err(JournalExportError::Writer)?;
+        if self.read_flight.is_some() {
+            self.settle_read_before_other_command()
+                .await
+                .map_err(JournalExportError::Writer)?;
+        }
+        if self.pending.is_some() {
+            self.flush_staged()
+                .await
+                .map_err(JournalExportError::Writer)?;
+        } else if self.flight.is_some() {
+            self.settle_flight()
+                .await
+                .map_err(JournalExportError::Writer)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(JournalExportError::Cancelled);
+        }
+        if self.cursor.physical_offset != self.cursor.durable_offset {
+            self.send_control(FlightKind::Barrier)
+                .await
+                .map_err(JournalExportError::Writer)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(JournalExportError::Cancelled);
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or(JournalExportError::Writer(JournalError::WriterStopped))?;
+        let permit = sender
+            .reserve()
+            .await
+            .map_err(|_| JournalExportError::Writer(JournalError::WriterStopped))?;
+        let (ack, receiver) = oneshot::channel();
+        let owned_cancellation = cancellation.child_token();
+        permit.send(Command::ExportRaw {
+            destination,
+            cancellation: owned_cancellation.clone(),
+            ack,
+        });
+        self.export_flight = Some(ExportFlight {
+            cancellation: owned_cancellation,
+            ack: receiver,
+        });
+        self.settle_export_flight().await
     }
 
     async fn send_control(&mut self, kind: FlightKind) -> Result<JournalCursor, JournalError> {
@@ -659,6 +750,40 @@ impl JournalWriter {
         }
     }
 
+    async fn settle_export_flight(&mut self) -> Result<u64, JournalExportError> {
+        let Some(flight) = self.export_flight.as_mut() else {
+            return Err(JournalExportError::Writer(JournalError::FlightInProgress));
+        };
+        let result = (&mut flight.ack).await;
+        self.export_flight = None;
+        match result {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(JournalExportError::Cancelled)) => Err(JournalExportError::Cancelled),
+            Ok(Err(JournalExportError::Destination)) => Err(JournalExportError::Destination),
+            Ok(Err(JournalExportError::Writer(error))) => {
+                self.poisoned = true;
+                Err(JournalExportError::Writer(error))
+            }
+            Err(_) => {
+                self.poisoned = true;
+                self.sender.take();
+                let _ = self.join_worker();
+                Err(JournalExportError::Writer(JournalError::WriterStopped))
+            }
+        }
+    }
+
+    async fn settle_export_before_other_command(&mut self) -> Result<(), JournalError> {
+        let Some(flight) = &self.export_flight else {
+            return Ok(());
+        };
+        flight.cancellation.cancel();
+        match self.settle_export_flight().await {
+            Ok(_) | Err(JournalExportError::Cancelled | JournalExportError::Destination) => Ok(()),
+            Err(JournalExportError::Writer(error)) => Err(error),
+        }
+    }
+
     fn join_worker(&mut self) -> Result<(), JournalError> {
         if self.join.take().is_some_and(|join| join.join().is_err()) {
             self.poisoned = true;
@@ -694,6 +819,9 @@ impl Drop for JournalWriter {
         // already queued work and then release its fd/flock. Pending unsent
         // bytes are deliberately not claimed durable.
         if let Some(flight) = &self.read_flight {
+            flight.cancellation.cancel();
+        }
+        if let Some(flight) = &self.export_flight {
             flight.cancellation.cancel();
         }
         self.sender.take();
@@ -754,6 +882,20 @@ fn writer_main(mut file: File, initial_offset: u64, mut receiver: mpsc::Receiver
                 } else {
                     read_row(&file, cursor, locator, &cancellation).inspect_err(|error| {
                         poisoned |= matches!(error, ReadCommandError::Writer(_));
+                    })
+                };
+                let _ = ack.send(result);
+            }
+            Command::ExportRaw {
+                destination,
+                cancellation,
+                ack,
+            } => {
+                let result = if poisoned {
+                    Err(JournalExportError::Writer(JournalError::Poisoned))
+                } else {
+                    export_raw(&file, cursor, destination, &cancellation).inspect_err(|error| {
+                        poisoned |= matches!(error, JournalExportError::Writer(_));
                     })
                 };
                 let _ = ack.send(result);
@@ -864,6 +1006,65 @@ fn read_row_with_chunk_observer(
         return Err(ReadCommandError::Cancelled);
     }
     Ok(bytes)
+}
+
+const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+
+fn export_raw(
+    source: &File,
+    cursor: JournalCursor,
+    destination: File,
+    cancellation: &CancellationToken,
+) -> Result<u64, JournalExportError> {
+    export_raw_with_chunk_observer(source, cursor, destination, cancellation, |_| {})
+}
+
+fn export_raw_with_chunk_observer(
+    source: &File,
+    cursor: JournalCursor,
+    mut destination: File,
+    cancellation: &CancellationToken,
+    mut chunk_observer: impl FnMut(u64),
+) -> Result<u64, JournalExportError> {
+    if cancellation.is_cancelled() {
+        return Err(JournalExportError::Cancelled);
+    }
+    if cursor.physical_offset != cursor.durable_offset {
+        return Err(JournalExportError::Writer(JournalError::Poisoned));
+    }
+    let mut buffer = [0_u8; EXPORT_CHUNK_BYTES];
+    let mut offset = 0_u64;
+    while offset < cursor.durable_offset {
+        if cancellation.is_cancelled() {
+            return Err(JournalExportError::Cancelled);
+        }
+        let remaining = cursor.durable_offset - offset;
+        let length = usize::try_from(remaining.min(EXPORT_CHUNK_BYTES as u64))
+            .map_err(|_| JournalExportError::Writer(JournalError::Poisoned))?;
+        source
+            .read_exact_at(&mut buffer[..length], offset)
+            .map_err(|_| JournalExportError::Writer(JournalError::Poisoned))?;
+        destination
+            .write_all(&buffer[..length])
+            .map_err(|_| JournalExportError::Destination)?;
+        offset = offset
+            .checked_add(
+                u64::try_from(length)
+                    .map_err(|_| JournalExportError::Writer(JournalError::Poisoned))?,
+            )
+            .ok_or(JournalExportError::Writer(JournalError::Poisoned))?;
+        chunk_observer(offset);
+    }
+    if cancellation.is_cancelled() {
+        return Err(JournalExportError::Cancelled);
+    }
+    destination
+        .sync_all()
+        .map_err(|_| JournalExportError::Destination)?;
+    if cancellation.is_cancelled() {
+        return Err(JournalExportError::Cancelled);
+    }
+    Ok(offset)
 }
 
 /// Commit a pre-encoded recovery suffix before this same thread becomes the
@@ -990,8 +1191,9 @@ mod tests {
     };
 
     use super::{
-        COMMAND_CAPACITY, Command, FlightKind, JournalCursor, JournalError, JournalReadError,
-        JournalWriter, ReadCommandError, append_bytes, barrier_file, read_row,
+        COMMAND_CAPACITY, Command, EXPORT_CHUNK_BYTES, FlightKind, JournalCursor, JournalError,
+        JournalExportError, JournalReadError, JournalWriter, ReadCommandError, append_bytes,
+        barrier_file, export_raw, export_raw_with_chunk_observer, read_row,
         read_row_with_chunk_observer, valid_prune_prefix,
     };
 
@@ -1035,6 +1237,102 @@ mod tests {
         assert_eq!(cursor.physical_offset, locator.end().unwrap() + 5);
         writer.finish().await.unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_export_is_exact_and_does_not_move_the_append_cursor() {
+        let (source_path, mut source) = test_file("journal-export-source");
+        let initial = b"header\nfirst\n";
+        source.write_all(initial).unwrap();
+        source.sync_all().unwrap();
+        let mut writer = JournalWriter::start(source, initial.len() as u64).unwrap();
+        let (destination_path, destination) = test_file("journal-export-destination");
+
+        assert_eq!(
+            writer
+                .export_raw_to(destination, CancellationToken::new())
+                .await
+                .unwrap(),
+            initial.len() as u64
+        );
+        writer.stage_bytes_for_test(b"later\n".to_vec()).unwrap();
+        writer.flush_staged().await.unwrap();
+        writer.barrier().await.unwrap();
+        writer.finish().await.unwrap();
+
+        assert_eq!(std::fs::read(&destination_path).unwrap(), initial);
+        assert_eq!(
+            std::fs::read(&source_path).unwrap(),
+            [initial.as_slice(), b"later\n"].concat()
+        );
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn destination_failure_does_not_poison_the_journal() {
+        let (source_path, mut source) = test_file("journal-export-destination-source");
+        source.write_all(b"header\n").unwrap();
+        source.sync_all().unwrap();
+        let mut writer = JournalWriter::start(source, 7).unwrap();
+        let (destination_path, destination) = test_file("journal-export-read-only");
+        drop(destination);
+        let destination = std::fs::File::open(&destination_path).unwrap();
+
+        assert_eq!(
+            writer
+                .export_raw_to(destination, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            JournalExportError::Destination
+        );
+        writer
+            .stage_bytes_for_test(b"still-usable\n".to_vec())
+            .unwrap();
+        writer.flush_staged().await.unwrap();
+        writer.finish().await.unwrap();
+
+        assert_eq!(
+            std::fs::read(&source_path).unwrap(),
+            b"header\nstill-usable\n"
+        );
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
+    }
+
+    #[test]
+    fn raw_export_observes_cancellation_between_bounded_chunks() {
+        let (source_path, mut source) = test_file("journal-export-cancel-source");
+        let bytes = vec![b'x'; EXPORT_CHUNK_BYTES * 2 + 1];
+        source.write_all(&bytes).unwrap();
+        source.sync_all().unwrap();
+        let (destination_path, destination) = test_file("journal-export-cancel-destination");
+        let cancellation = CancellationToken::new();
+        let observer_cancellation = cancellation.clone();
+
+        let error = export_raw_with_chunk_observer(
+            &source,
+            JournalCursor {
+                physical_offset: bytes.len() as u64,
+                durable_offset: bytes.len() as u64,
+            },
+            destination,
+            &cancellation,
+            move |offset| {
+                if offset == EXPORT_CHUNK_BYTES as u64 {
+                    observer_cancellation.cancel();
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error, JournalExportError::Cancelled);
+        assert_eq!(
+            std::fs::metadata(&destination_path).unwrap().len(),
+            EXPORT_CHUNK_BYTES as u64
+        );
+        std::fs::remove_file(source_path).unwrap();
+        std::fs::remove_file(destination_path).unwrap();
     }
 
     #[test]
@@ -1789,6 +2087,13 @@ mod tests {
                     Command::Barrier { ack } => {
                         let _ = ack.send(barrier_file(&mut file, &mut cursor));
                     }
+                    Command::ExportRaw {
+                        destination,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(export_raw(&file, cursor, destination, &cancellation));
+                    }
                 }
             }
         });
@@ -1874,6 +2179,13 @@ mod tests {
                     }
                     Command::Barrier { ack } => {
                         let _ = ack.send(barrier_file(&mut file, &mut cursor));
+                    }
+                    Command::ExportRaw {
+                        destination,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(export_raw(&file, cursor, destination, &cancellation));
                     }
                 }
             }
@@ -5875,6 +6187,14 @@ mod tests {
                         ack,
                     } => {
                         let _ = ack.send(read_row(&file, cursor, locator, &cancellation));
+                        continue;
+                    }
+                    Command::ExportRaw {
+                        destination,
+                        cancellation,
+                        ack,
+                    } => {
+                        let _ = ack.send(export_raw(&file, cursor, destination, &cancellation));
                         continue;
                     }
                     Command::Finish { ack } => CompletedCommand {

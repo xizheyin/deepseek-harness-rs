@@ -123,6 +123,8 @@ pub(super) enum IdleInput {
     Rename(RenameCommand),
     RefreshTitle,
     RefreshTitleUsage,
+    Export,
+    ExportUsage,
     Compact,
     CompactUsage,
     Exit,
@@ -158,6 +160,12 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     {
         return IdleInput::RefreshTitleUsage;
     }
+    if command
+        .strip_prefix("/export")
+        .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+    {
+        return IdleInput::ExportUsage;
+    }
     match command {
         "" => IdleInput::Redraw,
         "/help" => IdleInput::Help,
@@ -165,6 +173,7 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
         "/review" => IdleInput::Review,
         "/compact" => IdleInput::Compact,
         "/refresh-title" => IdleInput::RefreshTitle,
+        "/export" => IdleInput::Export,
         "/exit" | "/quit" => IdleInput::Exit,
         _ => IdleInput::Submit(record.to_owned()),
     }
@@ -314,9 +323,14 @@ mod tests {
             classify_idle_record(" /refresh-title ", true),
             IdleInput::RefreshTitle
         );
+        assert_eq!(classify_idle_record(" /export ", true), IdleInput::Export);
         assert_eq!(
             classify_idle_record("/refresh-title now", true),
             IdleInput::RefreshTitleUsage
+        );
+        assert_eq!(
+            classify_idle_record("/export output.zip", true),
+            IdleInput::ExportUsage
         );
         assert_eq!(
             classify_idle_record(" /rename ", true),

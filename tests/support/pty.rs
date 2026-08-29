@@ -329,6 +329,22 @@ impl PtyHarness {
         )
     }
 
+    pub fn spawn_with_session_root_cargo(
+        base_url: &str,
+        workspace: &Path,
+        session_root: TestSessionRoot,
+    ) -> Self {
+        Self::spawn_with_transcript_mode(
+            base_url,
+            workspace,
+            false,
+            None,
+            Some(session_root),
+            None,
+            PtyLaunch::cargo(false),
+        )
+    }
+
     pub fn spawn_picker_color_cargo(
         base_url: &str,
         workspace: &Path,

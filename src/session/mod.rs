@@ -7,6 +7,7 @@ mod compaction;
 mod context_budget;
 mod error;
 mod event;
+mod export;
 mod journal;
 mod journal_row;
 mod jsonl;
@@ -25,6 +26,7 @@ mod title;
 mod tool_result_pruner;
 
 use std::{
+    fs::File,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
@@ -57,6 +59,7 @@ pub use event::{
     TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TodoItem, TodoStatus, ToolFailure, TurnEndCancelCause,
     TurnEndReason, TurnId, UnixMillis,
 };
+pub(crate) use export::SessionLogExporter;
 pub(crate) use projection::CompactionCandidate;
 pub use projection::SessionState;
 pub(crate) use store::SessionMetadata;
@@ -107,7 +110,7 @@ use crate::{
 
 use self::{
     codec::decode_snapshot,
-    journal::{JournalError, JournalReadError, MAX_PRUNE_PREFIX_BYTES},
+    journal::{JournalError, JournalExportError, JournalReadError, MAX_PRUNE_PREFIX_BYTES},
     journal_row::JournalRowLocator,
     jsonl::{
         ChargedEventLineError, ChargedEventLineTemplate, DurableTimestamp,
@@ -374,6 +377,20 @@ pub(crate) enum SessionReadError {
     Changed,
     #[error("the durable surface row read was cancelled")]
     Cancelled,
+}
+
+/// A current-Session raw export either completes exactly or leaves no accepted
+/// artifact. Destination failures do not imply source-journal corruption.
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
+pub(crate) enum SessionRawExportError {
+    #[error("the current Session has no durable raw artifact")]
+    Unavailable,
+    #[error("the Session raw export was cancelled")]
+    Cancelled,
+    #[error("the Session raw export destination failed")]
+    Destination,
+    #[error(transparent)]
+    Barrier(#[from] BarrierError),
 }
 
 /// A private prune pair can fail before its marker or after that marker became
@@ -2394,6 +2411,44 @@ impl Session {
             return Err(BarrierError::ObserverUnavailable);
         }
         Ok(())
+    }
+
+    /// Synchronize and copy the exact current durable journal prefix.
+    pub(crate) async fn export_raw_to(
+        &mut self,
+        destination: File,
+        cancellation: CancellationToken,
+    ) -> Result<u64, SessionRawExportError> {
+        if cancellation.is_cancelled() {
+            return Err(SessionRawExportError::Cancelled);
+        }
+        self.flush_barrier().await?;
+        if cancellation.is_cancelled() {
+            return Err(SessionRawExportError::Cancelled);
+        }
+        let result = match &mut self.mode {
+            SessionMode::Memory { .. } => return Err(SessionRawExportError::Unavailable),
+            SessionMode::Durable { storage, .. } => match storage {
+                SessionStorage::Active(writer) => {
+                    writer.export_raw_to(destination, cancellation).await
+                }
+                SessionStorage::Deferred(_)
+                | SessionStorage::Finishing(_)
+                | SessionStorage::Failed(_)
+                | SessionStorage::Closed => return Err(SessionRawExportError::Unavailable),
+            },
+        };
+        match result {
+            Ok(bytes) => Ok(bytes),
+            Err(JournalExportError::Cancelled) => Err(SessionRawExportError::Cancelled),
+            Err(JournalExportError::Destination) => Err(SessionRawExportError::Destination),
+            Err(JournalExportError::Writer(error)) => {
+                self.fail_durable_writer(error);
+                Err(SessionRawExportError::Barrier(BarrierError::Storage(
+                    StoreError::from(error),
+                )))
+            }
+        }
     }
 
     /// Finish the owned journal thread and release its file lock.

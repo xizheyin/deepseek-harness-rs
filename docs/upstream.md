@@ -2540,3 +2540,38 @@ unchanged. Rust Phase 49 maps this service behavior to serialized idle terminal
 `/refresh-title`, retains one 4096-byte first-prompt projection for durable
 resume, and keeps overlapping/remote service calls outside its single-writer
 CLI boundary.
+
+## Phase 50 current Session log export — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. Before design and implementation,
+the following fixed-commit paths were inspected:
+
+- `packages/session-query/session-log-export/src/index.ts`,
+  `tests/command.client.spec.ts` and `README.md` for the Web-only, pathless
+  `/export`, local success/error result, zero model visibility and browser-owned
+  destination;
+- `packages/host/apiproxy/src/session-export.ts` and
+  `tests/session-export.spec.ts` for live flush before raw read, exact root
+  artifact bytes, sanitized archive names, bounded ZIP chunks/backpressure,
+  missing/read failures, cancellation, descendants and media.
+
+Official export reads the stored artifact rather than reconstructing events.
+It flushes a live root immediately before that read, then streams
+`session.jsonl` verbatim inside `dsh-session-<safe-id>.zip`. A missing root or
+preparation failure is explicit; mid-stream descendant/media failure and
+consumer cancellation terminate the archive instead of returning a truncated
+success. The command creates no model turn or request.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Commits `17c03bbbc` and
+`4f00a8b82` move the authenticated GET/HEAD route and archive owner from
+`host/apiproxy` into `session-query/session-log-export`; current
+`src/{index,archive}.ts` and `tests/{command,route,archive}.host.spec.ts` retain
+the pathless command, exact-root, flush and cancellation behavior.
+
+Rust Phase 50 maps this to one pathless terminal command and one exact raw
+JSONL file in the retained workspace. It keeps bounded copying, cancellation,
+no overwrite and fail-loud semantics. ZIP packaging, attachments, descendants,
+HTTP/HEAD, browser download state and generic command lifecycle facts remain
+outside the one-Agent terminal boundary.

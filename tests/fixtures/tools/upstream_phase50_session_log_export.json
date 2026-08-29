@@ -1,0 +1,38 @@
+{
+  "upstreamCommit": "47f943859bef60e4160492346772ded9b24f765a",
+  "latestMaster": "cd5ef8148158c3a752a658978873241fdf8e2bbc",
+  "sources": [
+    "packages/session-query/session-log-export/src/index.ts",
+    "packages/session-query/session-log-export/tests/command.client.spec.ts",
+    "packages/session-query/session-log-export/README.md",
+    "packages/host/apiproxy/src/session-export.ts",
+    "packages/host/apiproxy/tests/session-export.spec.ts"
+  ],
+  "command": {
+    "exactInput": "/export",
+    "acceptsPath": false,
+    "opensModelTurn": false,
+    "modelVisible": false
+  },
+  "rootArtifact": {
+    "flushLiveSessionBeforeRead": true,
+    "storedBytesPreservedVerbatim": true,
+    "archiveFilename": "dsh-session-<safe-session-id>.zip",
+    "entryFilename": "session.jsonl"
+  },
+  "failure": {
+    "missingRootFails": true,
+    "sourceReadFailsLoudly": true,
+    "cancellationPropagates": true,
+    "truncatedArchiveIsNotReportedAsSuccess": true
+  },
+  "rustCliMapping": {
+    "output": "one-current-session-raw-jsonl",
+    "destination": "generated-owner-only-workspace-file",
+    "overwrite": false,
+    "chunkBytes": 65536,
+    "descendants": false,
+    "media": false,
+    "zip": false
+  }
+}

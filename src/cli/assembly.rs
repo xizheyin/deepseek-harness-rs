@@ -17,7 +17,8 @@ use crate::{
         web_fetch::HttpWebFetchProvider,
     },
     session::{
-        CommittedUiReceiver, Session, SessionSearchRuntime, SessionStore, StoreError, SystemClock,
+        CommittedUiReceiver, Session, SessionLogExporter, SessionSearchRuntime, SessionStore,
+        StoreError, SystemClock,
     },
     time_context::TimeContextRuntime,
     tools::{
@@ -54,6 +55,7 @@ pub(super) struct InteractiveAssembly {
     pub(super) session_id: String,
     pub(super) resumed: bool,
     pub(super) file_suggestions: WorkspaceFileCatalogue,
+    pub(super) session_log_exporter: SessionLogExporter,
     pub(super) goal: GoalRuntime,
     pub(super) plan_mode: PlanModeRuntime,
 }
@@ -211,6 +213,7 @@ pub(super) async fn assemble_session(
     // workspace capability. No later UI path reopens the ambient pathname.
     let file_suggestions =
         interactive.then(|| WorkspaceFileCatalogue::from_authority(authority.clone()));
+    let session_log_exporter = interactive.then(|| SessionLogExporter::from_authority(&authority));
     let goal = interactive.then(|| GoalRuntime::from_replay(session.state().goal_replay()));
     let plan_mode = PlanModeRuntime::new(session.state().plan_mode_active());
     let workspace_instruction_runtime = WorkspaceInstructionRuntime::from_authority(&authority);
@@ -310,6 +313,9 @@ pub(super) async fn assemble_session(
         let Some(file_suggestions) = file_suggestions else {
             return Err(AssemblyFailure::new(AssemblyError::Agent, session));
         };
+        let Some(session_log_exporter) = session_log_exporter else {
+            return Err(AssemblyFailure::new(AssemblyError::Agent, session));
+        };
         let Some(goal) = goal else {
             return Err(AssemblyFailure::new(AssemblyError::Agent, session));
         };
@@ -346,6 +352,7 @@ pub(super) async fn assemble_session(
             session_id,
             resumed,
             file_suggestions,
+            session_log_exporter,
             goal,
             plan_mode,
         }))

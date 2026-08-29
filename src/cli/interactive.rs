@@ -7,12 +7,14 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::{AgentLoop, ManualCompactionOutcome, ManualTitleRefreshOutcome},
+    agent::{
+        AgentLoop, ManualCompactionOutcome, ManualSessionExportOutcome, ManualTitleRefreshOutcome,
+    },
     goal::{GoalCommand, GoalError, GoalRound, GoalRuntime},
     plan_mode::{PlanModeCommand, PlanModeError, PlanModeRuntime},
     session::{
-        ApprovalOutcome, CommittedUiKind, CommittedUiReceiver, EventSeq, StoreError, TurnEndReason,
-        TurnId, UiUserSource,
+        ApprovalOutcome, CommittedUiKind, CommittedUiReceiver, EventSeq, SessionLogExporter,
+        StoreError, TurnEndReason, TurnId, UiUserSource,
     },
     tui::{
         command_palette::{
@@ -35,6 +37,7 @@ use crate::{
         },
         theme::{ThemeCommand, ThemePalette, ThemeRequest, ThemeState},
         view::{ContextEstimate, ViewMode, ViewRequest, ViewState},
+        visible::render_visible_owned,
     },
     user_question::{MAX_CUSTOM_ANSWER_BYTES, UserQuestionEnvelope, UserQuestionReceiver},
 };
@@ -298,6 +301,7 @@ async fn run_enhanced(
         session_id,
         resumed,
         file_suggestions,
+        session_log_exporter,
         goal,
         plan_mode,
     } = assembly;
@@ -587,6 +591,7 @@ async fn run_enhanced(
                                 | EnhancedSubmission::Rename(_)
                                 | EnhancedSubmission::CompactUsage
                                 | EnhancedSubmission::RefreshTitleUsage
+                                | EnhancedSubmission::ExportUsage
                         );
                     let (mut draft, mut cursor) = if job_wake {
                         (String::new(), 0)
@@ -647,7 +652,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/compact | /rename TITLE | /refresh-title | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/compact | /rename TITLE | /refresh-title | /export | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -710,6 +715,18 @@ async fn run_enhanced(
                                     pending_signal = signal;
                                 }
                             }
+                            CommandId::Export => {
+                                let (message, signal) = run_session_export(
+                                    &mut agent,
+                                    &session_log_exporter,
+                                    signals,
+                                )
+                                .await?;
+                                notice = Some(message);
+                                if !matches!(signal, None | Some(UiSignal::Interrupt)) {
+                                    pending_signal = signal;
+                                }
+                            }
                             CommandId::Exit | CommandId::Quit => {
                                 break Ok(InteractiveExit::Ordinary(0));
                             }
@@ -732,6 +749,9 @@ async fn run_enhanced(
                         }
                         EnhancedSubmission::RefreshTitleUsage => {
                             notice = Some("Usage: /refresh-title (no arguments)".to_owned());
+                        }
+                        EnhancedSubmission::ExportUsage => {
+                            notice = Some("Usage: /export (no arguments)".to_owned());
                         }
                         EnhancedSubmission::Prompt => {
                             let prompt = copy_enhanced_prompt(&draft)?;
@@ -1220,6 +1240,7 @@ enum EnhancedSubmission {
     Rename(RenameCommand),
     CompactUsage,
     RefreshTitleUsage,
+    ExportUsage,
     Prompt,
 }
 
@@ -1245,6 +1266,11 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
     {
         EnhancedSubmission::RefreshTitleUsage
+    } else if command
+        .strip_prefix("/export")
+        .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+    {
+        EnhancedSubmission::ExportUsage
     } else if let Some(theme) = ThemeCommand::parse(command) {
         EnhancedSubmission::Theme(theme)
     } else if let Some(motion) = MotionCommand::parse(command) {
@@ -1335,6 +1361,57 @@ fn title_refresh_notice(outcome: &ManualTitleRefreshOutcome) -> String {
             "Title refresh failed. Current title unchanged.".to_owned()
         }
     }
+}
+
+async fn run_session_export(
+    agent: &mut AgentLoop,
+    exporter: &SessionLogExporter,
+    signals: &mut SignalStreams,
+) -> Result<(String, Option<UiSignal>), InteractiveError> {
+    let mut target = match exporter.reserve(agent.session().id()).await {
+        Ok(target) => target,
+        Err(_) => return Ok(("Session log export failed.".to_owned(), None)),
+    };
+    let destination = match target.take_file() {
+        Ok(file) => file,
+        Err(_) => return Ok(("Session log export failed.".to_owned(), None)),
+    };
+    let cancellation = CancellationToken::new();
+    let future = agent.export_session_log(destination, cancellation.clone());
+    tokio::pin!(future);
+    let mut stopped = SignalLatch::default();
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut future => break result,
+            signal = signals.next() => {
+                stopped.observe(DriverMode::Interactive, signal);
+                cancellation.cancel();
+            }
+        }
+    };
+    signals.drain_ready(DriverMode::Interactive, &mut stopped);
+    let notice = match result.map_err(|_| InteractiveError::Agent)? {
+        ManualSessionExportOutcome::Exported { bytes } => match target.commit(bytes).await {
+            Ok(artifact) => {
+                let path = artifact
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(InteractiveError::Agent)?;
+                let visible =
+                    render_visible_owned(path, false).map_err(|_| InteractiveError::Output)?;
+                format!(
+                    "Session log exported · {} bytes · {visible} (workspace root)",
+                    artifact.bytes()
+                )
+            }
+            Err(_) => "Session log export failed.".to_owned(),
+        },
+        ManualSessionExportOutcome::Cancelled => "Session log export cancelled.".to_owned(),
+        ManualSessionExportOutcome::Failed => "Session log export failed.".to_owned(),
+    };
+    Ok((notice, stopped.observed()))
 }
 
 async fn apply_plan_mode_command(
@@ -1893,7 +1970,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/compact · /rename TITLE · /refresh-title · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
+                "/compact · /rename TITLE · /refresh-title · /export · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -2643,6 +2720,7 @@ async fn run_linear(
         session_id,
         resumed,
         file_suggestions: _file_suggestions,
+        session_log_exporter,
         goal,
         plan_mode,
     } = assembly;
@@ -2996,6 +3074,29 @@ async fn run_linear(
                             }
                         }
                     }
+                    IdleInput::Export => {
+                        let (notice, signal) =
+                            run_session_export(&mut agent, &session_log_exporter, signals).await?;
+                        let message = format!("[{notice}]\n");
+                        if let Some(write_signal) =
+                            write_dynamic_notice(message, &mut presenter, &terminal, signals)
+                                .await?
+                        {
+                            if let Some(write_signal) =
+                                handle_idle_signal(write_signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(write_signal));
+                            }
+                        }
+                        if let Some(signal) = signal.filter(|signal| *signal != UiSignal::Interrupt)
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
                     IdleInput::Compact => {
                         let (outcome, signal) = run_manual_compaction(&mut agent, signals).await?;
                         let message = format!("[{}]\n", manual_compaction_notice(&outcome));
@@ -3037,6 +3138,22 @@ async fn run_linear(
                     IdleInput::RefreshTitleUsage => {
                         if let Some(signal) = write_notice(
                             "[Usage: /refresh-title (no arguments)]\n",
+                            &mut presenter,
+                            &terminal,
+                            signals,
+                        )
+                        .await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::ExportUsage => {
+                        if let Some(signal) = write_notice(
+                            "[Usage: /export (no arguments)]\n",
                             &mut presenter,
                             &terminal,
                             signals,
@@ -6104,7 +6221,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /export waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -6155,6 +6272,13 @@ fn handle_active_input(
                                     .to_owned(),
                             );
                         }
+                        CommandId::Export => {
+                            let _ = input.take_draft_for_turn()?;
+                            *notice = Some(
+                                "Session export busy · wait for the current turn or press Ctrl+C"
+                                    .to_owned(),
+                            );
+                        }
                     }
                     return Ok(ActiveInputOutcome::Redraw);
                 }
@@ -6195,6 +6319,11 @@ fn handle_active_input(
                 EnhancedSubmission::RefreshTitleUsage => {
                     let _ = input.take_draft_for_turn()?;
                     *notice = Some("Usage: /refresh-title (no arguments)".to_owned());
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::ExportUsage => {
+                    let _ = input.take_draft_for_turn()?;
+                    *notice = Some("Usage: /export (no arguments)".to_owned());
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Empty => {
@@ -8675,6 +8804,18 @@ mod tests {
         );
         assert_eq!(
             classify_enhanced_submission("/refresh-titles"),
+            EnhancedSubmission::Prompt
+        );
+        assert_eq!(
+            classify_enhanced_submission(" /export "),
+            EnhancedSubmission::Command(CommandId::Export)
+        );
+        assert_eq!(
+            classify_enhanced_submission("/export output.zip"),
+            EnhancedSubmission::ExportUsage
+        );
+        assert_eq!(
+            classify_enhanced_submission("/exports"),
             EnhancedSubmission::Prompt
         );
     }
