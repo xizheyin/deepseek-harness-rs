@@ -1733,6 +1733,7 @@ fn extract_event_text(event: &SessionEvent) -> String {
         | EventKind::AssistantChunk { .. }
         | EventKind::GoalChange { .. }
         | EventKind::PlanMode { .. }
+        | EventKind::PermissionPreset { .. }
         | EventKind::SessionTitle { .. }
         | EventKind::SessionTitleLlmRequest { .. }
         | EventKind::RequestHeader { .. }

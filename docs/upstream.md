@@ -2659,3 +2659,32 @@ without network I/O; the Agent keeps it process-local until its next real
 request appends the existing `request/header`. Dynamic multi-Provider catalog
 aggregation, remote refresh, a global saved default, image capability routing
 and the Web popup remain outside this CLI boundary.
+
+## Phase 53 permission presets — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. Focused fixed-commit evidence is:
+
+- `packages/interaction/permission-presets/src/index.ts` for the log-only
+  `permission/preset` event, last-value fold, no-op selection, selection-before-
+  mechanism ordering, new-Session pinning and refusal to compose over an
+  unconfined Shell executor;
+- `packages/interaction/permission-presets/tests/permission-presets.spec.ts`
+  for default bundles, replay, no-op, drift repair, event order, settings
+  lifetime and resumed-seed preservation;
+- `packages/interaction/permission-presets/README.md` and
+  `packages/client/ui-permission-presets/README.md` for the current-Session
+  `/permission` path, future-Session-only global setting, picker projection and
+  model invisibility.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`; the current permission service,
+projection and command retain the fixed behavior above.
+
+Rust Phase 53 keeps the common `permission/preset` envelope and durable
+last-value behavior but intentionally defines `ask` and `auto-edit`. Because
+this CLI has no proven OS sandbox, it does not expose official
+`danger-full-access` or claim `workspace-write`. `auto-edit` changes only the
+file-change policy; Shell and subprocess plugins remain Ask. The source-derived
+contract is fixed in
+`tests/fixtures/tools/upstream_phase53_permission_presets.json`.

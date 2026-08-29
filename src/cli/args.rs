@@ -730,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_mode_has_a_closed_process_local_surface() {
+    fn approval_mode_has_a_closed_surface() {
         for (value, expected) in [
             ("ask", ApprovalMode::Ask),
             ("auto-edit", ApprovalMode::AutoEdit),

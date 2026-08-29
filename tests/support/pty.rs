@@ -688,6 +688,28 @@ impl PtyHarness {
         )
     }
 
+    pub fn spawn_resume_color_with_approval_mode_cargo(
+        base_url: &str,
+        caller_workspace: &Path,
+        session_root: TestSessionRoot,
+        session_id: &str,
+        approval_mode: &str,
+    ) -> Self {
+        let mut launch = PtyLaunch::cargo(true);
+        launch
+            .extra_args
+            .extend(["--approval-mode".into(), approval_mode.into()]);
+        Self::spawn_with_transcript_mode(
+            base_url,
+            caller_workspace,
+            false,
+            None,
+            Some(session_root),
+            Some(session_id),
+            launch,
+        )
+    }
+
     #[allow(dead_code)] // Used only by the separately compiled release-acceptance binary.
     pub fn spawn_resume_color(
         base_url: &str,

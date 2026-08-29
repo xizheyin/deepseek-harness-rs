@@ -17,8 +17,8 @@ use crate::{
         web_fetch::HttpWebFetchProvider,
     },
     session::{
-        CommittedUiReceiver, Session, SessionForker, SessionLogExporter, SessionSearchRuntime,
-        SessionStore, StoreError, SystemClock,
+        CommittedUiReceiver, EventKind, NewEvent, PermissionPreset, Session, SessionForker,
+        SessionLogExporter, SessionSearchRuntime, SessionStore, StoreError, SystemClock,
     },
     time_context::TimeContextRuntime,
     tools::{
@@ -151,7 +151,7 @@ pub(super) async fn assemble_session(
     prepared: AssemblySession,
     requested_model: Option<String>,
     interactive: bool,
-    approval_mode: ApprovalMode,
+    requested_approval_mode: Option<ApprovalMode>,
     extensions: AssemblyExtensions,
     cancellation: CancellationToken,
 ) -> Result<AgentAssembly, AssemblyFailure> {
@@ -166,6 +166,11 @@ pub(super) async fn assemble_session(
         resumed,
     } = prepared;
     let session_id = session.header().id().as_str().to_owned();
+    let recorded_approval_mode = session
+        .state()
+        .permission_preset()
+        .map_or(ApprovalMode::Ask, approval_mode_from_preset);
+    let approval_mode = requested_approval_mode.unwrap_or(recorded_approval_mode);
     let call = select_call(session.request_header(), requested_model);
     let call = match call {
         Ok(call) => call,
@@ -193,6 +198,19 @@ pub(super) async fn assemble_session(
     } else {
         None
     };
+    if interactive
+        && requested_approval_mode.is_some()
+        && approval_mode != recorded_approval_mode
+        && (session.materialize_if_needed().await.is_err()
+            || session
+                .append_settled(NewEvent::log(EventKind::permission_preset(
+                    permission_preset_from_mode(approval_mode),
+                )))
+                .await
+                .is_err())
+    {
+        return Err(AssemblyFailure::new(AssemblyError::Agent, session));
+    }
 
     let provider_config = match DeepSeekConfig::from_process_environment() {
         Ok(config) => config,
@@ -404,6 +422,20 @@ const fn interactive_policies(
         ApprovalMode::AutoEdit => FileChangePolicy::Allow,
     };
     (file, ShellPolicy::Ask, PluginPolicy::Ask)
+}
+
+const fn permission_preset_from_mode(mode: ApprovalMode) -> PermissionPreset {
+    match mode {
+        ApprovalMode::Ask => PermissionPreset::Ask,
+        ApprovalMode::AutoEdit => PermissionPreset::AutoEdit,
+    }
+}
+
+const fn approval_mode_from_preset(preset: PermissionPreset) -> ApprovalMode {
+    match preset {
+        PermissionPreset::Ask => ApprovalMode::Ask,
+        PermissionPreset::AutoEdit => ApprovalMode::AutoEdit,
+    }
 }
 
 fn select_call(

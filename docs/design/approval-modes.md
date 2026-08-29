@@ -1,5 +1,10 @@
 # Interactive approval modes
 
+> Phase 53 extends this original startup-only design with durable idle
+> `/permission ask|auto-edit`. The safety split is unchanged: only prepared
+> file mutations become automatic; Shell and plugins remain Ask. See
+> [`permission-presets.md`](permission-presets.md).
+
 ## Status and scope
 
 This design freezes one narrow response to repeated interactive file-edit
@@ -127,9 +132,10 @@ with `--prompt` or piped input fails before workspace/session creation,
 credentials, plugins, or network work. Script mode otherwise keeps its fixed
 `Deny` policy for patch, Shell, and plugins.
 
-The choice is not stored in Session, the workspace, environment variables, or
-global configuration. A new process, including resume, uses `ask` unless the
-flag is supplied again. The model cannot change the mode.
+Phase 53 stores the choice in the Session, but still not in the workspace,
+environment variables, or global configuration. A new Session uses `ask`; a
+resumed Session uses its latest preset unless an explicit flag overrides and
+stores another value. The model cannot change the mode.
 
 The exact Shell grant is likewise process-local. It needs no CLI flag, but it
 can be created only by the human's explicit fourth selector choice and resets
@@ -137,8 +143,9 @@ on every new process/resume.
 
 ## State, event order, and side effects
 
-`ApprovalMode` belongs to CLI admission and is passed once into assembly. For
-an interactive assembly:
+`ApprovalMode` belongs to CLI admission. Phase 53 maps it to the same narrow
+runtime preset that an idle `/permission` command can change. For an
+interactive assembly:
 
 | Mode | File policy | Shell policy | Plugin policy |
 | --- | --- | --- | --- |
@@ -216,7 +223,8 @@ Default-enabled tests must prove:
    failure, cache capacity, and allocation/entropy failure never grant;
 9. Shell `Deny`, configured plugins, files, and scripts cannot consume the
    Shell cache, including in `auto-edit` mode;
-10. a resumed/new process resets both `ask` mode and the grant cache;
+10. a resumed process restores the latest narrow preset while a new Session
+    defaults to `ask`; both reset the exact-Shell grant cache;
 11. enhanced and zero-escape linear selectors keep fresh-input protection,
     Reject default, one-shot `y`, correct fourth-choice navigation, and
     terminal restoration;

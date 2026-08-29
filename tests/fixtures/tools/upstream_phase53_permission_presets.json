@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "implementation": "packages/interaction/permission-presets/src/index.ts",
+    "tests": "packages/interaction/permission-presets/tests/permission-presets.spec.ts",
+    "clientContract": "packages/client/ui-permission-presets/README.md"
+  },
+  "contract": {
+    "event": { "type": "permission/preset", "data": { "preset": "<name>" } },
+    "projection": "the last permission/preset value wins",
+    "switchOrder": "selection event precedes changed mechanism events",
+    "sameEffectiveSelection": "no events",
+    "modelVisibility": "log-only; no prompt content",
+    "lifetime": "current-session selection is durable; global setting applies only to future sessions",
+    "safetyPrecondition": "official preset composition refuses an unconfined shell executor"
+  },
+  "officialDefaults": {
+    "workspace-write": { "sandbox": "workspace-write", "approval": "ask" },
+    "danger-full-access": { "sandbox": "danger-full-access", "approval": "never" }
+  },
+  "rustIntentionalDifference": {
+    "reason": "the Rust CLI has no proven operating-system sandbox and must not claim unrestricted safe execution",
+    "ask": { "fileChanges": "ask", "shell": "ask", "plugins": "ask" },
+    "auto-edit": { "fileChanges": "allow", "shell": "ask", "plugins": "ask" },
+    "wireEvent": "the shared permission/preset envelope is retained with Rust's closed preset names"
+  },
+  "latestMaster": {
+    "commit": "cd5ef8148158c3a752a658978873241fdf8e2bbc",
+    "semanticChange": "none for last-value preset replay, no-op switching, event ordering, model invisibility, and current-session durability"
+  }
+}

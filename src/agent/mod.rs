@@ -8,6 +8,8 @@ mod job_notice;
 #[cfg(test)]
 mod model_selection_tests;
 #[cfg(test)]
+mod permission_preset_tests;
+#[cfg(test)]
 mod phase6_tests;
 #[cfg(test)]
 mod phase7_tests;
@@ -49,11 +51,11 @@ use crate::{
         AppendError, AppendReceipt, ApprovalAskedEvent, ApprovalDecidedEvent, ApprovalOutcome,
         ApprovalRequestId, AttemptDisposition, AttemptResidentGuard, AttemptToken, BarrierError,
         ClaimedAppend, EpochHeader, EventClaim, EventKind, EventSeq, LlmRetryEvent,
-        LlmRetryStartedEvent, NewEvent, PROVIDER_TITLE_MAX_BYTES, PreparedAttempt, RequestContext,
-        RequestHeaderReason, RetryId, RetryNumber, Session, SessionForkError, SessionForker,
-        SessionId, SessionRawExportError, SessionReadError, SessionReservation, StepId,
-        SurfaceIntent, TOOL_OUTCOME_UNKNOWN, ToolFailure, ToolResultPrunePassCause,
-        TurnEndCancelCause, TurnEndReason, TurnId, normalize_title,
+        LlmRetryStartedEvent, NewEvent, PROVIDER_TITLE_MAX_BYTES, PermissionPreset,
+        PreparedAttempt, RequestContext, RequestHeaderReason, RetryId, RetryNumber, Session,
+        SessionForkError, SessionForker, SessionId, SessionRawExportError, SessionReadError,
+        SessionReservation, StepId, SurfaceIntent, TOOL_OUTCOME_UNKNOWN, ToolFailure,
+        ToolResultPrunePassCause, TurnEndCancelCause, TurnEndReason, TurnId, normalize_title,
     },
     skills::{SkillRuntime, SkillRuntimeError},
     time_context::TimeContextRuntime,
@@ -994,6 +996,45 @@ impl AgentLoop {
     pub(crate) fn current_model_selection(&self) -> Option<SessionModelSelection> {
         let prepared = self.provider.prepare_call(self.config.call.clone()).ok()?;
         Some(selection_from_call(prepared.config()))
+    }
+
+    /// Return the effective narrow permission preset used by this Agent.
+    pub(crate) fn current_permission_preset(&self) -> Option<PermissionPreset> {
+        if self.config.shell_policy != ShellPolicy::Ask
+            || self.config.plugin_policy != PluginPolicy::Ask
+        {
+            return None;
+        }
+        match self.config.file_change_policy {
+            FileChangePolicy::Ask => Some(PermissionPreset::Ask),
+            FileChangePolicy::Allow => Some(PermissionPreset::AutoEdit),
+            FileChangePolicy::Deny => None,
+        }
+    }
+
+    /// Persist and then install a safe permission preset for later tools.
+    pub(crate) async fn select_permission_preset(
+        &mut self,
+        preset: PermissionPreset,
+    ) -> Result<bool, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if self.current_permission_preset() == Some(preset) {
+            return Ok(false);
+        }
+        self.session.materialize_if_needed().await?;
+        self.session
+            .append_settled(NewEvent::log(EventKind::permission_preset(preset)))
+            .await?;
+        self.config.file_change_policy = match preset {
+            PermissionPreset::Ask => FileChangePolicy::Ask,
+            PermissionPreset::AutoEdit => FileChangePolicy::Allow,
+        };
+        Ok(true)
     }
 
     /// Select the route consumed by the next model assembly.

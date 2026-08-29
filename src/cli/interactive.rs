@@ -15,8 +15,8 @@ use crate::{
     goal::{GoalCommand, GoalError, GoalRound, GoalRuntime},
     plan_mode::{PlanModeCommand, PlanModeError, PlanModeRuntime},
     session::{
-        ApprovalOutcome, CommittedUiKind, CommittedUiReceiver, EventSeq, SessionForker,
-        SessionLogExporter, StoreError, TurnEndReason, TurnId, UiUserSource,
+        ApprovalOutcome, CommittedUiKind, CommittedUiReceiver, EventSeq, PermissionPreset,
+        SessionForker, SessionLogExporter, StoreError, TurnEndReason, TurnId, UiUserSource,
     },
     tui::{
         command_palette::{
@@ -58,8 +58,9 @@ use super::{
     identity::{new_session_id, prepare_goal_turn, prepare_injected_turn, prepare_user_turn},
     input::{
         CanonicalRecordParser, ForkCommand, IdleInput, InputRecordEvent, MAX_APPROVAL_RECORD_BYTES,
-        MAX_INTERACTIVE_PROMPT_BYTES, ModelCommand, RenameCommand, classify_idle_record,
-        parse_fork_command, parse_model_command, parse_rename_command,
+        MAX_INTERACTIVE_PROMPT_BYTES, ModelCommand, PermissionCommand, RenameCommand,
+        classify_idle_record, parse_fork_command, parse_model_command, parse_permission_command,
+        parse_rename_command,
     },
     live::{
         EnhancedPresenter, InteractivePresenter, LiveFrame, LiveLifecycle, LiveRenderer,
@@ -593,6 +594,7 @@ async fn run_enhanced(
                                 | EnhancedSubmission::Goal(_)
                                 | EnhancedSubmission::Plan(_)
                                 | EnhancedSubmission::Model(_)
+                                | EnhancedSubmission::Permission(_)
                                 | EnhancedSubmission::Rename(_)
                                 | EnhancedSubmission::CompactUsage
                                 | EnhancedSubmission::RefreshTitleUsage
@@ -658,7 +660,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/model [MODEL [off|high|max]] | /compact | /rename TITLE | /refresh-title | /export | /fork [event-seq] | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/model [MODEL [off|high|max]] | /permission [ask|auto-edit] | /compact | /rename TITLE | /refresh-title | /export | /fork [event-seq] | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -699,6 +701,15 @@ async fn run_enhanced(
                             }
                             CommandId::Model => {
                                 notice = Some(apply_model_command(&mut agent, ModelCommand::Show));
+                            }
+                            CommandId::Permission => {
+                                notice = Some(
+                                    apply_permission_command(
+                                        &mut agent,
+                                        PermissionCommand::Show,
+                                    )
+                                    .await,
+                                );
                             }
                             CommandId::Compact => {
                                 let (outcome, signal) =
@@ -765,6 +776,9 @@ async fn run_enhanced(
                         EnhancedSubmission::Plan(_) => return Err(InteractiveError::Agent),
                         EnhancedSubmission::Model(command) => {
                             notice = Some(apply_model_command(&mut agent, command));
+                        }
+                        EnhancedSubmission::Permission(command) => {
+                            notice = Some(apply_permission_command(&mut agent, command).await);
                         }
                         EnhancedSubmission::Rename(command) => {
                             apply_rename_command(&mut agent, command, &mut notice).await;
@@ -1276,6 +1290,7 @@ enum EnhancedSubmission {
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
     Model(ModelCommand),
+    Permission(PermissionCommand),
     Rename(RenameCommand),
     CompactUsage,
     RefreshTitleUsage,
@@ -1294,6 +1309,8 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         EnhancedSubmission::Rename(rename)
     } else if let Some(model) = parse_model_command(command) {
         EnhancedSubmission::Model(model)
+    } else if let Some(permission) = parse_permission_command(command) {
+        EnhancedSubmission::Permission(permission)
     } else if let Some(fork) = parse_fork_command(command) {
         EnhancedSubmission::Fork(fork)
     } else if let Some(goal) = GoalCommand::parse(command) {
@@ -1356,6 +1373,33 @@ fn apply_model_command(agent: &mut AgentLoop, command: ModelCommand) -> String {
                 }
             }
         }
+    }
+}
+
+async fn apply_permission_command(agent: &mut AgentLoop, command: PermissionCommand) -> String {
+    match command {
+        PermissionCommand::Show => match agent.current_permission_preset() {
+            Some(preset) => format!(
+                "Current permission · {} · available ask, auto-edit · Shell and plugins always ask",
+                preset.as_str()
+            ),
+            None => "Current permission unavailable.".to_owned(),
+        },
+        PermissionCommand::Usage => "Usage: /permission [ask|auto-edit]".to_owned(),
+        PermissionCommand::Select(preset) => match agent.select_permission_preset(preset).await {
+            Ok(changed) => {
+                let state = if changed { "selected" } else { "unchanged" };
+                let edit = match preset {
+                    PermissionPreset::Ask => "file changes ask",
+                    PermissionPreset::AutoEdit => "file changes allowed",
+                };
+                format!(
+                    "Permission {state} · {} · {edit} · Shell and plugins still ask",
+                    preset.as_str()
+                )
+            }
+            Err(_) => "Permission change unavailable. Current permission unchanged.".to_owned(),
+        },
     }
 }
 
@@ -2091,7 +2135,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/model [MODEL [off|high|max]] · /compact · /rename TITLE · /refresh-title · /export · /fork [event-seq] · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
+                "/model [MODEL [off|high|max]] · /permission [ask|auto-edit] · /compact · /rename TITLE · /refresh-title · /export · /fork [event-seq] · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -3158,6 +3202,22 @@ async fn run_linear(
                     }
                     IdleInput::Model(command) => {
                         let message = format!("[{}]\n", apply_model_command(&mut agent, command));
+                        if let Some(signal) =
+                            write_dynamic_notice(message, &mut presenter, &terminal, signals)
+                                .await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::Permission(command) => {
+                        let message = format!(
+                            "[{}]\n",
+                            apply_permission_command(&mut agent, command).await
+                        );
                         if let Some(signal) =
                             write_dynamic_notice(message, &mut presenter, &terminal, signals)
                                 .await?
@@ -6379,7 +6439,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/goal [objective|edit|pause|resume|clear] | /model waits for this turn | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /export waits for this turn | /fork waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/goal [objective|edit|pause|resume|clear] | /model waits for this turn | /permission waits for this turn | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /export waits for this turn | /fork waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -6413,6 +6473,13 @@ fn handle_active_input(
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
                                 "Model selection busy · wait for the current turn or press Ctrl+C"
+                                    .to_owned(),
+                            );
+                        }
+                        CommandId::Permission => {
+                            let _ = input.take_draft_for_turn()?;
+                            *notice = Some(
+                                "Permission selection busy · wait for the current turn or press Ctrl+C"
                                     .to_owned(),
                             );
                         }
@@ -6481,6 +6548,14 @@ fn handle_active_input(
                     let _ = input.take_draft_for_turn()?;
                     *notice = Some(
                         "Model selection busy · wait for the current turn or press Ctrl+C"
+                            .to_owned(),
+                    );
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::Permission(_) => {
+                    let _ = input.take_draft_for_turn()?;
+                    *notice = Some(
+                        "Permission selection busy · wait for the current turn or press Ctrl+C"
                             .to_owned(),
                     );
                     return Ok(ActiveInputOutcome::Redraw);
@@ -6586,7 +6661,7 @@ fn process_event(
         return if matches!(
             &event.kind,
             CommittedUiKind::TypeOnly {
-                event_type: "goal/change" | "plan/mode"
+                event_type: "goal/change" | "plan/mode" | "permission/preset"
             }
         ) {
             Ok(())
@@ -7747,7 +7822,7 @@ fn discard_ready_updates_after_stop(
             if matches!(
                 &event.kind,
                 CommittedUiKind::TypeOnly {
-                    event_type: "goal/change"
+                    event_type: "goal/change" | "permission/preset"
                 }
             ) {
                 skipped = skipped.saturating_add(1);

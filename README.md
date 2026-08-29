@@ -58,8 +58,9 @@ dsh --workspace .
 dsh --workspace . --approval-mode auto-edit
 ```
 
-该模式不自动批准 Shell 或插件，也不用于 `--prompt`/管道脚本；新进程和恢复会话默认
-回到 `ask`，需要时必须再次传入。
+该模式不自动批准 Shell 或插件，也不用于 `--prompt`/管道脚本。选择会写入当前会话，
+恢复时继续生效；空闲时可用 `/permission` 查看，并用 `/permission ask` 或
+`/permission auto-edit` 随时切换。显式启动参数会覆盖并保存恢复会话中的旧选择。
 
 需要定义、引用、实现或类型提示等精确代码导航时，可显式配置本机语言服务器：
 
@@ -95,7 +96,8 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 项目 Skills（实验性） | 有界发现工作区 `.dsh/skills` 和 `.agents/skills` 中的 Markdown Skill；模型先看到名称/描述目录，再用只读 `skill` 工具按需加载当前正文，无需审批 |
 | 历史会话导航（实验性） | 模型可用只读 `session_search` 找到同工作区已关闭会话，再搜索/精读事件，或用 `session_trace` / `session_event_trace` 查看父子会话和事件替换/来源关系；均有界、标记为非可信且无需审批 |
 | LSP 代码导航（实验性） | 显式 `--lsp-config` 后，模型可用只读 `lsp` 精确查询定义、引用、实现和 hover；源码、协议、输出、超时、取消和进程组清理均有上限，无需逐次审批 |
-| 文件修改 | 官方风格的完整文件 `write`、唯一/全部字面 `edit` 和 `str_replace_editor`，以及严格的单文件 `apply_patch`；它们都检查实际 diff、路径、符号链接和并发修改，默认审批，也可显式启用进程级 `auto-edit` |
+| 文件修改 | 官方风格的完整文件 `write`、唯一/全部字面 `edit` 和 `str_replace_editor`，以及严格的单文件 `apply_patch`；它们都检查实际 diff、路径、符号链接和并发修改，默认审批，也可为当前会话显式启用 `auto-edit` |
+| 权限预设（实验性） | 空闲时用 `/permission [ask|auto-edit]` 查看或切换并随会话恢复；`auto-edit` 只免去内置文件修改确认，Shell 和插件仍逐次询问，不代表沙箱或无限制权限 |
 | 命令执行 | 经审批的前台或进程内后台 `bash`，可显式记住完全相同模式的本进程调用；后台作业通过 `job_list` / `job_output` / `job_kill` 管理，输出、数量和运行时间均有上限，退出时统一回收进程组 |
 | 交互控制 | 实验性 Unicode 多行 Composer、忙时下一回合队列、动态 Dock、安全粘贴、6 套内置语义主题、可关闭的工作状态动画、源文本保持的有限表格、每个工具生命周期至多一张最终卡、回合收据、只读 Inspect/Review、审批、Ctrl+C 取消，以及严格线性后备 |
 | 模型提问（实验性） | 模型可暂停回合并显示 1–3 个单选、多选或自由文本问题；答案草稿可前后翻页修改，全部完成后继续当前回合 |
@@ -260,6 +262,8 @@ Enter 提交，线性界面每行输入一个数字进行切换、空行提交�
 `+N/-N`、hunk 数和完整语义 diff；看起来像 diff 的普通文本不会获得这种可信样式。
 `--approval-mode auto-edit` 只把已经完成上述安全准备的内置文件修改从 `Ask` 改为 `Allow`，
 不会绕过路径、链接、冲突、资源、取消或会话记录检查；Shell 和插件仍显示审批。
+空闲时的 `/permission auto-edit` 作用相同，并把选择写入当前会话；
+`/permission ask` 可恢复默认确认。
 
 “本进程允许”只在第一次前台命令成功退出并回收，或后台命令已经安全交给作业管理器，
 且对应结果写入会话后生效。之后命令、前台/后台模式、
@@ -453,7 +457,7 @@ dsh --resume session-550e8400-e29b-41d4-a716-446655440000 \
 | 边界 | `dsh` 的做法 |
 | --- | --- |
 | 文件访问 | 文件工具只接受启动工作区内经过规范化和权限检查的路径，并拒绝已知的路径逃逸和危险链接 |
-| 修改与执行 | 文件修改和 Shell 默认要求交互式审批；显式 `auto-edit` 只自动允许受限的内置补丁或精确文本编辑；交互式 Shell 可由用户记住完全相同的本进程调用，插件仍逐次询问；脚本模式直接拒绝这些副作用 |
+| 修改与执行 | 文件修改和 Shell 默认要求交互式审批；会话级 `auto-edit` 只自动允许受限的内置补丁或精确文本编辑；交互式 Shell 可由用户记住完全相同的本进程调用，插件仍逐次询问；脚本模式直接拒绝这些副作用 |
 | Shell | 获批的 Bash 是当前用户权限下的原生程序，**不是沙箱**，可以离开工作区、访问网络或修改其他文件；超过 64,000 字节的流会把已捕获内容写入 0600 私有临时文件 |
 | 联网搜索 | 无额外审批的只读 DeepSeek 搜索；查询会发送给 DeepSeek，结果按外部不可信数据处理，不支持 Cookie、重定向或任意 URL 抓取 |
 | 插件 | 显式配置的插件在启动时作为当前用户运行；环境最小化、协议和进程组有界，但审批不是系统隔离 |
@@ -474,7 +478,7 @@ Shell 清理；`dsh` 不把这些情况描述成沙箱保证。
 | 当前版本 | `0.1.0-alpha.0`，预发布 |
 | Phase 0–9 | 已完成：v0.1 源码安装候选、终端体验、离线验收和双平台矩阵均已通过 |
 | Phase 10 | 已完成：受限的本地子进程工具插件、两个真实示例和故障矩阵已通过双平台验收 |
-| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据、assistant 有限 Markdown/代码/围栏 diff/简单表格、真实补丁语义预览、只读 Inspect/Review、6 套内置语义主题、15 条本地命令面板、有界工作区文件建议、Reduced Motion 和 Session picker 已有生产路径；安装版截图与同候选双平台旅程已通过，真实终端模拟器验收未完成 |
+| Phase 11 | 进行中：语义投影、Unicode Composer、下一回合 FIFO、inline Dock、增强审批、最终工具卡、回合收据、assistant 有限 Markdown/代码/围栏 diff/简单表格、真实补丁语义预览、只读 Inspect/Review、6 套内置语义主题、16 条本地命令面板、有界工作区文件建议、Reduced Motion 和 Session picker 已有生产路径；安装版截图与同候选双平台旅程已通过，真实终端模拟器验收未完成 |
 | Phase 23 | 已完成：可恢复的 Plan Mode、增强/线性 `/plan`、完整计划审阅，以及只在下一模型步骤生效的批准退出；本阶段按要求仅做本机必要验证 |
 | Phase 24 | 已完成：有界模型任务列表、可恢复的 Session 投影、取消保护，以及增强/线性终端进度展示；本阶段按要求仅做本机必要验证 |
 | Phase 25 | 已完成：有界 `AGENTS.md`/`CLAUDE.md` 基线、持久化请求顺序和恢复时增改删对账；本阶段按要求仅做本机必要验证 |
@@ -532,8 +536,9 @@ Phase 0–10 的已发布候选已通过本地 macOS arm64 验收，以及 GitHu
 - `/export` 只导出当前会话的一份原始 `.jsonl`，不是官方包含子会话和媒体的 ZIP，也不能直接导入；日志可能包含提示词、工具输出或其他敏感内容，请妥善保管或删除；
 - `/fork` 只操作当前已打开的会话，且至少需要一个已完成回合；它不会自动切换终端、直接 fork 另一个冷会话、复制外部媒体或启动第二个 Agent，子会话仍需用提示中的 `dsh --resume` 打开；
 - `/model` 只配置当前进程里的单个 DeepSeek Agent，不提供多 Provider、远程目录、Web 选择器或全局默认设置；若切换后没有再发出模型请求就直接退出，这个尚未写入 `request/header` 的选择不会保存；活动回合中必须等当前回合结束后再切换；
+- `/permission` 只在 Agent 空闲时切换当前会话的 `ask` / `auto-edit`；它不提供官方 `danger-full-access`、自动 Shell/插件批准、全局默认或真实 OS 沙箱；
 - 自动压缩每个 turn 最多尝试一次摘要；手动 `/compact` 每次也只发一个有界摘要请求。两者都不保证摘要无损或事实完美；
-- Phase 11 的 Inspect 只保留当前回合，Review 只保留最近一个可信关联的摘要；它们不重建恢复点之前的历史，也不提供完整 canonical diff 或完整命令记录；主题选择只属于当前进程，恢复会话时重新使用 Adaptive，窄 Dock 可能截断主题列表；表格只支持上面列出的有限子集，命令面板也只包含上面列出的 15 条本地命令；文件建议只插入扫描时得到的相对路径字面量，不读取内容，也不保证文件在选择时仍存在；Session picker 会从已关闭且不超过 16 MiB 的严格日志读取最后标题，但不读取最后一条消息或统计最后活跃时间；`/refresh-title` 只使用第一条人工文本，不实现上游通用 all-messages Provider 或并发刷新 API；真实 iTerm/Terminal/VS Code 模拟器验收仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
+- Phase 11 的 Inspect 只保留当前回合，Review 只保留最近一个可信关联的摘要；它们不重建恢复点之前的历史，也不提供完整 canonical diff 或完整命令记录；主题选择只属于当前进程，恢复会话时重新使用 Adaptive，窄 Dock 可能截断主题列表；表格只支持上面列出的有限子集，命令面板也只包含上面列出的 16 条本地命令；文件建议只插入扫描时得到的相对路径字面量，不读取内容，也不保证文件在选择时仍存在；Session picker 会从已关闭且不超过 16 MiB 的严格日志读取最后标题，但不读取最后一条消息或统计最后活跃时间；`/refresh-title` 只使用第一条人工文本，不实现上游通用 all-messages Provider 或并发刷新 API；真实 iTerm/Terminal/VS Code 模拟器验收仍未完成；单帧展示超过软上限时会显示 `[assistant display omitted: presentation limit exceeded]`，但不会取消回合或删除 Session 事实；
 - Auto 暂不在 tmux、GNU Screen、Zellij、未知终端或初始小于 44×12 的窗口启用增强界面；已进入增强模式后可缩到 12×5，继续缩小会安全恢复并退出；
 - primary-screen resize/reflow/copy 目前只有确定性终端模型和 PTY 字节证据，真实 iTerm/Terminal/VS Code 矩阵仍待完成；
 - Windows 以及未列入发布矩阵的 Unix 平台尚未支持。

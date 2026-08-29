@@ -1,7 +1,7 @@
 use crate::{
     goal::{GoalCommand, GoalError},
     plan_mode::{PlanModeCommand, PlanModeError},
-    session::EventSeq,
+    session::{EventSeq, PermissionPreset},
     tui::{motion::MotionCommand, theme::ThemeCommand},
 };
 
@@ -34,6 +34,35 @@ pub(super) enum ModelCommand {
         effort: Option<ModelEffort>,
     },
     Usage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PermissionCommand {
+    Show,
+    Select(PermissionPreset),
+    Usage,
+}
+
+pub(super) fn parse_permission_command(command: &str) -> Option<PermissionCommand> {
+    if command == "/permission" {
+        return Some(PermissionCommand::Show);
+    }
+    let suffix = command.strip_prefix("/permission")?;
+    if !suffix.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let mut fields = suffix.split_whitespace();
+    let Some(preset) = fields.next() else {
+        return Some(PermissionCommand::Show);
+    };
+    if fields.next().is_some() {
+        return Some(PermissionCommand::Usage);
+    }
+    Some(match preset {
+        "ask" => PermissionCommand::Select(PermissionPreset::Ask),
+        "auto-edit" => PermissionCommand::Select(PermissionPreset::AutoEdit),
+        _ => PermissionCommand::Usage,
+    })
 }
 
 pub(super) fn parse_model_command(command: &str) -> Option<ModelCommand> {
@@ -206,6 +235,7 @@ pub(super) enum IdleInput {
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
     Model(ModelCommand),
+    Permission(PermissionCommand),
     Rename(RenameCommand),
     RefreshTitle,
     RefreshTitleUsage,
@@ -234,6 +264,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     }
     if let Some(model) = parse_model_command(command) {
         return IdleInput::Model(model);
+    }
+    if let Some(permission) = parse_permission_command(command) {
+        return IdleInput::Permission(permission);
     }
     if let Some(rename) = parse_rename_command(command) {
         return IdleInput::Rename(rename);
@@ -276,8 +309,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
 mod tests {
     use super::{
         CanonicalRecordParser, ForkCommand, IdleInput, InputRecordEvent, ModelCommand, ModelEffort,
-        RenameCommand, classify_idle_record,
+        PermissionCommand, RenameCommand, classify_idle_record,
     };
+    use crate::session::PermissionPreset;
     use crate::tui::{
         motion::{MotionCommand, MotionPreference},
         theme::{ThemeCommand, ThemePalette},
@@ -449,6 +483,32 @@ mod tests {
         assert_eq!(
             classify_idle_record(&format!("/model {}", "x".repeat(257)), true),
             IdleInput::Model(ModelCommand::Usage)
+        );
+        assert_eq!(
+            classify_idle_record(" /permission ", true),
+            IdleInput::Permission(PermissionCommand::Show)
+        );
+        assert_eq!(
+            classify_idle_record(" /permission auto-edit ", true),
+            IdleInput::Permission(PermissionCommand::Select(PermissionPreset::AutoEdit))
+        );
+        assert_eq!(
+            classify_idle_record("/permission ask", true),
+            IdleInput::Permission(PermissionCommand::Select(PermissionPreset::Ask))
+        );
+        for invalid in [
+            "/permission never",
+            "/permission AUTO-EDIT",
+            "/permission ask extra",
+        ] {
+            assert_eq!(
+                classify_idle_record(invalid, true),
+                IdleInput::Permission(PermissionCommand::Usage)
+            );
+        }
+        assert_eq!(
+            classify_idle_record("/permissions", true),
+            IdleInput::Submit("/permissions".to_owned())
         );
         assert_eq!(
             classify_idle_record(" /fork ", true),

@@ -435,8 +435,8 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
     dsh.expect(b"/quit");
     dsh.expect(b"/goal");
     dsh.expect(b"/model");
+    dsh.expect(b"/permission");
     dsh.expect(b"/compact");
-    dsh.expect(b"/rename");
     dsh.expect("Enter complete · Esc close".as_bytes());
     dsh.write(b"\x1b[A");
     dsh.expect(b"> /exit");
@@ -4046,7 +4046,111 @@ fn resumed_project_skill_catalog_appends_a_complete_replacement_before_provider_
 }
 
 #[test]
-fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
+fn runtime_permission_switch_keeps_shell_guarded_and_can_restore_ask() {
+    let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
+    let second_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-middle\n+new\n";
+    let server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-runtime-auto-edit",
+            "apply_patch",
+            serde_json::json!({ "patch": first_patch }),
+        ),
+        text_sse("runtime auto edit finished"),
+        tool_sse(
+            "call-runtime-shell",
+            "bash",
+            serde_json::json!({
+                "command": "printf DSH_PERMISSION_SHELL",
+                "description": "prove Shell still asks"
+            }),
+        ),
+        text_sse("guarded shell finished"),
+        tool_sse(
+            "call-runtime-ask-edit",
+            "apply_patch",
+            serde_json::json!({ "patch": second_patch }),
+        ),
+        text_sse("restored ask finished"),
+    ]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let target = workspace.0.join("note.txt");
+    std::fs::write(&target, "old\n").unwrap();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"/permission\r");
+    dsh.expect(b"Current permission");
+    dsh.expect(b"ask");
+    dsh.write(b"/permission never\r");
+    dsh.expect(b"Usage: /permission [ask|auto-edit]");
+    dsh.write(b"/permission auto-edit\r");
+    dsh.expect(b"Permission selected");
+    dsh.expect(b"file changes allowed");
+
+    dsh.write(b"apply the prepared edit\r");
+    dsh.expect(b"Updated  note.txt");
+    dsh.expect(b"runtime auto edit finished");
+    dsh.expect(b"Turn complete");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "middle\n");
+
+    let guarded_turn = dsh.checkpoint();
+    dsh.write(b"try the guarded shell\r");
+    dsh.approval_ready();
+    dsh.write(b"\r");
+    dsh.expect(b"Rejected");
+    dsh.expect(b"guarded shell finished");
+    dsh.expect_after(guarded_turn, b"Turn complete");
+    dsh.expect_after(guarded_turn, b"Ready");
+
+    dsh.write(b"/permission ask\r");
+    dsh.expect(b"Permission selected");
+    dsh.expect(b"file changes ask");
+    dsh.write(b"try the second prepared edit\r");
+    dsh.approval_ready_occurrence(2);
+    dsh.write(b"\r");
+    dsh.expect(b"Rejected");
+    dsh.expect(b"restored ask finished");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    let requests = server.finish();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "middle\n");
+    assert_eq!(requests.len(), 6);
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let rows = std::fs::read_to_string(entry.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let presets = rows
+        .iter()
+        .filter(|row| row["type"] == "permission/preset")
+        .map(|row| row["data"]["preset"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(presets, ["auto-edit", "ask"]);
+    let auto_edit = rows
+        .iter()
+        .position(|row| row["type"] == "permission/preset" && row["data"]["preset"] == "auto-edit")
+        .unwrap();
+    let first_call = rows
+        .iter()
+        .position(|row| row["type"] == "tool/call")
+        .unwrap();
+    assert!(auto_edit < first_call);
+}
+
+#[test]
+fn auto_edit_is_persisted_resume_keeps_it_and_explicit_ask_overrides() {
     let first_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-old\n+middle\n";
     let first_server = SequenceSseServer::start(vec![
         tool_sse(
@@ -4091,6 +4195,11 @@ fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let filename = entries[0].file_name().into_string().unwrap();
     let session_id = filename.strip_suffix(".jsonl").unwrap().to_owned();
     let journal = std::fs::read(entries[0].path()).unwrap();
+    assert!(
+        journal
+            .windows(b"\"type\":\"permission/preset\"".len())
+            .any(|row| row == b"\"type\":\"permission/preset\"")
+    );
     for event in [
         b"\"type\":\"approval/asked\"".as_slice(),
         b"\"type\":\"approval/decided\"".as_slice(),
@@ -4101,32 +4210,79 @@ fn auto_edit_is_not_persisted_and_resume_returns_to_ask() {
     let second_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-middle\n+new\n";
     let second_server = SequenceSseServer::start(vec![
         tool_sse(
-            "call-resumed-ask",
+            "call-resumed-auto-edit",
             "apply_patch",
             serde_json::json!({ "patch": second_patch }),
         ),
-        text_sse("resume ask restored"),
+        text_sse("resume auto edit kept"),
     ]);
     let mut resumed = PtyHarness::spawn_resume_color_cargo(
         &second_server.base_url,
         &caller_workspace.0,
-        session_root,
+        session_root.clone(),
         &session_id,
     );
     resumed.expect("❯".as_bytes());
-    resumed.write(b"prove approval mode reset\r");
-    resumed.approval_ready();
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "middle\n");
-    resumed.write(b"\r");
-    resumed.expect(b"Rejected");
-    resumed.expect(b"resume ask restored");
+    resumed.write(b"prove approval mode persisted\r");
+    resumed.expect(b"Updated  note.txt");
+    resumed.expect(b"resume auto edit kept");
     resumed.expect(b"Turn complete");
     let (status, _) = resumed.exit_cleanly();
     let requests = second_server.finish();
 
     assert!(status.success());
-    assert_eq!(std::fs::read_to_string(&target).unwrap(), "middle\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
     assert_eq!(requests.len(), 2);
+
+    let third_patch = "--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-new\n+final\n";
+    let third_server = SequenceSseServer::start(vec![
+        tool_sse(
+            "call-explicit-ask",
+            "apply_patch",
+            serde_json::json!({ "patch": third_patch }),
+        ),
+        text_sse("explicit ask restored"),
+    ]);
+    let mut overridden = PtyHarness::spawn_resume_color_with_approval_mode_cargo(
+        &third_server.base_url,
+        &caller_workspace.0,
+        session_root,
+        &session_id,
+        "ask",
+    );
+    overridden.expect("❯".as_bytes());
+    overridden.write(b"prove explicit ask override\r");
+    overridden.approval_ready();
+    overridden.write(b"\r");
+    overridden.expect(b"Rejected");
+    overridden.expect(b"explicit ask restored");
+    overridden.expect(b"Turn complete");
+    let (status, _) = overridden.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert_eq!(third_server.finish().len(), 2);
+}
+
+#[test]
+fn linear_permission_command_is_plain_and_model_invisible() {
+    let server = SequenceSseServer::start(Vec::new());
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"/permission auto-edit\r");
+    dsh.expect(b"[Permission selected");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    dsh.write(b"/permission\r");
+    dsh.expect(b"[Current permission");
+    dsh.expect(b"auto-edit");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    let (status, transcript) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert!(!transcript.contains(&0x1b));
+    assert!(server.finish().is_empty());
 }
 
 #[test]

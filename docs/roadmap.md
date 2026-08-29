@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–52 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–53 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -60,6 +60,7 @@ for behavior that users can run today.
 | 50 | Safe current-Session raw log export | `complete` | [`validation/phase-50.md`](validation/phase-50.md) |
 | 51 | Completed-turn current-Session fork | `complete` | [`validation/phase-51.md`](validation/phase-51.md) |
 | 52 | Idle Session model and reasoning-effort selection | `complete` | [`validation/phase-52.md`](validation/phase-52.md) |
+| 53 | Durable safe permission presets | `complete` | [`validation/phase-53.md`](validation/phase-53.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -191,6 +192,24 @@ remote catalog refresh, global default settings, image-capability negotiation,
 or the official Web popup. A selection that is never consumed by a later model
 request is process-local and is lost on exit, matching the upstream rule that
 Session durability begins when a request header consumes it.
+
+## Phase 53 boundary (2026-08-29)
+
+Phase 53 adds idle `/permission [ask|auto-edit]` with a durable, log-only
+`permission/preset` Session fact. `ask` retains confirmation for file changes,
+Shell and plugins. `auto-edit` allows ordinary file-changing tools without a
+prompt but deliberately leaves Shell and plugin policies at Ask. It does not
+claim or add an operating-system sandbox.
+
+The latest valid preset survives resume and fork. An omitted startup flag uses
+that Session value; an explicit `--approval-mode` overrides and durably records
+it before any turn or tool side effect. Re-selecting the effective value is a
+no-op. The command is model-invisible and idle-only; active enhanced input is
+consumed locally as busy.
+
+This phase does not expose official `danger-full-access`, automatic Shell or
+plugin approval, a deployment-wide default, arbitrary custom bundles, sandbox
+events, or a Web permission picker.
 
 ## Phase 8 revised boundary (2026-08-18)
 

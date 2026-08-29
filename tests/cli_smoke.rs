@@ -747,7 +747,7 @@ fn help_describes_only_available_options() {
         assert!(help.contains("--workspace"));
         assert!(help.contains("--approval-mode <MODE>"));
         assert!(help.contains("--time-zone <IANA_ZONE>"));
-        assert!(help.contains("ask (default) or auto-edit"));
+        assert!(help.contains("ask or auto-edit (resume: stored)"));
         assert!(help.contains("--resume [SESSION_ID]"));
         assert!(help.contains("resume: stored model"));
         assert!(help.contains("resume: optional identity check"));

@@ -1172,6 +1172,25 @@ impl LlmRetryStartedEvent {
     }
 }
 
+/// Safe permission bundle selected for one Session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PermissionPreset {
+    #[default]
+    Ask,
+    AutoEdit,
+}
+
+impl PermissionPreset {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AutoEdit => "auto-edit",
+        }
+    }
+}
+
 /// One-shot answer to a durable approval question.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1364,6 +1383,9 @@ pub enum EventKind {
     PlanMode {
         change: crate::plan_mode::PlanModeChange,
     },
+    PermissionPreset {
+        preset: PermissionPreset,
+    },
     SessionTitle {
         title: super::SessionTitleEvent,
     },
@@ -1499,6 +1521,12 @@ impl EventKind {
         Self::PlanMode { change }
     }
 
+    /// Construct one durable, model-invisible permission selection.
+    #[must_use]
+    pub(crate) fn permission_preset(preset: PermissionPreset) -> Self {
+        Self::PermissionPreset { preset }
+    }
+
     #[must_use]
     pub fn session_title(title: super::SessionTitleEvent) -> Self {
         Self::SessionTitle { title }
@@ -1565,6 +1593,7 @@ impl EventKind {
             Self::TodoWrite { .. } => "todo/write",
             Self::GoalChange { .. } => "goal/change",
             Self::PlanMode { .. } => "plan/mode",
+            Self::PermissionPreset { .. } => "permission/preset",
             Self::SessionTitle { .. } => "session/title",
             Self::SessionTitleLlmRequest { .. } => "session/title-llm-request",
             Self::RequestHeader { .. } => "request/header",
@@ -1596,6 +1625,7 @@ impl EventKind {
             Self::TodoWrite { .. } => "todo/write",
             Self::GoalChange { .. } => "goal/change",
             Self::PlanMode { .. } => "plan/mode",
+            Self::PermissionPreset { .. } => "permission/preset",
             Self::SessionTitle { .. } => "session/title",
             Self::SessionTitleLlmRequest { .. } => "session/title-llm-request",
             Self::RequestHeader { .. } => "request/header",

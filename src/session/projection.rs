@@ -302,6 +302,7 @@ pub struct SessionState {
     request_context: Option<super::RequestContext>,
     goal: GoalReplayState,
     plan_mode_active: bool,
+    permission_preset: Option<super::PermissionPreset>,
     standing_todos: Option<Arc<Vec<TodoItem>>>,
     session_title: Option<super::SessionTitleEvent>,
     session_title_llm_requested: bool,
@@ -383,6 +384,12 @@ impl SessionState {
         self.plan_mode_active
     }
 
+    /// Latest explicit safe permission preset, or `None` for a legacy/default Session.
+    #[must_use]
+    pub const fn permission_preset(&self) -> Option<super::PermissionPreset> {
+        self.permission_preset
+    }
+
     #[must_use]
     pub fn standing_todos(&self) -> Option<&[TodoItem]> {
         self.standing_todos.as_deref().map(Vec::as_slice)
@@ -420,6 +427,7 @@ pub(crate) struct Projection {
     request_context_seq: Option<EventSeq>,
     goal: GoalReplayState,
     plan_mode_active: bool,
+    permission_preset: Option<super::PermissionPreset>,
     standing_todos: Option<Arc<Vec<TodoItem>>>,
     session_title: Option<super::SessionTitleEvent>,
     session_title_llm_requested: bool,
@@ -680,6 +688,7 @@ impl Projection {
             request_context_seq: None,
             goal: GoalReplayState::default(),
             plan_mode_active: false,
+            permission_preset: None,
             standing_todos: None,
             session_title: None,
             session_title_llm_requested: false,
@@ -1140,6 +1149,7 @@ impl Projection {
             request_context: self.request_context.clone(),
             goal: self.goal.clone(),
             plan_mode_active: self.plan_mode_active,
+            permission_preset: self.permission_preset,
             standing_todos: self.standing_todos.clone(),
             session_title: self.session_title.clone(),
             session_title_llm_requested: self.session_title_llm_requested,
@@ -2241,6 +2251,9 @@ impl Projection {
             }
             EventKind::PlanMode { change } => {
                 self.plan_mode_active = change.active();
+            }
+            EventKind::PermissionPreset { preset } => {
+                self.permission_preset = Some(*preset);
             }
             EventKind::SessionTitle { title } => {
                 self.session_title = Some(title.clone());
@@ -3456,6 +3469,7 @@ impl EventKind {
             Self::TodoWrite { .. } => "todo/write",
             Self::GoalChange { .. } => "goal/change",
             Self::PlanMode { .. } => "plan/mode",
+            Self::PermissionPreset { .. } => "permission/preset",
             Self::SessionTitle { .. } => "session/title",
             Self::SessionTitleLlmRequest { .. } => "session/title-llm-request",
             Self::RequestHeader { .. } => "request/header",

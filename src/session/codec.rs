@@ -317,6 +317,9 @@ fn decode_kind(
         "plan/mode" => EventKind::PlanMode {
             change: payload!(crate::plan_mode::PlanModeChange),
         },
+        "permission/preset" => EventKind::PermissionPreset {
+            preset: payload!(PermissionPresetData).preset,
+        },
         "session/title" => EventKind::SessionTitle {
             title: payload!(super::SessionTitleEvent),
         },
@@ -483,6 +486,9 @@ pub(crate) fn kind_data_value(kind: &EventKind) -> Result<Value, serde_json::Err
         EventKind::TodoWrite { todos } => serde_json::to_value(TodoWriteRef { todos }),
         EventKind::GoalChange { change } => serde_json::to_value(change),
         EventKind::PlanMode { change } => serde_json::to_value(change),
+        EventKind::PermissionPreset { preset } => {
+            serde_json::to_value(PermissionPresetRef { preset })
+        }
         EventKind::SessionTitle { title } => serde_json::to_value(title),
         EventKind::SessionTitleLlmRequest { request } => serde_json::to_value(request),
         EventKind::RequestHeader { header, reason } => {
@@ -607,6 +613,17 @@ struct TodoWriteData {
 #[derive(Serialize)]
 struct TodoWriteRef<'a> {
     todos: &'a [TodoItem],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PermissionPresetData {
+    preset: super::PermissionPreset,
+}
+
+#[derive(Serialize)]
+struct PermissionPresetRef<'a> {
+    preset: &'a super::PermissionPreset,
 }
 
 #[derive(Deserialize)]

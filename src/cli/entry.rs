@@ -51,7 +51,7 @@ const HELP: &str = concat!(
     "      --lsp-config <PATH>      Enable explicitly configured local language servers\n",
     "      --time-zone <IANA_ZONE>  Add durable per-step time context in this zone\n",
     "      --tui <MODE>             Terminal UI: auto (default), enhanced, or linear\n",
-    "      --approval-mode <MODE>   Interactive edits: ask (default) or auto-edit\n",
+    "      --approval-mode <MODE>   Interactive edits: ask or auto-edit (resume: stored)\n",
     "      --reduced-motion         Disable periodic enhanced-UI animation\n",
     "      --no-color               Disable color and force the linear terminal UI\n",
     "      --list-sessions          List persisted sessions and titles\n",
@@ -329,7 +329,7 @@ fn run_options(options: CliOptions) -> Result<u8, EntryError> {
                 prepared,
                 model,
                 interactive,
-                approval_mode,
+                approval_mode_explicit.then_some(approval_mode),
                 AssemblyExtensions::new(plugin_config, lsp_config, time_context),
                 startup_cancellation.clone(),
             ),
@@ -729,7 +729,7 @@ mod tests {
         assert!(HELP.contains("--tui <MODE>"));
         assert!(HELP.contains("--approval-mode <MODE>"));
         assert!(HELP.contains("--lsp-config <PATH>"));
-        assert!(HELP.contains("ask (default) or auto-edit"));
+        assert!(HELP.contains("ask or auto-edit (resume: stored)"));
         assert!(HELP.contains("auto (default), enhanced, or linear"));
         assert!(HELP.contains("force the linear terminal UI"));
         assert!(HELP.contains("resume: stored model"));

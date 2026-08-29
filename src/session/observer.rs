@@ -1078,6 +1078,9 @@ impl CommittedUiEvent {
             EventKind::PlanMode { .. } => CommittedUiKind::TypeOnly {
                 event_type: "plan/mode",
             },
+            EventKind::PermissionPreset { .. } => CommittedUiKind::TypeOnly {
+                event_type: "permission/preset",
+            },
             EventKind::RequestHeader { .. } => CommittedUiKind::TypeOnly {
                 event_type: "request/header",
             },

@@ -4,7 +4,8 @@ use deepseek_harness_cli::{
     model::{Message, MessageRole},
     session::{
         Clock, ClockError, CodecError, EventKind, EventSeq, EventValidationError, HeaderError,
-        ReplayError, Session, SessionError, SessionHeader, SurfaceError, TurnId, UnixMillis,
+        PermissionPreset, ReplayError, Session, SessionError, SessionHeader, SurfaceError, TurnId,
+        UnixMillis,
     },
 };
 use serde_json::{Value, json};
@@ -68,6 +69,39 @@ fn plan_mode_events_round_trip_and_reject_unknown_payload_fields() {
         }
     ]));
     assert!(Session::from_json(&malformed, IncrementingClock::new(20)).is_err());
+}
+
+#[test]
+fn permission_preset_round_trips_folds_last_value_and_stays_off_surface() {
+    let snapshot = minimal_snapshot(json!([
+        { "type": "permission/preset", "seq": 0, "time": 11, "data": { "preset": "auto-edit" } },
+        { "type": "permission/preset", "seq": 1, "time": 12, "data": { "preset": "ask" } }
+    ]));
+    let session = Session::from_json(&snapshot, IncrementingClock::new(20)).unwrap();
+
+    assert_eq!(
+        session.state().permission_preset(),
+        Some(PermissionPreset::Ask)
+    );
+    assert!(session.state().surface_nodes().is_empty());
+    assert!(session.messages().is_empty());
+    let encoded: Value = serde_json::from_str(&session.to_json().unwrap()).unwrap();
+    assert_eq!(encoded["events"][0]["type"], "permission/preset");
+    assert_eq!(
+        encoded["events"][0]["data"],
+        json!({ "preset": "auto-edit" })
+    );
+
+    for data in [
+        json!({ "preset": "never" }),
+        json!({ "preset": "AUTO-EDIT" }),
+        json!({ "preset": "ask", "extra": true }),
+    ] {
+        let malformed = minimal_snapshot(json!([
+            { "type": "permission/preset", "seq": 0, "time": 11, "data": data }
+        ]));
+        assert!(Session::from_json(&malformed, IncrementingClock::new(20)).is_err());
+    }
 }
 
 #[test]
