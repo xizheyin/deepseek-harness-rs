@@ -434,9 +434,9 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
     dsh.expect(b"/exit");
     dsh.expect(b"/quit");
     dsh.expect(b"/goal");
+    dsh.expect(b"/model");
     dsh.expect(b"/compact");
     dsh.expect(b"/rename");
-    dsh.expect(b"/refresh-title");
     dsh.expect("Enter complete · Esc close".as_bytes());
     dsh.write(b"\x1b[A");
     dsh.expect(b"> /exit");
@@ -930,7 +930,7 @@ fn active_palette_theme_and_unknown_slash_keep_the_next_turn_fifo_truthful() {
     dsh.expect_after(help, b"/help");
     server.assert_no_second_request(Duration::from_millis(150));
     dsh.write(b"\r");
-    dsh.expect_after(help, b"/inspect | /review | /focus");
+    dsh.expect_after(help, b"/model waits for this turn");
     server.assert_no_second_request(Duration::from_millis(150));
 
     let themed = dsh.checkpoint();
@@ -3530,6 +3530,85 @@ fn linear_past_end_fork_is_local_and_zero_ansi() {
     let (status, transcript) = dsh.exit_cleanly();
     assert!(status.success());
     assert_eq!(server.finish().len(), 1);
+    assert!(!transcript.contains(&0x1b));
+}
+
+#[test]
+fn enhanced_model_selection_is_used_by_the_next_request_and_linear_resume() {
+    let first_server = SequenceSseServer::start(vec![text_sse("Selected model response.")]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut dsh = PtyHarness::spawn_color_with_session_root_cargo(
+        &first_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    dsh.expect("❯".as_bytes());
+    dsh.write(b"/model\r");
+    dsh.expect(b"Current model");
+    dsh.expect(b"deepseek-v4-flash");
+    dsh.expect(b"effort high");
+    dsh.write(b"/model private-preview medium\r");
+    dsh.expect(b"Usage: /model MODEL [off|high|max]");
+    dsh.write(b"/model deepseek-v4-pro max\r");
+    dsh.expect(b"Model selected for next request");
+    dsh.expect(b"deepseek-v4-pro");
+    dsh.expect(b"effort max");
+    dsh.write(b"use the selected model\r");
+    dsh.expect(b"Selected model response.");
+    dsh.expect(b"Turn complete");
+    let (status, _) = dsh.exit_cleanly();
+    assert!(status.success());
+
+    let requests = first_server.finish();
+    assert_eq!(requests.len(), 1);
+    let request = request_json(&requests[0]);
+    assert_eq!(request["model"], "deepseek-v4-pro");
+    assert_eq!(request["reasoning_effort"], "max");
+
+    let journal = only_session_journal(session_root.path());
+    let rows = journal_rows(&journal);
+    let session_id = rows[0]["id"].as_str().unwrap().to_owned();
+    let headers = rows
+        .iter()
+        .filter(|row| row["type"] == "request/header")
+        .collect::<Vec<_>>();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0]["data"]["reason"], "initial");
+    assert_eq!(
+        headers[0]["data"]["header"]["config"]["model"],
+        "deepseek-v4-pro"
+    );
+    assert_eq!(
+        headers[0]["data"]["header"]["config"]["reasoningEffort"],
+        "max"
+    );
+
+    let resumed_server = SequenceSseServer::start(vec![text_sse("Resumed selected model.")]);
+    let mut resumed = PtyHarness::spawn_resume(
+        &resumed_server.base_url,
+        &workspace.0,
+        session_root,
+        &session_id,
+    );
+    resumed.expect(b"dsh > ");
+    resumed.write(b"/model\r");
+    resumed.expect(b"[Current model");
+    resumed.expect(b"deepseek-v4-pro");
+    resumed.expect(b"effort max");
+    resumed.expect_occurrences(b"dsh > ", 2);
+    resumed.write(b"continue with the stored selection\r");
+    resumed.expect(b"Resumed selected model.");
+    resumed.expect(b"[done]");
+    resumed.expect_occurrences(b"dsh > ", 3);
+    let (status, transcript) = resumed.exit_cleanly();
+    assert!(status.success());
+    let resumed_requests = resumed_server.finish();
+    assert_eq!(resumed_requests.len(), 1);
+    let resumed_request = request_json(&resumed_requests[0]);
+    assert_eq!(resumed_request["model"], "deepseek-v4-pro");
+    assert_eq!(resumed_request["reasoning_effort"], "max");
     assert!(!transcript.contains(&0x1b));
 }
 

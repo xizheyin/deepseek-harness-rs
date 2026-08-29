@@ -7,6 +7,65 @@ use crate::{
 
 pub(super) const MAX_INTERACTIVE_PROMPT_BYTES: usize = 1_000;
 pub(super) const MAX_APPROVAL_RECORD_BYTES: usize = 64;
+pub(super) const MAX_MODEL_ID_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ModelEffort {
+    Off,
+    High,
+    Max,
+}
+
+impl ModelEffort {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ModelCommand {
+    Show,
+    Select {
+        model: String,
+        effort: Option<ModelEffort>,
+    },
+    Usage,
+}
+
+pub(super) fn parse_model_command(command: &str) -> Option<ModelCommand> {
+    if command == "/model" {
+        return Some(ModelCommand::Show);
+    }
+    let suffix = command.strip_prefix("/model")?;
+    if !suffix.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let mut fields = suffix.split_whitespace();
+    let Some(model) = fields.next() else {
+        return Some(ModelCommand::Show);
+    };
+    if model.len() > MAX_MODEL_ID_BYTES || model.chars().any(char::is_control) {
+        return Some(ModelCommand::Usage);
+    }
+    let effort = match fields.next() {
+        None => None,
+        Some("off") => Some(ModelEffort::Off),
+        Some("high") => Some(ModelEffort::High),
+        Some("max") => Some(ModelEffort::Max),
+        Some(_) => return Some(ModelCommand::Usage),
+    };
+    if fields.next().is_some() {
+        return Some(ModelCommand::Usage);
+    }
+    Some(ModelCommand::Select {
+        model: model.to_owned(),
+        effort,
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RenameCommand {
@@ -146,6 +205,7 @@ pub(super) enum IdleInput {
     Motion(MotionCommand),
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
+    Model(ModelCommand),
     Rename(RenameCommand),
     RefreshTitle,
     RefreshTitleUsage,
@@ -171,6 +231,9 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     }
     if let Some(plan) = PlanModeCommand::parse(command) {
         return IdleInput::Plan(plan);
+    }
+    if let Some(model) = parse_model_command(command) {
+        return IdleInput::Model(model);
     }
     if let Some(rename) = parse_rename_command(command) {
         return IdleInput::Rename(rename);
@@ -212,8 +275,8 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
 #[cfg(test)]
 mod tests {
     use super::{
-        CanonicalRecordParser, ForkCommand, IdleInput, InputRecordEvent, RenameCommand,
-        classify_idle_record,
+        CanonicalRecordParser, ForkCommand, IdleInput, InputRecordEvent, ModelCommand, ModelEffort,
+        RenameCommand, classify_idle_record,
     };
     use crate::tui::{
         motion::{MotionCommand, MotionPreference},
@@ -355,6 +418,38 @@ mod tests {
             IdleInput::RefreshTitle
         );
         assert_eq!(classify_idle_record(" /export ", true), IdleInput::Export);
+        assert_eq!(
+            classify_idle_record(" /model ", true),
+            IdleInput::Model(ModelCommand::Show)
+        );
+        assert_eq!(
+            classify_idle_record(" /model private-preview max ", true),
+            IdleInput::Model(ModelCommand::Select {
+                model: "private-preview".to_owned(),
+                effort: Some(ModelEffort::Max),
+            })
+        );
+        assert_eq!(
+            classify_idle_record(" /model deepseek-v4-pro ", true),
+            IdleInput::Model(ModelCommand::Select {
+                model: "deepseek-v4-pro".to_owned(),
+                effort: None,
+            })
+        );
+        for invalid in [
+            "/model model medium",
+            "/model model HIGH",
+            "/model model high extra",
+        ] {
+            assert_eq!(
+                classify_idle_record(invalid, true),
+                IdleInput::Model(ModelCommand::Usage)
+            );
+        }
+        assert_eq!(
+            classify_idle_record(&format!("/model {}", "x".repeat(257)), true),
+            IdleInput::Model(ModelCommand::Usage)
+        );
         assert_eq!(
             classify_idle_record(" /fork ", true),
             IdleInput::Fork(ForkCommand::Latest)

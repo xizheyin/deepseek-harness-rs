@@ -6,6 +6,8 @@ mod compaction;
 mod error;
 mod job_notice;
 #[cfg(test)]
+mod model_selection_tests;
+#[cfg(test)]
 mod phase6_tests;
 #[cfg(test)]
 mod phase7_tests;
@@ -35,8 +37,8 @@ use crate::{
     goal::{GoalWrapup, PreparedGoalMutation},
     model::{
         CallId, ContentBlock, ContentBlockKind, FinishReasonKind, JsonValue, LlmCallConfig,
-        LlmFailure, Message, MessageRole, MessageSource, MessageSourceKind, StreamChunkKind,
-        ToolSchema,
+        LlmFailure, Message, MessageRole, MessageSource, MessageSourceKind, ReasoningEffortId,
+        StreamChunkKind, ToolSchema,
     },
     plan_mode::{PlanModeRuntime, PreparedPlanModeMutation},
     provider::{
@@ -830,6 +832,23 @@ pub(crate) enum ManualSessionForkOutcome {
     Failed,
 }
 
+/// Effective Session-local route shown after an idle model selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionModelSelection {
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: Option<String>,
+}
+
+/// User-facing result of one side-effect-free idle model selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualModelSelectionOutcome {
+    Selected {
+        selection: SessionModelSelection,
+        changed: bool,
+    },
+    Unavailable,
+}
+
 /// Stateful owner of one session and its request-header lifecycle.
 pub struct AgentLoop {
     session: Session,
@@ -969,6 +988,65 @@ impl AgentLoop {
         runtime: WorkspaceInstructionRuntime,
     ) {
         self.workspace_instructions = Some(runtime);
+    }
+
+    /// Resolve the effective route without opening a request or reading credentials.
+    pub(crate) fn current_model_selection(&self) -> Option<SessionModelSelection> {
+        let prepared = self.provider.prepare_call(self.config.call.clone()).ok()?;
+        Some(selection_from_call(prepared.config()))
+    }
+
+    /// Select the route consumed by the next model assembly.
+    ///
+    /// Like upstream `session.selectModel`, this is intentionally not durable
+    /// until a later request header consumes the choice.
+    pub(crate) fn select_model(
+        &mut self,
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<ManualModelSelectionOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        let requested = match LlmCallConfig::from_parts(
+            self.config.call.provider().to_owned(),
+            model.to_owned(),
+            reasoning_effort.map(ReasoningEffortId::new),
+            self.config.call.temperature(),
+            self.config.call.max_tokens(),
+            self.config.call.stop().map(<[String]>::to_vec),
+        ) {
+            Ok(requested) => requested,
+            Err(_) => return Ok(ManualModelSelectionOutcome::Unavailable),
+        };
+        let prepared = match self.provider.prepare_call(requested.clone()) {
+            Ok(prepared) => prepared,
+            Err(_) => return Ok(ManualModelSelectionOutcome::Unavailable),
+        };
+        // Host `selectModel` returns the resolved default effort. Preserve that
+        // exact choice rather than letting a later Provider-default change
+        // reinterpret an already accepted command.
+        let selected =
+            match requested.with_reasoning_effort_if_absent(prepared.config().reasoning_effort()) {
+                Ok(selected) => selected,
+                Err(_) => return Ok(ManualModelSelectionOutcome::Unavailable),
+            };
+        let mut candidate = self.config.clone();
+        candidate.call = selected.clone();
+        if candidate.validate_fixed_request_size().is_err() {
+            return Ok(ManualModelSelectionOutcome::Unavailable);
+        }
+        let changed = !self.config.call.equivalent_to(&selected);
+        if changed {
+            self.config.call = selected.clone();
+        }
+        Ok(ManualModelSelectionOutcome::Selected {
+            selection: selection_from_call(&selected),
+            changed,
+        })
     }
 
     /// Install the read-only project Skill runtime used for both catalog
@@ -6273,7 +6351,16 @@ fn proposed_config(
     if header_logged {
         if let Some(previous) = previous {
             let defaults = previous.adapter_defaults.clone().unwrap_or_default();
-            return Ok(previous.config.without_adapter_defaults(&defaults)?);
+            let prior_proposal = previous.config.without_adapter_defaults(&defaults)?;
+            // Most turns keep using the already logged proposal. An idle
+            // `/model` command is the one supported mutation of `config.call`;
+            // when it differs, let the normal header comparison append a
+            // `change` before the next Provider dispatch.
+            return Ok(if config.call.equivalent_to(&prior_proposal) {
+                prior_proposal
+            } else {
+                config.call.clone()
+            });
         }
         return Ok(config.call.clone());
     }
@@ -6294,6 +6381,15 @@ fn proposed_config(
     Ok(config
         .call
         .with_reasoning_effort_if_absent(explicit_effort)?)
+}
+
+fn selection_from_call(call: &LlmCallConfig) -> SessionModelSelection {
+    SessionModelSelection {
+        model: call.model().to_owned(),
+        reasoning_effort: call
+            .reasoning_effort()
+            .map(|effort| effort.as_str().to_owned()),
+    }
 }
 
 fn next_id(runtime: &dyn AgentRuntime, kind: AgentIdKind) -> Result<String, AgentRuntimeError> {

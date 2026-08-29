@@ -1241,15 +1241,15 @@ mod tests {
                 24,
                 80,
                 vec![
-                    "/review", "/focus", "/theme", "/motion", "/exit", "/quit", "/goal",
-                    "/compact", "/rename",
+                    "/review", "/focus", "/theme", "/motion", "/exit", "/quit", "/goal", "/model",
+                    "/compact",
                 ],
             ),
             (
                 15,
                 80,
                 vec![
-                    "/focus", "/theme", "/motion", "/exit", "/quit", "/goal", "/compact",
+                    "/focus", "/theme", "/motion", "/exit", "/quit", "/goal", "/model",
                 ],
             ),
             (12, 80, vec!["/motion", "/exit", "/quit", "/goal"]),

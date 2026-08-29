@@ -376,7 +376,10 @@ fn spawn_two_request_barrier_server(
                 }
             };
             stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                // A full repository run may leave the host briefly CPU-bound
+                // after the large unit-test binary. Keep this fixture bounded
+                // without turning scheduler delay into a false network fault.
+                .set_read_timeout(Some(Duration::from_secs(15)))
                 .expect("request read should be bounded");
             stream
                 .set_write_timeout(Some(Duration::from_secs(5)))

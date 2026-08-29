@@ -8,8 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{
-        AgentLoop, ManualCompactionOutcome, ManualSessionExportOutcome, ManualSessionForkOutcome,
-        ManualTitleRefreshOutcome,
+        AgentLoop, ManualCompactionOutcome, ManualModelSelectionOutcome,
+        ManualSessionExportOutcome, ManualSessionForkOutcome, ManualTitleRefreshOutcome,
     },
     entropy::EntropySource,
     goal::{GoalCommand, GoalError, GoalRound, GoalRuntime},
@@ -58,8 +58,8 @@ use super::{
     identity::{new_session_id, prepare_goal_turn, prepare_injected_turn, prepare_user_turn},
     input::{
         CanonicalRecordParser, ForkCommand, IdleInput, InputRecordEvent, MAX_APPROVAL_RECORD_BYTES,
-        MAX_INTERACTIVE_PROMPT_BYTES, RenameCommand, classify_idle_record, parse_fork_command,
-        parse_rename_command,
+        MAX_INTERACTIVE_PROMPT_BYTES, ModelCommand, RenameCommand, classify_idle_record,
+        parse_fork_command, parse_model_command, parse_rename_command,
     },
     live::{
         EnhancedPresenter, InteractivePresenter, LiveFrame, LiveLifecycle, LiveRenderer,
@@ -592,6 +592,7 @@ async fn run_enhanced(
                                 | EnhancedSubmission::Motion(_)
                                 | EnhancedSubmission::Goal(_)
                                 | EnhancedSubmission::Plan(_)
+                                | EnhancedSubmission::Model(_)
                                 | EnhancedSubmission::Rename(_)
                                 | EnhancedSubmission::CompactUsage
                                 | EnhancedSubmission::RefreshTitleUsage
@@ -657,7 +658,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/compact | /rename TITLE | /refresh-title | /export | /fork [event-seq] | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/model [MODEL [off|high|max]] | /compact | /rename TITLE | /refresh-title | /export | /fork [event-seq] | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -695,6 +696,9 @@ async fn run_enhanced(
                                     &mut notice,
                                 )
                                 .await;
+                            }
+                            CommandId::Model => {
+                                notice = Some(apply_model_command(&mut agent, ModelCommand::Show));
                             }
                             CommandId::Compact => {
                                 let (outcome, signal) =
@@ -759,6 +763,9 @@ async fn run_enhanced(
                             apply_goal_command(&mut agent, &goal, command, &mut notice).await;
                         }
                         EnhancedSubmission::Plan(_) => return Err(InteractiveError::Agent),
+                        EnhancedSubmission::Model(command) => {
+                            notice = Some(apply_model_command(&mut agent, command));
+                        }
                         EnhancedSubmission::Rename(command) => {
                             apply_rename_command(&mut agent, command, &mut notice).await;
                         }
@@ -1268,6 +1275,7 @@ enum EnhancedSubmission {
     Motion(MotionCommand),
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
+    Model(ModelCommand),
     Rename(RenameCommand),
     CompactUsage,
     RefreshTitleUsage,
@@ -1284,6 +1292,8 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         EnhancedSubmission::Command(command)
     } else if let Some(rename) = parse_rename_command(command) {
         EnhancedSubmission::Rename(rename)
+    } else if let Some(model) = parse_model_command(command) {
+        EnhancedSubmission::Model(model)
     } else if let Some(fork) = parse_fork_command(command) {
         EnhancedSubmission::Fork(fork)
     } else if let Some(goal) = GoalCommand::parse(command) {
@@ -1311,6 +1321,41 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         EnhancedSubmission::Motion(motion)
     } else {
         EnhancedSubmission::Prompt
+    }
+}
+
+fn apply_model_command(agent: &mut AgentLoop, command: ModelCommand) -> String {
+    match command {
+        ModelCommand::Show => match agent.current_model_selection() {
+            Some(selection) => format!(
+                "Current model · {} · effort {} · suggested deepseek-v4-flash, deepseek-v4-pro · efforts off/high/max",
+                selection.model,
+                selection
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("provider default")
+            ),
+            None => "Current model unavailable.".to_owned(),
+        },
+        ModelCommand::Usage => "Usage: /model MODEL [off|high|max]".to_owned(),
+        ModelCommand::Select { model, effort } => {
+            match agent.select_model(&model, effort.map(|value| value.as_str())) {
+                Ok(ManualModelSelectionOutcome::Selected { selection, changed }) => {
+                    let state = if changed { "selected" } else { "unchanged" };
+                    format!(
+                        "Model {state} for next request · {} · effort {}",
+                        selection.model,
+                        selection
+                            .reasoning_effort
+                            .as_deref()
+                            .unwrap_or("provider default")
+                    )
+                }
+                Ok(ManualModelSelectionOutcome::Unavailable) | Err(_) => {
+                    "Model selection unavailable. Current model unchanged.".to_owned()
+                }
+            }
+        }
     }
 }
 
@@ -2046,7 +2091,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/compact · /rename TITLE · /refresh-title · /export · /fork [event-seq] · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
+                "/model [MODEL [off|high|max]] · /compact · /rename TITLE · /refresh-title · /export · /fork [event-seq] · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -3100,6 +3145,19 @@ async fn run_linear(
                             "[{}]\n",
                             notice.as_deref().unwrap_or("Plan Mode state unavailable")
                         );
+                        if let Some(signal) =
+                            write_dynamic_notice(message, &mut presenter, &terminal, signals)
+                                .await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::Model(command) => {
+                        let message = format!("[{}]\n", apply_model_command(&mut agent, command));
                         if let Some(signal) =
                             write_dynamic_notice(message, &mut presenter, &terminal, signals)
                                 .await?
@@ -6321,7 +6379,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /export waits for this turn | /fork waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/goal [objective|edit|pause|resume|clear] | /model waits for this turn | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /export waits for this turn | /fork waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -6350,6 +6408,13 @@ fn handle_active_input(
                         CommandId::Goal => {
                             let _ = input.take_draft_for_turn()?;
                             apply_active_goal_command(goal, Ok(GoalCommand::Show), notice);
+                        }
+                        CommandId::Model => {
+                            let _ = input.take_draft_for_turn()?;
+                            *notice = Some(
+                                "Model selection busy · wait for the current turn or press Ctrl+C"
+                                    .to_owned(),
+                            );
                         }
                         CommandId::Compact => {
                             let _ = input.take_draft_for_turn()?;
@@ -6408,6 +6473,14 @@ fn handle_active_input(
                     let _ = input.take_draft_for_turn()?;
                     *notice = Some(
                         "Plan Mode error · wait for the current turn or press Ctrl+C before changing mode"
+                            .to_owned(),
+                    );
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::Model(_) => {
+                    let _ = input.take_draft_for_turn()?;
+                    *notice = Some(
+                        "Model selection busy · wait for the current turn or press Ctrl+C"
                             .to_owned(),
                     );
                     return Ok(ActiveInputOutcome::Redraw);

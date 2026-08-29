@@ -410,14 +410,33 @@ fn select_call(
     previous: Option<&crate::session::EpochHeader>,
     requested_model: Option<String>,
 ) -> Result<LlmCallConfig, crate::model::ModelError> {
+    let preserve_explicit_effort = requested_model.is_none();
     let model = requested_model
         .as_deref()
         .or_else(|| previous.map(|header| header.config.model()))
         .unwrap_or(DEFAULT_MODEL);
-    // Provider defaults and adapter-owned values are resolved afresh. Resume
-    // reuses only the stored model name; it never freezes an old materialized
-    // default or routes a hand-written journal to a non-DeepSeek Provider.
-    LlmCallConfig::new(DEEPSEEK_PROVIDER, model)
+    let reasoning_effort = preserve_explicit_effort
+        .then_some(previous)
+        .flatten()
+        .filter(|header| {
+            header
+                .adapter_defaults
+                .as_ref()
+                .is_none_or(|defaults| defaults.reasoning_effort.is_none())
+        })
+        .and_then(|header| header.config.reasoning_effort())
+        .cloned();
+    // Provider defaults are resolved afresh, while a user-selected effort is
+    // part of the Session route and must survive resume. A new `--model`
+    // override clears that prior effort and uses the new model's default.
+    LlmCallConfig::from_parts(
+        DEEPSEEK_PROVIDER.to_owned(),
+        model.to_owned(),
+        reasoning_effort,
+        None,
+        None,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -462,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_model_selection_does_not_freeze_old_provider_defaults() {
+    fn resumed_model_selection_preserves_only_explicit_effort() {
         let previous = EpochHeader {
             config: serde_json::from_value(serde_json::json!({
                 "provider": "foreign-provider",
@@ -473,6 +492,38 @@ mod tests {
             }))
             .unwrap(),
             adapter_defaults: None,
+            system: None,
+            tools: None,
+        };
+
+        let explicit = EpochHeader {
+            config: serde_json::from_value(serde_json::json!({
+                "provider": "deepseek-official",
+                "model": "stored-model",
+                "reasoningEffort": "max",
+                "maxTokens": 123
+            }))
+            .unwrap(),
+            adapter_defaults: Some(crate::model::LlmCallConfigAdapterDefaults {
+                reasoning_effort: None,
+                max_tokens: Some(crate::model::TrueMarker),
+            }),
+            system: None,
+            tools: None,
+        };
+
+        let materialized_default = EpochHeader {
+            config: serde_json::from_value(serde_json::json!({
+                "provider": "deepseek-official",
+                "model": "stored-model",
+                "reasoningEffort": "high",
+                "maxTokens": 123
+            }))
+            .unwrap(),
+            adapter_defaults: Some(crate::model::LlmCallConfigAdapterDefaults {
+                reasoning_effort: Some(crate::model::TrueMarker),
+                max_tokens: Some(crate::model::TrueMarker),
+            }),
             system: None,
             tools: None,
         };
@@ -494,5 +545,20 @@ mod tests {
                 LlmCallConfig::new(DEEPSEEK_PROVIDER, expected_model).unwrap()
             );
         }
+
+        let resumed = select_call(Some(&explicit), None).unwrap();
+        assert_eq!(
+            resumed.reasoning_effort().map(|effort| effort.as_str()),
+            Some("max")
+        );
+        assert_eq!(resumed.max_tokens(), None);
+
+        let overridden = select_call(Some(&explicit), Some("override".to_owned())).unwrap();
+        assert_eq!(overridden.model(), "override");
+        assert_eq!(overridden.reasoning_effort(), None);
+
+        let defaulted = select_call(Some(&materialized_default), None).unwrap();
+        assert_eq!(defaulted.model(), "stored-model");
+        assert_eq!(defaulted.reasoning_effort(), None);
     }
 }

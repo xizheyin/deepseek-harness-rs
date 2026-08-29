@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–51 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–52 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -59,6 +59,7 @@ for behavior that users can run today.
 | 49 | Explicit cancellable Session title refresh | `complete` | [`validation/phase-49.md`](validation/phase-49.md) |
 | 50 | Safe current-Session raw log export | `complete` | [`validation/phase-50.md`](validation/phase-50.md) |
 | 51 | Completed-turn current-Session fork | `complete` | [`validation/phase-51.md`](validation/phase-51.md) |
+| 52 | Idle Session model and reasoning-effort selection | `complete` | [`validation/phase-52.md`](validation/phase-52.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -166,6 +167,30 @@ Phase 51 does not add product subagents, fork a different cold Session directly,
 copy external attachments, create a shared live Agent, or allow a model tool to
 fork. Resume validates the child through the existing strict recovery path;
 forking creates no parent conversation event, model request, tool or approval.
+
+## Phase 52 boundary (2026-08-29)
+
+Phase 52 adds idle terminal `/model`, `/model MODEL` and
+`/model MODEL EFFORT`. The no-argument form reports the current effective
+DeepSeek selection and the built-in advisory choices. A selection accepts one
+bounded model id, including an unlisted pass-through id, plus optional exact
+`off`, `high` or `max` effort. It is validated synchronously by the configured
+Provider and replaces only the selection used by the next model assembly.
+
+Selection creates no turn, message, model request, tool, approval or immediate
+Session event. The next real request records the chosen route through the
+existing `request/header`; after that, ordinary Session recovery preserves it.
+An invalid selection leaves the prior one untouched. A selection made after a
+request is recorded with reason `change`, while the first request remains
+`initial`. The command is idle-only because this terminal owns one mutable
+Agent; an active-turn attempt reports busy instead of altering an already
+assembled step or entering the prompt queue.
+
+This phase remains DeepSeek-only and does not add a Provider marketplace,
+remote catalog refresh, global default settings, image-capability negotiation,
+or the official Web popup. A selection that is never consumed by a later model
+request is process-local and is lost on exit, matching the upstream rule that
+Session durability begins when a request header consumes it.
 
 ## Phase 8 revised boundary (2026-08-18)
 

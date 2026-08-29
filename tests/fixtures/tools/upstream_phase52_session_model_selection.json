@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "deepseek-ai/deepseek-harness",
+    "commit": "47f943859bef60e4160492346772ded9b24f765a",
+    "agentImplementation": "packages/core/agent/src/model-selection.ts",
+    "agentTests": "packages/core/agent/tests/model-selection.spec.ts",
+    "hostImplementation": "packages/host/apiproxy/src/api-proxy.ts",
+    "hostTests": "packages/host/apiproxy/tests/api-proxy-models.spec.ts",
+    "clientContract": "packages/client/ui-model-selection/README.md"
+  },
+  "contract": {
+    "scope": "one live ordinary Session",
+    "selection": ["provider", "model", "optional reasoningEffort"],
+    "assemblyBoundary": "selection is snapshotted before one step assembles its request",
+    "catalog": "advisory; an unlisted model on a served Provider is accepted",
+    "durability": "selection becomes durable only when a later request/header consumes it",
+    "modelVisibility": "selection adds no prompt content or conversation event",
+    "failure": "invalid selection preserves the prior selection"
+  },
+  "cases": [
+    {
+      "name": "unlisted_model_with_explicit_effort",
+      "before": { "provider": "deepseek-official", "model": "deepseek-v4-flash" },
+      "select": { "provider": "deepseek-official", "model": "private-preview", "reasoningEffort": "max" },
+      "selected": { "provider": "deepseek-official", "model": "private-preview", "reasoningEffort": "max" },
+      "currentStep": "unchanged",
+      "nextAssembly": "selected"
+    },
+    {
+      "name": "omitted_effort_uses_provider_default",
+      "select": { "provider": "deepseek-official", "model": "deepseek-v4-pro" },
+      "selected": { "provider": "deepseek-official", "model": "deepseek-v4-pro", "reasoningEffort": "high" }
+    },
+    {
+      "name": "unsupported_effort",
+      "select": { "provider": "deepseek-official", "model": "private-preview", "reasoningEffort": "medium" },
+      "error": "model-unavailable",
+      "selectionAfter": "unchanged"
+    },
+    {
+      "name": "durable_only_after_request",
+      "selectEvent": null,
+      "nextRequestEvent": "request/header",
+      "nextResumeSelection": "selected"
+    }
+  ],
+  "latestMaster": {
+    "commit": "cd5ef8148158c3a752a658978873241fdf8e2bbc",
+    "implementation": "packages/api/session-controller/src/commands.ts",
+    "tests": "packages/api/session-controller/tests/session-models.host.spec.ts",
+    "semanticChange": "image compatibility moved to prompt admission; text model selection, validation, snapshot and request-header durability remain"
+  }
+}

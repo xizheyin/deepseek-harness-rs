@@ -2618,3 +2618,44 @@ an existing title. The current parent stays open and the terminal prints a
 resume command. Direct cold-source RPC, Web selection, subagent workspace
 attachment, attachments and automatic current-session switching remain out of
 scope.
+
+## Phase 52 Session model selection — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The focused fixed-commit evidence
+is:
+
+- `packages/core/agent/src/model-selection.ts` and
+  `tests/model-selection.spec.ts` for atomically snapshotting provider, model
+  and optional effort at prompt assembly, so a concurrent selection affects a
+  later step rather than splitting one step's prompt variables and request;
+- `packages/host/apiproxy/src/api-proxy.ts`, its `models`/`selectModel`
+  methods, and `tests/api-proxy-models.spec.ts` for side-effect-free resolution,
+  default-effort materialization, advisory-unlisted model acceptance,
+  unsupported-effort failure, prior-selection preservation and default-save
+  failure not undoing the Session-local choice;
+- `packages/client/ui-model-selection/README.md` and its plugin tests for the
+  `/model` entry, Provider-grouped advisory choices, no prompt content, and the
+  rule that a choice becomes Session-durable only when a later request header
+  consumes it;
+- `packages/llm/llm-deepseek/src/{index,adapter}.ts` and adapter tests for the
+  default `deepseek-v4-flash`/`deepseek-v4-pro` catalog, unlisted model
+  pass-through, `off`/`high`/`max`, and default `high` effort when thinking is
+  enabled.
+
+Freshly fetched `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Current
+`packages/api/session-controller/src/commands.ts` and
+`tests/session-models.host.spec.ts` retain the same text-selection validation,
+advisory catalog, next-assembly snapshot and request-header durability. The
+focused current change allows switching to text-only models while older or
+pending image facts exist and instead rejects an incompatible image at prompt
+admission; Rust has no image-input terminal path, so this does not change the
+Phase 52 text contract.
+
+Rust Phase 52 maps the Web selector to idle terminal `/model [MODEL [EFFORT]]`
+on its one DeepSeek Agent. The Provider validates and resolves the selection
+without network I/O; the Agent keeps it process-local until its next real
+request appends the existing `request/header`. Dynamic multi-Provider catalog
+aggregation, remote refresh, a global saved default, image capability routing
+and the Web popup remain outside this CLI boundary.
