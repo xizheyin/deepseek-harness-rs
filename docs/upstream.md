@@ -2507,3 +2507,36 @@ Fresh `origin/master` remains
 remain present. Rust maps the service method to idle `/rename <TITLE>` on the
 current Agent. Its single Session writer cancels and joins the owned auxiliary
 title task before appending the same bounded user event.
+
+## Phase 49 explicit Session title refresh — 2026-08-29
+
+The semantic baseline remains fixed at
+`47f943859bef60e4160492346772ded9b24f765a`. The focused fixed-commit evidence
+is:
+
+- `packages/session/session-title/src/index.ts` and
+  `tests/{rename,service-contracts,provider,persistence}.spec.ts` for explicit
+  unpin, empty input, fallback-only behavior, caller cancellation, newest
+  overlapping revision, provider failure and durable folding;
+- `packages/session/session-title-first-prompt-llm/src/index.ts` and
+  `tests/provider.spec.ts` for selecting only the first eligible human message
+  even when refresh follows later prompts;
+- `packages/session/session-title-llm/src/index.ts` for the existing bounded
+  request, stream and accepted-output contract.
+
+Official refresh returns no title without eligible human text. With no active
+provider it re-derives the first-message fallback only when needed to unpin a
+user title. With a provider it supersedes older work, propagates caller
+cancellation, ensures a fallback, and accepts a provider result only if its
+revision is still current. Provider failure rejects the explicit call while
+leaving the prior title latest. The shipped first-prompt LLM adapter continues
+to select only the first eligible message during explicit refresh.
+
+Fresh `origin/master` remains
+`cd5ef8148158c3a752a658978873241fdf8e2bbc`. Its only diff in these focused
+paths changes optional projection-cache registration from `schema/view` to the
+new `stateSchema/wire.viewSchema` shape; refresh behavior and tests are
+unchanged. Rust Phase 49 maps this service behavior to serialized idle terminal
+`/refresh-title`, retains one 4096-byte first-prompt projection for durable
+resume, and keeps overlapping/remote service calls outside its single-writer
+CLI boundary.

@@ -794,6 +794,16 @@ pub(crate) enum ManualCompactionOutcome {
     Failed,
 }
 
+/// User-facing result of one idle explicit Session-title refresh.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManualTitleRefreshOutcome {
+    NoHistory,
+    Unchanged { title: String },
+    Refreshed { title: String },
+    Cancelled,
+    Failed,
+}
+
 /// Stateful owner of one session and its request-header lifecycle.
 pub struct AgentLoop {
     session: Session,
@@ -1031,6 +1041,32 @@ impl AgentLoop {
             .rename(&mut self.session, title)
             .await
             .map(Some)
+    }
+
+    /// Explicitly retry or unpin the current Session's first-prompt title.
+    pub(crate) async fn refresh_session_title(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<ManualTitleRefreshOutcome, AgentLoopError> {
+        if self.poisoned {
+            return Err(AgentLoopError::Poisoned);
+        }
+        if self.session.state().open_turn().is_some() {
+            return Err(AgentLoopError::SessionNotIdle);
+        }
+        if cancellation.is_cancelled() {
+            return Ok(ManualTitleRefreshOutcome::Cancelled);
+        }
+        let state = self.session.state();
+        let Some((seq, text)) = state.session_title_first_prompt() else {
+            return Ok(ManualTitleRefreshOutcome::NoHistory);
+        };
+        let text = text.to_owned();
+        let config = self.config.call.clone();
+        self.session.materialize_if_needed().await?;
+        self.session_titles
+            .refresh(&mut self.session, &config, seq, text, cancellation)
+            .await
     }
 
     /// Run one standalone `/compact` transaction without opening an Agent turn.

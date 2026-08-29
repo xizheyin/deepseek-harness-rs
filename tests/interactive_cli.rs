@@ -428,7 +428,6 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
 
     dsh.write(b"/");
     dsh.expect(b"> /quit");
-    dsh.expect(b"/review");
     dsh.expect(b"/focus");
     dsh.expect(b"/theme");
     dsh.expect(b"/motion");
@@ -437,6 +436,7 @@ fn enhanced_command_palette_navigation_resize_and_same_read_exit_are_fenced() {
     dsh.expect(b"/goal");
     dsh.expect(b"/compact");
     dsh.expect(b"/rename");
+    dsh.expect(b"/refresh-title");
     dsh.expect("Enter complete · Esc close".as_bytes());
     dsh.write(b"\x1b[A");
     dsh.expect(b"> /exit");
@@ -3251,6 +3251,88 @@ fn manual_rename_works_in_the_linear_fallback_without_a_model_request() {
     assert!(status.success());
     assert!(server.finish().is_empty());
     assert!(!transcript.contains(&0x1b));
+}
+
+#[test]
+fn fallback_title_refresh_works_in_the_linear_terminal_without_an_extra_request() {
+    let server = SequenceSseServer::start(vec![text_sse("Linear refresh response.")]);
+    let workspace = TestWorkspace::new();
+    let mut dsh = PtyHarness::spawn(&server.base_url, &workspace.0);
+
+    dsh.expect(b"dsh > ");
+    dsh.write(b"Restore the first title in linear mode please\r");
+    dsh.expect(b"assistant | Linear refresh response.");
+    dsh.expect(b"[done]");
+    dsh.expect_occurrences(b"dsh > ", 2);
+    dsh.write(b"/rename Temporary linear title\r");
+    dsh.expect(b"[Session renamed");
+    dsh.expect_occurrences(b"dsh > ", 3);
+    dsh.write(b"/refresh-title\r");
+    dsh.expect(b"[Session title refreshed");
+    dsh.expect(b"Restore the first title in");
+    dsh.expect_occurrences(b"dsh > ", 4);
+    let (status, transcript) = dsh.exit_cleanly();
+
+    assert!(status.success());
+    assert_eq!(server.finish().len(), 1);
+    assert!(!transcript.contains(&0x1b));
+}
+
+#[test]
+fn fallback_title_refresh_replays_the_first_prompt_after_resume() {
+    let first_server = SequenceSseServer::start(vec![text_sse("Durable refresh response.")]);
+    let workspace = TestWorkspace::new();
+    let session_root = TestSessionRoot::new();
+    let mut first = PtyHarness::spawn_color_with_session_root_cargo(
+        &first_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+    );
+
+    first.expect("❯".as_bytes());
+    first.write(b"Restore this durable first title please\r");
+    first.expect(b"Durable refresh response.");
+    first.expect(b"Turn complete");
+    first.write(b"/rename Temporary durable title\r");
+    first.expect(b"Session renamed");
+    let (status, _) = first.exit_cleanly();
+    assert!(status.success());
+    assert_eq!(first_server.finish().len(), 1);
+
+    let entry = std::fs::read_dir(session_root.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let filename = entry.file_name().into_string().unwrap();
+    let session_id = filename.strip_suffix(".jsonl").unwrap().to_owned();
+    let second_server = SequenceSseServer::start(Vec::new());
+    let mut resumed = PtyHarness::spawn_resume_color_cargo(
+        &second_server.base_url,
+        &workspace.0,
+        session_root.clone(),
+        &session_id,
+    );
+    resumed.expect("❯".as_bytes());
+    resumed.write(b"/refresh-title\r");
+    resumed.expect(b"Session title refreshed");
+    resumed.expect(b"Restore this durable first title");
+    let (status, _) = resumed.exit_cleanly();
+    assert!(status.success());
+    assert!(second_server.finish().is_empty());
+
+    let latest_title = std::fs::read_to_string(session_root.path().join(filename))
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|row| row["type"] == "session/title")
+        .next_back()
+        .unwrap();
+    assert_eq!(
+        latest_title["data"]["title"],
+        "Restore this durable first title"
+    );
+    assert_eq!(latest_title["data"]["source"]["kind"], "fallback");
 }
 
 #[test]

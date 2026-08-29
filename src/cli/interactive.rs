@@ -7,7 +7,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::{AgentLoop, ManualCompactionOutcome},
+    agent::{AgentLoop, ManualCompactionOutcome, ManualTitleRefreshOutcome},
     goal::{GoalCommand, GoalError, GoalRound, GoalRuntime},
     plan_mode::{PlanModeCommand, PlanModeError, PlanModeRuntime},
     session::{
@@ -586,6 +586,7 @@ async fn run_enhanced(
                                 | EnhancedSubmission::Plan(_)
                                 | EnhancedSubmission::Rename(_)
                                 | EnhancedSubmission::CompactUsage
+                                | EnhancedSubmission::RefreshTitleUsage
                         );
                     let (mut draft, mut cursor) = if job_wake {
                         (String::new(), 0)
@@ -646,7 +647,7 @@ async fn run_enhanced(
                         EnhancedSubmission::Command(command) => match command {
                             CommandId::Help => {
                                 notice = Some(
-                                    "/compact | /rename TITLE | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
+                                    "/compact | /rename TITLE | /refresh-title | /goal [objective|edit|pause|resume|clear] | /plan [message|off] | /inspect | /review | /focus | /theme | /motion | /help | /exit | /quit | Ctrl+O inspect"
                                         .to_owned(),
                                 );
                             }
@@ -701,6 +702,14 @@ async fn run_enhanced(
                                 )
                                 .await;
                             }
+                            CommandId::RefreshTitle => {
+                                let (outcome, signal) =
+                                    run_title_refresh(&mut agent, signals).await?;
+                                notice = Some(title_refresh_notice(&outcome));
+                                if !matches!(signal, None | Some(UiSignal::Interrupt)) {
+                                    pending_signal = signal;
+                                }
+                            }
                             CommandId::Exit | CommandId::Quit => {
                                 break Ok(InteractiveExit::Ordinary(0));
                             }
@@ -720,6 +729,9 @@ async fn run_enhanced(
                         }
                         EnhancedSubmission::CompactUsage => {
                             notice = Some("Usage: /compact (no arguments)".to_owned());
+                        }
+                        EnhancedSubmission::RefreshTitleUsage => {
+                            notice = Some("Usage: /refresh-title (no arguments)".to_owned());
                         }
                         EnhancedSubmission::Prompt => {
                             let prompt = copy_enhanced_prompt(&draft)?;
@@ -1207,6 +1219,7 @@ enum EnhancedSubmission {
     Plan(Result<PlanModeCommand, PlanModeError>),
     Rename(RenameCommand),
     CompactUsage,
+    RefreshTitleUsage,
     Prompt,
 }
 
@@ -1227,6 +1240,11 @@ fn classify_enhanced_submission(prompt: &str) -> EnhancedSubmission {
         .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
     {
         EnhancedSubmission::CompactUsage
+    } else if command
+        .strip_prefix("/refresh-title")
+        .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+    {
+        EnhancedSubmission::RefreshTitleUsage
     } else if let Some(theme) = ThemeCommand::parse(command) {
         EnhancedSubmission::Theme(theme)
     } else if let Some(motion) = MotionCommand::parse(command) {
@@ -1273,6 +1291,49 @@ fn manual_compaction_notice(outcome: &ManualCompactionOutcome) -> String {
         }
         ManualCompactionOutcome::Cancelled => "Compaction cancelled.".to_owned(),
         ManualCompactionOutcome::Failed => "Compaction failed. Conversation unchanged.".to_owned(),
+    }
+}
+
+async fn run_title_refresh(
+    agent: &mut AgentLoop,
+    signals: &mut SignalStreams,
+) -> Result<(ManualTitleRefreshOutcome, Option<UiSignal>), InteractiveError> {
+    let cancellation = CancellationToken::new();
+    let future = agent.refresh_session_title(cancellation.clone());
+    tokio::pin!(future);
+    let mut stopped = SignalLatch::default();
+    let result = loop {
+        tokio::select! {
+            biased;
+            result = &mut future => break result,
+            signal = signals.next() => {
+                stopped.observe(DriverMode::Interactive, signal);
+                cancellation.cancel();
+            }
+        }
+    };
+    signals.drain_ready(DriverMode::Interactive, &mut stopped);
+    Ok((
+        result.map_err(|_| InteractiveError::Agent)?,
+        stopped.observed(),
+    ))
+}
+
+fn title_refresh_notice(outcome: &ManualTitleRefreshOutcome) -> String {
+    match outcome {
+        ManualTitleRefreshOutcome::NoHistory => {
+            "No direct human prompt is available for a title yet.".to_owned()
+        }
+        ManualTitleRefreshOutcome::Unchanged { title } => {
+            format!("Session title unchanged · {title}")
+        }
+        ManualTitleRefreshOutcome::Refreshed { title } => {
+            format!("Session title refreshed · {title}")
+        }
+        ManualTitleRefreshOutcome::Cancelled => "Title refresh cancelled.".to_owned(),
+        ManualTitleRefreshOutcome::Failed => {
+            "Title refresh failed. Current title unchanged.".to_owned()
+        }
     }
 }
 
@@ -1832,7 +1893,7 @@ fn apply_enhanced_key(
         Key::Newline => input.insert_newline()?,
         Key::Char('?') if input.composer().is_empty() => {
             *notice = Some(
-                "/compact · /rename TITLE · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
+                "/compact · /rename TITLE · /refresh-title · /goal · /plan [message|off] · /inspect · /review · /focus · /theme · /motion · /help · /exit · /quit · Enter send · Ctrl+J newline"
                     .to_owned(),
             );
             return Ok(EnhancedInputAction::Redraw);
@@ -2913,6 +2974,28 @@ async fn run_linear(
                             }
                         }
                     }
+                    IdleInput::RefreshTitle => {
+                        let (outcome, signal) = run_title_refresh(&mut agent, signals).await?;
+                        let message = format!("[{}]\n", title_refresh_notice(&outcome));
+                        if let Some(write_signal) =
+                            write_dynamic_notice(message, &mut presenter, &terminal, signals)
+                                .await?
+                        {
+                            if let Some(write_signal) =
+                                handle_idle_signal(write_signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(write_signal));
+                            }
+                        }
+                        if let Some(signal) = signal.filter(|signal| *signal != UiSignal::Interrupt)
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
                     IdleInput::Compact => {
                         let (outcome, signal) = run_manual_compaction(&mut agent, signals).await?;
                         let message = format!("[{}]\n", manual_compaction_notice(&outcome));
@@ -2938,6 +3021,22 @@ async fn run_linear(
                     IdleInput::CompactUsage => {
                         if let Some(signal) = write_notice(
                             "[Usage: /compact (no arguments)]\n",
+                            &mut presenter,
+                            &terminal,
+                            signals,
+                        )
+                        .await?
+                        {
+                            if let Some(signal) =
+                                handle_idle_signal(signal, &terminal, signals).await?
+                            {
+                                return Ok(InteractiveExit::Signal(signal));
+                            }
+                        }
+                    }
+                    IdleInput::RefreshTitleUsage => {
+                        if let Some(signal) = write_notice(
+                            "[Usage: /refresh-title (no arguments)]\n",
                             &mut presenter,
                             &terminal,
                             signals,
@@ -6005,7 +6104,7 @@ fn handle_active_input(
                         CommandId::Help => {
                             let _ = input.take_draft_for_turn()?;
                             *notice = Some(
-                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
+                                "/goal [objective|edit|pause|resume|clear] | /plan waits for this turn | /inspect | /review | /focus | /theme | /motion | /compact waits for this turn | /rename waits for this turn | /refresh-title waits for this turn | /help | /exit | /quit | Enter queue | Ctrl+J newline"
                                     .to_owned(),
                             );
                         }
@@ -6049,6 +6148,13 @@ fn handle_active_input(
                                     .to_owned(),
                             );
                         }
+                        CommandId::RefreshTitle => {
+                            let _ = input.take_draft_for_turn()?;
+                            *notice = Some(
+                                "Title refresh busy · wait for the current turn or press Ctrl+C"
+                                    .to_owned(),
+                            );
+                        }
                     }
                     return Ok(ActiveInputOutcome::Redraw);
                 }
@@ -6084,6 +6190,11 @@ fn handle_active_input(
                 EnhancedSubmission::CompactUsage => {
                     let _ = input.take_draft_for_turn()?;
                     *notice = Some("Usage: /compact (no arguments)".to_owned());
+                    return Ok(ActiveInputOutcome::Redraw);
+                }
+                EnhancedSubmission::RefreshTitleUsage => {
+                    let _ = input.take_draft_for_turn()?;
+                    *notice = Some("Usage: /refresh-title (no arguments)".to_owned());
                     return Ok(ActiveInputOutcome::Redraw);
                 }
                 EnhancedSubmission::Empty => {
@@ -8552,6 +8663,18 @@ mod tests {
         );
         assert_eq!(
             classify_enhanced_submission("/renamed remains a prompt"),
+            EnhancedSubmission::Prompt
+        );
+        assert_eq!(
+            classify_enhanced_submission(" /refresh-title "),
+            EnhancedSubmission::Command(CommandId::RefreshTitle)
+        );
+        assert_eq!(
+            classify_enhanced_submission("/refresh-title now"),
+            EnhancedSubmission::RefreshTitleUsage
+        );
+        assert_eq!(
+            classify_enhanced_submission("/refresh-titles"),
             EnhancedSubmission::Prompt
         );
     }

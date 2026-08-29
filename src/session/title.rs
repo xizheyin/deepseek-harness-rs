@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Message, NonNegativeSafeInteger};
+use crate::model::{ContentBlockKind, Message, MessageSourceKind, NonNegativeSafeInteger};
 
 use super::{EventSeq, MAX_SOURCE_EVENT_SEQS, error::EventValidationError};
 
@@ -11,6 +11,38 @@ pub const FALLBACK_TITLE_MAX_BYTES: usize = 40;
 pub const PROVIDER_TITLE_MAX_BYTES: usize = 80;
 pub const TITLE_INPUT_MAX_BYTES: usize = 4_096;
 pub const TITLE_OUTPUT_MAX_TOKENS: u64 = 64;
+
+/// Capture only the bounded text the shipped first-prompt title provider may
+/// receive. Keeping this in the projection lets a resumed durable Session
+/// refresh its title without retaining the complete historical event body.
+pub(crate) fn title_prompt_text(message: &Message) -> Option<String> {
+    if !matches!(message.source().kind(), MessageSourceKind::User) {
+        return None;
+    }
+    let mut text = String::new();
+    text.try_reserve(TITLE_INPUT_MAX_BYTES).ok()?;
+    for block in message.content() {
+        let ContentBlockKind::Text { text: part } = block.kind() else {
+            continue;
+        };
+        if !text.is_empty() && text.len() < TITLE_INPUT_MAX_BYTES {
+            text.push('\n');
+        }
+        let remaining = TITLE_INPUT_MAX_BYTES.saturating_sub(text.len());
+        if remaining == 0 {
+            break;
+        }
+        let mut end = remaining.min(part.len());
+        while end != 0 && !part.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.push_str(&part[..end]);
+        if text.len() == TITLE_INPUT_MAX_BYTES {
+            break;
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
@@ -290,7 +322,8 @@ fn invisible(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{fallback_title, normalize_title};
+    use super::{TITLE_INPUT_MAX_BYTES, fallback_title, normalize_title, title_prompt_text};
+    use crate::model::{ContentBlock, Message, MessageSource};
 
     #[test]
     fn fallback_and_normalization_are_bounded_and_terminal_safe() {
@@ -306,5 +339,30 @@ mod tests {
             normalize_title("你好世界测试标题", 7).as_deref(),
             Some("你好")
         );
+    }
+
+    #[test]
+    fn first_prompt_text_is_direct_human_text_and_utf8_bounded() {
+        let message = Message::user(
+            "title-prompt",
+            vec![
+                ContentBlock::text("first").unwrap(),
+                ContentBlock::text(format!("{}尾", "x".repeat(TITLE_INPUT_MAX_BYTES))).unwrap(),
+            ],
+            MessageSource::user().unwrap(),
+        )
+        .unwrap();
+        let text = title_prompt_text(&message).unwrap();
+        assert_eq!(text.len(), TITLE_INPUT_MAX_BYTES);
+        assert!(text.starts_with("first\n"));
+        assert!(text.is_char_boundary(text.len()));
+
+        let generated = Message::user(
+            "generated",
+            vec![ContentBlock::text("not direct").unwrap()],
+            MessageSource::plugin("test").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(title_prompt_text(&generated), None);
     }
 }

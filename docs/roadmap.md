@@ -1,7 +1,7 @@
 # Product Roadmap
 
 This roadmap records implementation status. Phases 0–9 remain the finite v0.1
-plan; Phases 10–48 are explicitly approved post-v0.1 extensions. This is a
+plan; Phases 10–49 are explicitly approved post-v0.1 extensions. This is a
 plan, not a list of current product features. `README.md` remains the source
 for behavior that users can run today.
 
@@ -56,6 +56,7 @@ for behavior that users can run today.
 | 46 | Title-enriched prior-Session search | `complete` | [`validation/phase-46.md`](validation/phase-46.md) |
 | 47 | Title-enriched historical event and lineage tools | `complete` | [`validation/phase-47.md`](validation/phase-47.md) |
 | 48 | Durable manual Session title rename | `complete` | [`validation/phase-48.md`](validation/phase-48.md) |
+| 49 | Explicit cancellable Session title refresh | `complete` | [`validation/phase-49.md`](validation/phase-49.md) |
 
 Only one phase may be `in-progress`. A phase becomes `complete` only after its production path, tests, compatibility evidence, validation record, and repository-wide checks pass.
 
@@ -106,6 +107,22 @@ without a title reports the current title and usage; a title containing no
 visible characters is rejected without changing the existing title. Official
 explicit title refresh/unpin, rename APIs outside this CLI, and cross-process
 live-session mutation remain future work.
+
+## Phase 49 boundary (2026-08-29)
+
+Phase 49 adds idle `/refresh-title` for explicitly retrying the configured
+first-prompt title provider. It keeps a bounded projection of the first direct
+human text and sequence, including after durable resume. A provider refresh
+records `session/title-llm-request` before the network call and appends a
+provider title only after a valid successful response. A fallback-only route
+replaces a user-pinned title with the deterministic first-prompt fallback.
+
+The command is cancellable with `Ctrl+C`, starts no Agent turn or tool, and
+requires no approval. Missing input, provider failure, invalid output, timeout
+or cancellation preserve the current title. Rust serializes explicit refreshes
+through its one idle Agent instead of exposing the official service's
+overlapping caller API. All-messages title providers, remote/cross-process
+refresh, refresh queues and title projection caching remain out of scope.
 
 ## Phase 8 revised boundary (2026-08-18)
 
@@ -197,7 +214,7 @@ tests, full Phase 0–10 regression gates, and successful macOS/Ubuntu CI.
 
 The current green checkpoints implement bounded assistant-message markup,
 source-preserving 2–8-column pipe tables, six closed process-local semantic
-themes with transactional redraw, a closed eleven-command completion palette, a
+themes with transactional redraw, a closed twelve-command completion palette, a
 generator-provenanced semantic card for the real single-file `apply_patch`
 approval preview, bounded workspace-file suggestions, and bounded primary-screen Inspect/Review panels. Inspect
 shows only current-turn committed metadata and retained reasoning; Review keeps

@@ -1,0 +1,28 @@
+{
+  "upstreamCommit": "47f943859bef60e4160492346772ded9b24f765a",
+  "sources": [
+    "packages/session/session-title/src/index.ts",
+    "packages/session/session-title/tests/rename.spec.ts",
+    "packages/session/session-title/tests/service-contracts.spec.ts",
+    "packages/session/session-title/tests/provider.spec.ts",
+    "packages/session/session-title/tests/persistence.spec.ts",
+    "packages/session/session-title-first-prompt-llm/src/index.ts",
+    "packages/session/session-title-first-prompt-llm/tests/provider.spec.ts"
+  ],
+  "providerRefresh": {
+    "selectedMessages": "first-eligible-human-message-only",
+    "eventOrder": [
+      "session/title-llm-request",
+      "session/title"
+    ],
+    "failureKeepsCurrentTitle": true,
+    "cancellationKeepsCurrentTitle": true,
+    "newestOverlappingRefreshWins": true
+  },
+  "fallbackOnlyRefresh": {
+    "userTitleYieldsToFirstPromptFallback": true,
+    "noEligiblePromptReturnsNoTitle": true,
+    "noDerivableFallbackKeepsUserTitle": true
+  },
+  "persistence": "refresh-result-replays-from-append-only-events"
+}

@@ -305,6 +305,24 @@ pub struct SessionState {
     standing_todos: Option<Arc<Vec<TodoItem>>>,
     session_title: Option<super::SessionTitleEvent>,
     session_title_llm_requested: bool,
+    session_title_first_prompt: Option<SessionTitleFirstPrompt>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct SessionTitleFirstPrompt {
+    seq: EventSeq,
+    text: Arc<str>,
+}
+
+impl fmt::Debug for SessionTitleFirstPrompt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionTitleFirstPrompt")
+            .field("seq", &self.seq)
+            .field("text", &"<redacted>")
+            .field("bytes", &self.text.len())
+            .finish()
+    }
 }
 
 impl SessionState {
@@ -379,6 +397,12 @@ impl SessionState {
     pub const fn session_title_llm_requested(&self) -> bool {
         self.session_title_llm_requested
     }
+
+    pub(crate) fn session_title_first_prompt(&self) -> Option<(EventSeq, &str)> {
+        self.session_title_first_prompt
+            .as_ref()
+            .map(|prompt| (prompt.seq, prompt.text.as_ref()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -399,6 +423,7 @@ pub(crate) struct Projection {
     standing_todos: Option<Arc<Vec<TodoItem>>>,
     session_title: Option<super::SessionTitleEvent>,
     session_title_llm_requested: bool,
+    session_title_first_prompt: Option<SessionTitleFirstPrompt>,
     compaction: CompactionState,
     pending_approvals: Vec<ApprovalRequestId>,
     owned_approval_ids: Arc<BTreeSet<ApprovalRequestId>>,
@@ -658,6 +683,7 @@ impl Projection {
             standing_todos: None,
             session_title: None,
             session_title_llm_requested: false,
+            session_title_first_prompt: None,
             compaction: CompactionState::default(),
             pending_approvals: Vec::new(),
             owned_approval_ids: Arc::new(BTreeSet::new()),
@@ -1117,6 +1143,7 @@ impl Projection {
             standing_todos: self.standing_todos.clone(),
             session_title: self.session_title.clone(),
             session_title_llm_requested: self.session_title_llm_requested,
+            session_title_first_prompt: self.session_title_first_prompt.clone(),
         }
     }
 
@@ -2291,6 +2318,16 @@ impl Projection {
             | EventKind::UserMessage { .. }
             | EventKind::EndSeed
             | EventKind::Unknown { .. } => {}
+        }
+        if self.session_title_first_prompt.is_none() {
+            if let EventKind::UserMessage { message } = &event.kind {
+                if let Some(text) = super::title_prompt_text(message) {
+                    self.session_title_first_prompt = Some(SessionTitleFirstPrompt {
+                        seq: event.seq,
+                        text: Arc::from(text),
+                    });
+                }
+            }
         }
         Ok(())
     }

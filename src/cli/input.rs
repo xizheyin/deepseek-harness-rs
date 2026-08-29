@@ -121,6 +121,8 @@ pub(super) enum IdleInput {
     Goal(Result<GoalCommand, GoalError>),
     Plan(Result<PlanModeCommand, PlanModeError>),
     Rename(RenameCommand),
+    RefreshTitle,
+    RefreshTitleUsage,
     Compact,
     CompactUsage,
     Exit,
@@ -150,12 +152,19 @@ pub(super) fn classify_idle_record(record: &str, _terminated_by_lf: bool) -> Idl
     {
         return IdleInput::CompactUsage;
     }
+    if command
+        .strip_prefix("/refresh-title")
+        .is_some_and(|suffix| suffix.chars().next().is_some_and(char::is_whitespace))
+    {
+        return IdleInput::RefreshTitleUsage;
+    }
     match command {
         "" => IdleInput::Redraw,
         "/help" => IdleInput::Help,
         "/inspect" => IdleInput::Inspect,
         "/review" => IdleInput::Review,
         "/compact" => IdleInput::Compact,
+        "/refresh-title" => IdleInput::RefreshTitle,
         "/exit" | "/quit" => IdleInput::Exit,
         _ => IdleInput::Submit(record.to_owned()),
     }
@@ -301,6 +310,14 @@ mod tests {
         assert_eq!(classify_idle_record(" /inspect ", true), IdleInput::Inspect);
         assert_eq!(classify_idle_record(" /review ", true), IdleInput::Review);
         assert_eq!(classify_idle_record(" /compact ", true), IdleInput::Compact);
+        assert_eq!(
+            classify_idle_record(" /refresh-title ", true),
+            IdleInput::RefreshTitle
+        );
+        assert_eq!(
+            classify_idle_record("/refresh-title now", true),
+            IdleInput::RefreshTitleUsage
+        );
         assert_eq!(
             classify_idle_record(" /rename ", true),
             IdleInput::Rename(RenameCommand::Show)

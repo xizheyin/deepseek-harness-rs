@@ -61,7 +61,7 @@ pub(crate) use projection::CompactionCandidate;
 pub use projection::SessionState;
 pub(crate) use store::SessionMetadata;
 pub use store::{SessionStore, StoreError};
-pub(crate) use title::{PROVIDER_TITLE_MAX_BYTES, TITLE_INPUT_MAX_BYTES, TITLE_OUTPUT_MAX_TOKENS};
+pub(crate) use title::{PROVIDER_TITLE_MAX_BYTES, TITLE_OUTPUT_MAX_TOKENS, title_prompt_text};
 pub use title::{
     SessionTitleEvent, SessionTitleLlmRequestEvent, SessionTitleRoute, SessionTitleSource,
     fallback_title, normalize_title,
