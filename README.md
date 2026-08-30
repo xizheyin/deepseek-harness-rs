@@ -112,6 +112,7 @@ API Key 只从进程环境按请求读取。不要把真实密钥写入提示词
 | 会话分支（实验性） | 空闲时用 `/fork [EVENT_SEQ]` 从一个已完成回合创建独立、可恢复的子会话；当前父会话继续运行 |
 | Session 模型切换（实验性） | 空闲时用 `/model [MODEL [EFFORT]]` 查看或切换下一次请求的 DeepSeek 模型与 `off`/`high`/`max` 推理强度；实际请求后随会话恢复 |
 | 本地工具插件（实验性） | 显式配置受信任的子进程工具；协议、队列、输出、超时和清理都有上限，交互调用仍需审批 |
+| webClx 终端协作适配器（实验性） | 通过 Rust 子进程插件列出 webClx 终端并向精确目标发送带来源标记的消息；配置见[配置文档](docs/configuration.md#webclx-terminal-messaging-adapter) |
 
 ## 使用方式
 

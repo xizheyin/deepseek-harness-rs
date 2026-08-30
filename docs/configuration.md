@@ -177,6 +177,52 @@ unknown tool outcome is never replayed to a restarted plugin. The closed
 protocol/schema limits are documented in
 [the Phase 10 design](design/subprocess-tool-plugins.md).
 
+### webClx terminal messaging adapter
+
+The `webclx_terminal_message_plugin` example exposes
+`webclx_list_terminals` and `webclx_send_terminal_message` through the bounded
+subprocess protocol. It lets a Rust `dsh` process cooperate with webClx-managed
+Codex, Claude, and DeepSeek terminals. After building the example, create an
+owner-private plugin config:
+
+```json
+{
+  "version": 1,
+  "plugins": [
+    {
+      "id": "webclx-terminal-message",
+      "program": "/absolute/path/to/dsh-rs/target/debug/examples/webclx_terminal_message_plugin",
+      "args": [
+        "--base-url", "http://127.0.0.1:11111",
+        "--sender", "RUST_DSH_TERMINAL",
+        "--local-token-file", "/absolute/path/to/webclx-local-token"
+      ]
+    }
+  ]
+}
+```
+
+`--sender` must be the exact current webClx terminal name or stable session ID.
+The plugin host clears ambient `WEBCLX_*` variables, so identity and the optional
+local token file are explicit arguments. Omit `--local-token-file` when the
+loopback API does not require it. For a cross-host return route, add
+`--reply-url URL`. URLs reject credentials, query strings, and fragments;
+redirects are not followed; and a local token is sent only to a loopback base
+URL. Tool calls still use the normal interactive plugin approval policy.
+
+After building the example, the repository acceptance script performs a real
+read-only NDJSON handshake and calls the configured webClx session-list API:
+
+```console
+scripts/accept-webclx-terminal-message.sh
+```
+
+Set `DSH_WEBCLX_PLUGIN`, `WEBCLX_URL`, `WEBCLX_LOCAL_TOKEN_FILE`, or
+`DSH_WEBCLX_EXPECTED_PATH` when the executable, API, token file, or expected
+workspace differs from the defaults. Set `DSH_WEBCLX_ACCEPT_TIMEOUT_SECONDS`
+to change the 15-second per-response timeout. The acceptance path never sends
+terminal input.
+
 ## Local stdio language servers
 
 `--lsp-config` enables the experimental read-only `lsp` tool. Passing the flag
